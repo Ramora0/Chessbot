@@ -23,8 +23,8 @@ OUTPUT_DIR = "outputs"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 70
 PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
-ELO_EVAL_STEPS = 1000
-EVAL_BATCH_SIZE = 256
+ELO_EVAL_STEPS = 2000
+EVAL_BATCH_SIZE = 4096
 
 
 class EloEvaluationCallback(TrainerCallback):
@@ -126,9 +126,9 @@ def train() -> None:
         vocab_size=vocab_size,
         n_positions=MAX_SEQ_LENGTH,
         n_ctx=MAX_SEQ_LENGTH,
-        n_embd=512,
-        n_layer=8,
-        n_head=8,
+        n_embd=768,
+        n_layer=18,
+        n_head=12,
         resid_pdrop=DROPOUT,
         embd_pdrop=DROPOUT,
         attn_pdrop=DROPOUT,
@@ -148,8 +148,8 @@ def train() -> None:
         output_dir=OUTPUT_DIR,
         num_train_epochs=1,
 
-        per_device_train_batch_size=512,
-        learning_rate=1e-4,
+        per_device_train_batch_size=256,
+        learning_rate=2e-4,
         weight_decay=0.01,
         max_grad_norm=1.0,
         bf16=True,

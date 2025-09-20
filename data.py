@@ -72,6 +72,7 @@ class ChessPolicyCollator:
             "policy_mask": policy_mask.to(torch.bool),
         }
 
+
 def create_dataloader(
     hf_dataset: HFDataset,
     batch_size: int = 32,

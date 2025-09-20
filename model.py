@@ -25,10 +25,17 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
         super().__init__(config)
         self.policy_dim = config.policy_dim
         self.transformer = GPT2Model(config)
+        self._disable_causal_mask()
         self.norm = nn.LayerNorm(config.n_embd)
         self.policy_head = nn.Linear(config.n_embd, self.policy_dim)
         self.wdl_head = nn.Linear(config.n_embd, 3)
         self.post_init()
+
+    def _disable_causal_mask(self) -> None:
+        for block in self.transformer.h:
+            attn = block.attn
+            ones_bias = torch.ones_like(attn.bias)
+            attn.register_buffer("bias", ones_bias)
 
     def forward(
         self,
