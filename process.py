@@ -31,7 +31,6 @@ def main() -> None:
         return {
             "processed_fen": processed_fens,
             "input_ids": [encoding.ids for encoding in encodings],
-            "attention_mask": [encoding.attention_mask for encoding in encodings],
         }
 
     processed_dataset = dataset.map(

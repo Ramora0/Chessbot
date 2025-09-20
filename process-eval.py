@@ -19,7 +19,7 @@ from policy_index import policy_index
 
 
 PUZZLES_CSV = Path("data/puzzles.csv")
-OUTPUT_DIR = Path("processed_puzzles_eval")
+OUTPUT_DIR = Path("/fs/scratch/PAS3150/lees_stuff/processed_puzzles_eval")
 BATCH_SIZE = 2_048
 POLICY_MOVES: List[str] = policy_index
 POLICY_SIZE = len(POLICY_MOVES)
@@ -113,9 +113,7 @@ def main() -> None:
                         "fen": board_state_fen,
                         "puzzle_id": puzzle_id,
                         "rating": rating,
-                        "target_move": player_move_uci_norm,
                         "target_policy_index": target_index,
-                        "example_index": pair_index // 2,
                         "legal_moves_mask": legal_moves_mask,
                     }
                 )
@@ -133,11 +131,15 @@ def main() -> None:
         processed_fens = process_fen_batch(fens)
         encodings = tokenizer.encode_batch(processed_fens)
 
-        for item, processed_fen, encoding in zip(chunk, processed_fens, encodings):
-            processed_record = dict(item)
-            processed_record["processed_fen"] = processed_fen
-            processed_record["input_ids"] = encoding.ids
-            processed_record["attention_mask"] = encoding.attention_mask
+        for item, encoding in zip(chunk, encodings):
+            item.pop("fen", None)
+            processed_record = {
+                "puzzle_id": item["puzzle_id"],
+                "rating": item["rating"],
+                "target_policy_index": item["target_policy_index"],
+                "legal_moves_mask": item["legal_moves_mask"],
+                "input_ids": encoding.ids,
+            }
             processed_records.append(processed_record)
 
     if not processed_records:

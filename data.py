@@ -7,10 +7,9 @@ from torch.utils.data import Dataset
 from datasets import Dataset as HFDataset
 
 from policy_index import policy_index
-from tokenizer import create_tokenizer, process_fen_batch
 
 
-EXPECTED_SEQ_LEN = 71
+EXPECTED_SEQ_LEN = 70
 
 
 class ChessPolicyDataset(Dataset):
@@ -32,22 +31,16 @@ class ChessPolicyDataset(Dataset):
                 f"received {len(policy_values)}"
             )
 
-        item: Dict[str, object] = {"policy": policy_values}
-        if "input_ids" in example:
-            item["input_ids"] = example["input_ids"]
-            if "attention_mask" in example:
-                item["attention_mask"] = example["attention_mask"]
-        else:
-            item["fen"] = example["fen"]
-
-        return item
+        return {
+            "policy": policy_values,
+            "input_ids": example["input_ids"],
+        }
 
 
 class ChessPolicyCollator:
-    """Collator that batches tokenization and tensor creation."""
+    """Collator that batches tensor creation for already-tokenized data."""
 
-    def __init__(self, tokenizer=None) -> None:
-        self.tokenizer = tokenizer or create_tokenizer()
+    def __init__(self) -> None:
         self.policy_size = len(policy_index)
 
     def __call__(self, batch: Iterable[Dict[str, object]]) -> Dict[str, torch.Tensor]:
@@ -55,34 +48,14 @@ class ChessPolicyCollator:
         if not items:
             raise ValueError("Empty batch provided to ChessPolicyCollator")
 
-        if "input_ids" in items[0]:
-            input_ids = torch.tensor(
-                [item["input_ids"] for item in items], dtype=torch.long
-            )
-            if "attention_mask" in items[0]:
-                attention_mask = torch.tensor(
-                    [item["attention_mask"] for item in items], dtype=torch.long
-                )
-            else:
-                attention_mask = torch.ones_like(input_ids)
-        else:
-            processed_fens = process_fen_batch(item["fen"] for item in items)
-            encodings = self.tokenizer.encode_batch(processed_fens)
-            input_ids = torch.tensor(
-                [encoding.ids for encoding in encodings], dtype=torch.long
-            )
-            attention_mask = torch.tensor(
-                [encoding.attention_mask for encoding in encodings], dtype=torch.long
-            )
+        input_ids = torch.stack([item["input_ids"] for item in items]).long()
 
         if input_ids.ndim != 2 or input_ids.shape[1] != EXPECTED_SEQ_LEN:
             raise ValueError(
                 f"Batch tokenized length {input_ids.shape[1]} does not match expected {EXPECTED_SEQ_LEN}"
             )
 
-        policy_values = torch.tensor(
-            [item["policy"] for item in items], dtype=torch.float32
-        )
+        policy_values = torch.stack([item["policy"] for item in items]).float()
         if policy_values.shape[1] != self.policy_size:
             raise ValueError(
                 f"policy tensor expected width {self.policy_size}, "
@@ -95,20 +68,18 @@ class ChessPolicyCollator:
 
         return {
             "input_ids": input_ids,
-            "attention_mask": attention_mask,
             "policy": policy,
             "policy_mask": policy_mask.to(torch.bool),
         }
 
 def create_dataloader(
     hf_dataset: HFDataset,
-    tokenizer=None,
     batch_size: int = 32,
     shuffle: bool = True,
     num_workers: int = 0,
 ) -> torch.utils.data.DataLoader:
     dataset = ChessPolicyDataset(hf_dataset)
-    collator = ChessPolicyCollator(tokenizer=tokenizer)
+    collator = ChessPolicyCollator()
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,

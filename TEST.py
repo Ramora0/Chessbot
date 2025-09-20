@@ -137,6 +137,7 @@ puzzle_ratings = rng.triangular(TRI_LEFT, TRI_MODE, TRI_RIGHT, size=N_PUZZLES)
 model_ratings = np.arange(R_MIN, R_MAX + 1, R_STEP)
 
 est_mle = []
+se_mle = []
 est_inv = []
 
 for R_true in tqdm(model_ratings):
@@ -148,18 +149,21 @@ for R_true in tqdm(model_ratings):
     q_obs = clip01(sigmoid(z))
 
     # Estimate Elo by MLE
-    R_mle, _ = estimate_elo_mle(
+    R_mle, se = estimate_elo_mle(
         puzzle_ratings, q_obs, init=np.median(puzzle_ratings))
     est_mle.append(R_mle)
+    se_mle.append(se)
 
     # Estimate Elo by inverted-per-puzzle (weighted)
     R_inv = estimate_elo_inverted_weighted(puzzle_ratings, q_obs)
     est_inv.append(R_inv)
 
 est_mle = np.array(est_mle)  # - 28) * 1.0177852349
+se_mle = np.array(se_mle)
 est_inv = np.array(est_inv)
 
 est_mle = smooth_moving_average(est_mle, SMOOTH_WINDOW)
+se_mle = smooth_moving_average(se_mle, SMOOTH_WINDOW)
 est_inv = smooth_moving_average(est_inv, SMOOTH_WINDOW)
 
 dev_mle = est_mle - model_ratings
@@ -168,7 +172,16 @@ dev_inv = est_inv - model_ratings
 # ------------------------------- Plot -------------------------------------- #
 plt.figure(figsize=(8, 5))
 # plt.plot(model_ratings, model_ratings, label="True", linestyle="--")
-plt.plot(model_ratings, dev_mle, label="MLE (1-parameter logistic)")
+line_mle, = plt.plot(model_ratings, dev_mle, label="MLE (1-parameter logistic)")
+plt.fill_between(
+    model_ratings,
+    dev_mle - se_mle,
+    dev_mle + se_mle,
+    color=line_mle.get_color(),
+    alpha=0.25,
+    linewidth=0,
+    label="MLE ± SE",
+)
 # plt.plot(model_ratings, dev_inv, linestyle="--",
 #          label="Inverted + Fisher weights")
 
