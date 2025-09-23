@@ -9,15 +9,18 @@ from datasets import Dataset as HFDataset
 from policy_index import policy_index
 
 
-EXPECTED_SEQ_LEN = 70
+EXPECTED_SEQ_LEN = 71
 
 
 class ChessPolicyDataset(Dataset):
     """Dataset wrapper that defers expensive preprocessing to the collator."""
 
-    def __init__(self, hf_dataset: HFDataset) -> None:
+    def __init__(self, hf_dataset: HFDataset, act_token_id: int) -> None:
         self.dataset = hf_dataset
         self.policy_size = len(policy_index)
+        if act_token_id is None:
+            raise ValueError("act_token_id must be provided")
+        self.act_token_id = int(act_token_id)
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -31,9 +34,34 @@ class ChessPolicyDataset(Dataset):
                 f"received {len(policy_values)}"
             )
 
+        input_ids = example["input_ids"]
+        if not torch.is_tensor(input_ids):
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
+        else:
+            input_ids = input_ids.to(torch.long)
+
+        if input_ids.ndim != 1:
+            raise ValueError(
+                f"input_ids expected 1D tensor, received shape {tuple(input_ids.shape)}"
+            )
+
+        seq_len = input_ids.shape[0]
+        if seq_len == EXPECTED_SEQ_LEN:
+            if input_ids[-1].item() != self.act_token_id:
+                raise ValueError(
+                    f"input_ids final token id {input_ids[-1].item()} does not match expected act token id {self.act_token_id}"
+                )
+        elif seq_len == EXPECTED_SEQ_LEN - 1:
+            act_token = torch.tensor([self.act_token_id], dtype=input_ids.dtype, device=input_ids.device)
+            input_ids = torch.cat((input_ids, act_token))
+        else:
+            raise ValueError(
+                f"input_ids length {seq_len} does not match expected {EXPECTED_SEQ_LEN}"
+            )
+
         return {
             "policy": policy_values,
-            "input_ids": example["input_ids"],
+            "input_ids": input_ids,
         }
 
 
@@ -75,11 +103,12 @@ class ChessPolicyCollator:
 
 def create_dataloader(
     hf_dataset: HFDataset,
+    act_token_id: int,
     batch_size: int = 32,
     shuffle: bool = True,
     num_workers: int = 0,
 ) -> torch.utils.data.DataLoader:
-    dataset = ChessPolicyDataset(hf_dataset)
+    dataset = ChessPolicyDataset(hf_dataset, act_token_id=act_token_id)
     collator = ChessPolicyCollator()
     return torch.utils.data.DataLoader(
         dataset,

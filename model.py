@@ -15,7 +15,7 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2PreTrainedModel
 class ChessGPT2Output(ModelOutput):
     loss: Optional[torch.Tensor] = None
     policy_logits: torch.Tensor = None
-    wdl_logits: torch.Tensor = None
+    # wdl_logits: torch.Tensor = None
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
 
@@ -28,7 +28,7 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
         self._disable_causal_mask()
         self.norm = nn.LayerNorm(config.n_embd)
         self.policy_head = nn.Linear(config.n_embd, self.policy_dim)
-        self.wdl_head = nn.Linear(config.n_embd, 3)
+        # self.wdl_head = nn.Linear(config.n_embd, 3)
         self.post_init()
 
     def _disable_causal_mask(self) -> None:
@@ -51,7 +51,7 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
         pooled = hidden_states.mean(dim=1)
         pooled = self.norm(pooled)
         policy_logits = self.policy_head(pooled)
-        wdl_logits = self.wdl_head(pooled)
+        # wdl_logits = self.wdl_head(pooled)
 
         loss = None
         if policy is not None and policy_mask is not None:
@@ -63,7 +63,7 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
         if not return_dict:
             outputs = (
                 policy_logits,
-                wdl_logits,
+                # wdl_logits,
                 transformer_outputs.hidden_states,
                 transformer_outputs.attentions,
             )
@@ -72,7 +72,7 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
         return ChessGPT2Output(
             loss=loss,
             policy_logits=policy_logits,
-            wdl_logits=wdl_logits,
+            # wdl_logits=wdl_logits,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )

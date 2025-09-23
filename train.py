@@ -21,7 +21,7 @@ from evaluation import evaluate_model_elo, DEFAULT_EVAL_DATASET_DIR
 
 OUTPUT_DIR = "outputs"
 DROPOUT = 0.1
-MAX_SEQ_LENGTH = 70
+MAX_SEQ_LENGTH = 71
 PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
 ELO_EVAL_STEPS = 2000
 EVAL_BATCH_SIZE = 4096
@@ -84,11 +84,16 @@ class EloEvaluationCallback(TrainerCallback):
 def train() -> None:
     print("Starting chess transformer training...")
     os.environ["WANDB_PROJECT"] = "chessformer"
+    # Avoid W&B from uploading checkpoints while keeping metric logging enabled.
+    os.environ["WANDB_LOG_MODEL"] = "false"
 
     print("Creating tokenizer...")
     tokenizer = create_tokenizer()
     vocab_size = len(tokenizer.get_vocab())
     pad_token_id = tokenizer.token_to_id("[PAD]")
+    act_token_id = tokenizer.token_to_id("<ACT>")
+    if act_token_id is None:
+        raise ValueError("Tokenizer is missing the <ACT> token")
     print(
         f"Tokenizer created - vocab size: {vocab_size}, pad token id: {pad_token_id}")
 
@@ -106,7 +111,10 @@ def train() -> None:
         columns=["input_ids", "policy"],
     )
 
-    train_dataset = ChessPolicyDataset(hf_dataset)
+    train_dataset = ChessPolicyDataset(
+        hf_dataset,
+        act_token_id=act_token_id,
+    )
     print(f"Dataset loaded - training samples: {len(train_dataset)}")
 
     eval_dataset = None
@@ -153,10 +161,11 @@ def train() -> None:
         weight_decay=0.01,
         max_grad_norm=1.0,
         bf16=True,
-        save_strategy="epoch",
+        save_strategy="steps",
+        save_steps=10000,
         logging_strategy="steps",
         logging_steps=50,
-        report_to=["wandb"],
+        report_to=[],
         run_name="chessformer-gpt2-policy",
         remove_unused_columns=False,
 
