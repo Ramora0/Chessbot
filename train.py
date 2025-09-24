@@ -68,6 +68,51 @@ def build_training_schedule(batch_size: int) -> TrainingSchedule:
     )
 
 
+class TrackingTrainer(Trainer):
+    """Custom Trainer that logs individual loss components."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._last_policy_loss: Optional[float] = None
+        self._last_wdl_loss: Optional[float] = None
+        self._last_total_loss: Optional[float] = None
+
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs: bool = False,
+        num_items_in_batch: Optional[int] = None,
+    ):  # type: ignore[override]
+        outputs = model(**inputs)
+        loss = outputs.loss
+        if loss is None:
+            raise ValueError("Model did not return a loss tensor during training")
+
+        self._last_total_loss = float(loss.detach().item())
+
+        policy_loss = getattr(outputs, "policy_loss", None)
+        self._last_policy_loss = float(policy_loss.detach().item()) if policy_loss is not None else None
+
+        wdl_loss = getattr(outputs, "wdl_loss", None)
+        self._last_wdl_loss = float(wdl_loss.detach().item()) if wdl_loss is not None else None
+
+        if return_outputs:
+            return loss, outputs
+        return loss
+
+    def log(self, logs, *args, **kwargs):  # type: ignore[override]
+        logs = dict(logs)
+        if "loss" in logs:
+            if self._last_total_loss is not None:
+                logs.setdefault("total_loss", self._last_total_loss)
+            if self._last_policy_loss is not None:
+                logs.setdefault("policy_loss", self._last_policy_loss)
+            if self._last_wdl_loss is not None:
+                logs.setdefault("wdl_loss", self._last_wdl_loss)
+        super().log(logs, *args, **kwargs)
+
+
 class EloEvaluationCallback(TrainerCallback):
     def __init__(
         self,
@@ -112,11 +157,11 @@ class EloEvaluationCallback(TrainerCallback):
             model.train()
 
         metrics = {
-            "eval/elo": float(elo),
-            "eval/elo_se": float(elo_se),
+            "elo": float(elo),
+            "elo_se": float(elo_se),
             "step": step,
         }
-        self.trainer.log(metrics)
+        self.trainer.log_metrics("eval", metrics)
         self._last_step_logged = step
 
         return control
@@ -262,7 +307,7 @@ def train() -> None:
     print("Creating trainer...")
     data_collator = ChessPolicyCollator()
 
-    trainer = Trainer(
+    trainer = TrackingTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
