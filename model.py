@@ -41,7 +41,6 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
         self,
         input_ids: torch.Tensor,
         policy: Optional[torch.Tensor] = None,
-        policy_mask: Optional[torch.Tensor] = None,
         wdl: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         **kwargs,
@@ -54,7 +53,14 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
         # wdl_logits = self.wdl_head(pooled)
 
         loss = None
-        if policy is not None and policy_mask is not None:
+        if policy is not None:
+            target_device = policy_logits.device
+            if policy.device != target_device:
+                policy = policy.to(target_device)
+
+            policy_mask = (policy >= 0).to(dtype=torch.bool)
+            policy = policy.masked_fill(~policy_mask, 0)
+
             masked_logits = policy_logits.masked_fill(~policy_mask, -1e9)
             policy_log_probs = F.log_softmax(masked_logits, dim=-1)
             policy_loss = -(policy * policy_log_probs).sum(dim=-1).mean()

@@ -189,6 +189,7 @@ def train() -> None:
         dataloader_num_workers=8,
         dataloader_prefetch_factor=1,
         dataloader_pin_memory=True,
+        dataloader_persistent_workers=True,
         max_steps=max_steps,
     )
     print(f"Training config: {training_args.num_train_epochs} epochs, batch size {training_args.per_device_train_batch_size}, lr {training_args.learning_rate}")

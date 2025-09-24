@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, Iterator, List
+from typing import Dict, Iterable, Iterator
 
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
@@ -44,22 +44,18 @@ class ChessPolicyDataset(IterableDataset):
             yield self._process_example(example)
 
     def _process_example(self, example: Dict[str, object]) -> Dict[str, torch.Tensor]:
-        policy_values = example["policy"]
-        if torch.is_tensor(policy_values):
-            policy = policy_values.to(dtype=torch.float32)
-        else:
-            policy = torch.tensor(policy_values, dtype=torch.float32)
+        policy = torch.as_tensor(example["policy"])
+        if policy.dtype != torch.float32:
+            policy = policy.to(dtype=torch.float32)
 
         if policy.ndim != 1 or policy.shape[0] != self.policy_size:
             raise ValueError(
                 f"policy field expected shape ({self.policy_size},), received {tuple(policy.shape)}"
             )
 
-        input_ids = example["input_ids"]
-        if torch.is_tensor(input_ids):
+        input_ids = torch.as_tensor(example["input_ids"])
+        if input_ids.dtype != torch.long:
             input_ids = input_ids.to(dtype=torch.long)
-        else:
-            input_ids = torch.tensor(input_ids, dtype=torch.long)
 
         if input_ids.ndim != 1:
             raise ValueError(
@@ -73,7 +69,7 @@ class ChessPolicyDataset(IterableDataset):
                     f"input_ids final token id {input_ids[-1].item()} does not match expected act token id {self.act_token_id}"
                 )
         elif seq_len == EXPECTED_SEQ_LEN - 1:
-            act_token = torch.tensor([self.act_token_id], dtype=input_ids.dtype, device=input_ids.device)
+            act_token = input_ids.new_tensor([self.act_token_id])
             input_ids = torch.cat((input_ids, act_token))
         else:
             raise ValueError(
@@ -93,32 +89,36 @@ class ChessPolicyCollator:
         self.policy_size = len(policy_index)
 
     def __call__(self, batch: Iterable[Dict[str, object]]) -> Dict[str, torch.Tensor]:
-        items: List[Dict[str, object]] = list(batch)
-        if not items:
+        input_ids_list = []
+        policy_list = []
+        for item in batch:
+            input_ids_list.append(item["input_ids"])
+            policy_list.append(item["policy"])
+
+        if not input_ids_list:
             raise ValueError("Empty batch provided to ChessPolicyCollator")
 
-        input_ids = torch.stack([item["input_ids"] for item in items]).long()
+        input_ids = torch.stack(input_ids_list)
+        if input_ids.dtype != torch.long:
+            input_ids = input_ids.to(dtype=torch.long)
 
         if input_ids.ndim != 2 or input_ids.shape[1] != EXPECTED_SEQ_LEN:
             raise ValueError(
                 f"Batch tokenized length {input_ids.shape[1]} does not match expected {EXPECTED_SEQ_LEN}"
             )
 
-        policy_values = torch.stack([item["policy"] for item in items]).float()
+        policy_values = torch.stack(policy_list)
+        if policy_values.dtype != torch.float32:
+            policy_values = policy_values.to(dtype=torch.float32)
         if policy_values.shape[1] != self.policy_size:
             raise ValueError(
                 f"policy tensor expected width {self.policy_size}, "
                 f"received {policy_values.shape[1]}"
             )
 
-        policy_mask = policy_values >= 0
-        policy = torch.where(policy_mask, policy_values,
-                             torch.zeros_like(policy_values))
-
         return {
             "input_ids": input_ids,
-            "policy": policy,
-            "policy_mask": policy_mask.to(torch.bool),
+            "policy": policy_values,
         }
 
 
