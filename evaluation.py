@@ -166,11 +166,12 @@ def evaluate_puzzles(
             legal_masks_cpu = legal_masks.cpu()
             probs_cpu = probs.cpu()
             selected_probs = selected_probs.cpu().tolist()
+            target_indices_cpu = target_indices.cpu().tolist()
             puzzle_ids = batch["puzzle_ids"]
             ratings = batch["ratings"]
 
-            for batch_index, (puzzle_id, rating, prob) in enumerate(
-                zip(puzzle_ids, ratings, selected_probs)
+            for batch_index, (puzzle_id, rating, prob, target_idx) in enumerate(
+                zip(puzzle_ids, ratings, selected_probs, target_indices_cpu)
             ):
                 if puzzle_id not in encountered_puzzles:
                     puzzle_order.append(puzzle_id)
@@ -178,6 +179,10 @@ def evaluate_puzzles(
 
                 puzzle_probabilities[puzzle_id] *= float(prob)
                 puzzle_ratings[puzzle_id] = rating
+
+                correct_move_index = int(target_idx)
+                correct_move = POLICY_MOVES[correct_move_index]
+                correct_move_probability = float(probs_cpu[batch_index][correct_move_index])
 
                 legal_indices = torch.nonzero(
                     legal_masks_cpu[batch_index], as_tuple=False
@@ -203,6 +208,9 @@ def evaluate_puzzles(
                 puzzle_states[puzzle_id].append(
                     {
                         "state_index": puzzle_state_counters[puzzle_id],
+                        "correct_move": correct_move,
+                        "correct_move_id": correct_move_index,
+                        "correct_move_probability": correct_move_probability,
                         "moves": moves,
                     }
                 )
@@ -240,7 +248,8 @@ def _write_move_distribution_log(
         raise ValueError(
             "No puzzles were evaluated; cannot write move distributions.")
 
-    selected_indices = list(range(0, total_puzzles, 1_000))
+    selection_stride = max(1, 1_000 // 5)
+    selected_indices = list(range(0, total_puzzles, selection_stride))
     last_index = total_puzzles - 1
     if last_index not in selected_indices:
         selected_indices.append(last_index)
@@ -270,6 +279,8 @@ def _write_move_distribution_log(
                 "states": states_sorted,
             }
         )
+
+    selected_puzzles.sort(key=lambda item: item["rating"], reverse=True)
 
     timestamp_str = datetime.now().strftime("%Y%m%d-%H%M%S")
     elo_label = f"{elo:.2f}"

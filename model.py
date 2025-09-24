@@ -11,6 +11,10 @@ from transformers.modeling_outputs import ModelOutput
 from transformers.models.gpt2.modeling_gpt2 import GPT2PreTrainedModel
 
 
+DEFAULT_POLICY_LOSS_WEIGHT = 0.9
+DEFAULT_WDL_LOSS_WEIGHT = 0.1
+
+
 @dataclass
 class ChessGPT2Output(ModelOutput):
     loss: Optional[torch.Tensor] = None
@@ -31,9 +35,20 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
         self.norm = nn.LayerNorm(config.n_embd)
         self.policy_head = nn.Linear(config.n_embd, self.policy_dim)
         self.wdl_head = nn.Linear(config.n_embd, 3)
+        self.policy_loss_weight = float(
+            getattr(config, "policy_loss_weight", DEFAULT_POLICY_LOSS_WEIGHT)
+        )
+        self.wdl_loss_weight = float(
+            getattr(config, "wdl_loss_weight", DEFAULT_WDL_LOSS_WEIGHT)
+        )
+        if self.policy_loss_weight < 0 or self.wdl_loss_weight < 0:
+            raise ValueError("Loss weights must be non-negative")
+        if self.policy_loss_weight + self.wdl_loss_weight == 0:
+            raise ValueError("At least one loss weight must be positive")
         self.post_init()
 
-    def load_state_dict(self, state_dict, strict: bool = False):  # type: ignore[override]
+    # type: ignore[override]
+    def load_state_dict(self, state_dict, strict: bool = False):
         result = super().load_state_dict(state_dict, strict=strict)
 
         missing = list(getattr(result, "missing_keys", ()))
@@ -85,7 +100,7 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
             masked_logits = policy_logits.masked_fill(~policy_mask, -1e9)
             policy_log_probs = F.log_softmax(masked_logits, dim=-1)
             raw_policy_loss = -(policy * policy_log_probs).sum(dim=-1).mean()
-            policy_loss = 0.8 * raw_policy_loss
+            policy_loss = self.policy_loss_weight * raw_policy_loss
 
         wdl_loss: Optional[torch.Tensor] = None
         if wdl is not None:
@@ -94,7 +109,7 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
 
             wdl_log_probs = F.log_softmax(wdl_logits, dim=-1)
             raw_wdl_loss = -(wdl * wdl_log_probs).sum(dim=-1).mean()
-            wdl_loss = 0.2 * raw_wdl_loss
+            wdl_loss = self.wdl_loss_weight * raw_wdl_loss
 
         loss: Optional[torch.Tensor] = None
         if policy_loss is not None and wdl_loss is not None:

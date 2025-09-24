@@ -35,6 +35,8 @@ BASE_MAX_STEPS = 2_800_000
 BASE_SAVE_STEPS = 10_000
 BASE_LOGGING_STEPS = 200
 BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
+POLICY_LOSS_WEIGHT = 0.9
+WDL_LOSS_WEIGHT = 0.1
 
 
 @dataclass
@@ -87,15 +89,30 @@ class TrackingTrainer(Trainer):
         outputs = model(**inputs)
         loss = outputs.loss
         if loss is None:
-            raise ValueError("Model did not return a loss tensor during training")
+            raise ValueError(
+                "Model did not return a loss tensor during training")
 
         self._last_total_loss = float(loss.detach().item())
 
         policy_loss = getattr(outputs, "policy_loss", None)
-        self._last_policy_loss = float(policy_loss.detach().item()) if policy_loss is not None else None
+        if policy_loss is not None:
+            policy_weight = float(getattr(model, "policy_loss_weight", 0.0))
+            policy_value = float(policy_loss.detach().item())
+            self._last_policy_loss = (
+                policy_value / policy_weight if policy_weight > 0 else policy_value
+            )
+        else:
+            self._last_policy_loss = None
 
         wdl_loss = getattr(outputs, "wdl_loss", None)
-        self._last_wdl_loss = float(wdl_loss.detach().item()) if wdl_loss is not None else None
+        if wdl_loss is not None:
+            wdl_weight = float(getattr(model, "wdl_loss_weight", 0.0))
+            wdl_value = float(wdl_loss.detach().item())
+            self._last_wdl_loss = (
+                wdl_value / wdl_weight if wdl_weight > 0 else wdl_value
+            )
+        else:
+            self._last_wdl_loss = None
 
         if return_outputs:
             return loss, outputs
@@ -157,11 +174,10 @@ class EloEvaluationCallback(TrainerCallback):
             model.train()
 
         metrics = {
-            "elo": float(elo),
-            "elo_se": float(elo_se),
-            "step": step,
+            "eval_elo": float(elo),
+            "eval_elo_se": float(elo_se),
         }
-        self.trainer.log_metrics("eval", metrics)
+        self.trainer.log(metrics)
         self._last_step_logged = step
 
         return control
@@ -254,6 +270,8 @@ def train() -> None:
         pad_token_id=pad_token_id,
     )
     config.policy_dim = len(policy_index)
+    config.policy_loss_weight = POLICY_LOSS_WEIGHT
+    config.wdl_loss_weight = WDL_LOSS_WEIGHT
     print(f"Model config created - policy dimension: {config.policy_dim}")
 
     print("Initializing ChessGPT2 model...")
