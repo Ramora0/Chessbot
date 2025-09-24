@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import torch
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -24,9 +26,46 @@ OUTPUT_DIR = "outputs"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 71
 PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
-ELO_EVAL_STEPS = 2000
+ELO_EVAL_STEPS = 4000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
+BASE_BATCH_SIZE = 256
+BASE_LEARNING_RATE = 5e-5
+BASE_MAX_STEPS = 2_800_000
+BASE_SAVE_STEPS = 10_000
+BASE_LOGGING_STEPS = 200
+BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
+
+
+@dataclass
+class TrainingSchedule:
+    learning_rate: float
+    max_steps: int
+    save_steps: int
+    logging_steps: int
+    elo_eval_steps: int
+
+
+def build_training_schedule(batch_size: int) -> TrainingSchedule:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    scale = batch_size / BASE_BATCH_SIZE
+    inv_scale = BASE_BATCH_SIZE / batch_size
+
+    learning_rate = BASE_LEARNING_RATE * scale
+    max_steps = max(1, int(BASE_MAX_STEPS * inv_scale))
+    save_steps = max(1, int(BASE_SAVE_STEPS * inv_scale))
+    logging_steps = max(1, int(BASE_LOGGING_STEPS * inv_scale))
+    elo_eval_steps = max(1, int(BASE_ELO_EVAL_STEPS * inv_scale))
+
+    return TrainingSchedule(
+        learning_rate=learning_rate,
+        max_steps=max_steps,
+        save_steps=save_steps,
+        logging_steps=logging_steps,
+        elo_eval_steps=elo_eval_steps,
+    )
 
 
 class EloEvaluationCallback(TrainerCallback):
@@ -131,9 +170,19 @@ def train() -> None:
         act_token_id=act_token_id,
     )
 
-    max_steps = 2_800_000
+    per_device_batch_size = 512
+    schedule = build_training_schedule(per_device_batch_size)
+
     print(
-        f"Streaming dataset detected. Training will run for {max_steps} steps.")
+        f"Streaming dataset detected. Training will run for {schedule.max_steps} steps.")
+    print(
+        "Training schedule:",
+        f"batch_size={per_device_batch_size}",
+        f"learning_rate={schedule.learning_rate}",
+        f"save_steps={schedule.save_steps}",
+        f"logging_steps={schedule.logging_steps}",
+        f"elo_eval_steps={schedule.elo_eval_steps}",
+    )
     eval_dataset = None
     eval_path = Path(DEFAULT_EVAL_DATASET_DIR)
     if eval_path.exists():
@@ -168,21 +217,28 @@ def train() -> None:
     print(
         f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
 
+    if hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)
+            print("Model compiled with torch.compile")
+        except RuntimeError as err:
+            print(f"torch.compile unavailable at runtime: {err}")
+
     print("Setting up training arguments...")
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         # num_train_epochs=1,
 
-        per_device_train_batch_size=256,
-        learning_rate=2e-4,
+        per_device_train_batch_size=per_device_batch_size,
+        learning_rate=schedule.learning_rate,
         weight_decay=0,
         max_grad_norm=1.0,
         bf16=True,
         save_strategy="steps",
-        save_steps=10000,
+        save_steps=schedule.save_steps,
         logging_strategy="steps",
-        logging_steps=50,
-        report_to=[],
+        logging_steps=schedule.logging_steps,
+        report_to=["wandb"],
         run_name="chessformer-gpt2-policy",
         remove_unused_columns=False,
 
@@ -190,9 +246,18 @@ def train() -> None:
         dataloader_prefetch_factor=1,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
-        max_steps=max_steps,
+        max_steps=schedule.max_steps,
     )
-    print(f"Training config: {training_args.num_train_epochs} epochs, batch size {training_args.per_device_train_batch_size}, lr {training_args.learning_rate}")
+    print(
+        f"Training config: {training_args.num_train_epochs} epochs, batch size {training_args.per_device_train_batch_size}, "
+        f"lr {training_args.learning_rate}")
+    print(
+        "Effective schedule:",
+        f"max_steps={training_args.max_steps}",
+        f"save_steps={training_args.save_steps}",
+        f"logging_steps={training_args.logging_steps}",
+        f"elo_eval_steps={schedule.elo_eval_steps}",
+    )
 
     print("Creating trainer...")
     data_collator = ChessPolicyCollator()
@@ -204,14 +269,14 @@ def train() -> None:
         data_collator=data_collator,
     )
 
-    if eval_dataset is not None and ELO_EVAL_STEPS > 0:
+    if eval_dataset is not None and schedule.elo_eval_steps > 0:
         print(
-            f"Registering Elo evaluation callback every {ELO_EVAL_STEPS} steps "
+            f"Registering Elo evaluation callback every {schedule.elo_eval_steps} steps "
             f"(batch size {EVAL_BATCH_SIZE})"
         )
         elo_callback = EloEvaluationCallback(
             eval_dataset=eval_dataset,
-            frequency=ELO_EVAL_STEPS,
+            frequency=schedule.elo_eval_steps,
             batch_size=EVAL_BATCH_SIZE,
         )
         elo_callback.attach_trainer(trainer)
