@@ -14,6 +14,8 @@ DATASET_SPLIT = "train"
 OUTPUT_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
 BATCH_SIZE = 1_024
 EXPECTED_SEQ_LEN = 71
+# Controls the on-disk shard size when saving the processed dataset.
+MAX_SHARD_SIZE = "1500MB"
 
 
 def main() -> None:
@@ -61,8 +63,13 @@ def main() -> None:
     output_path = Path(OUTPUT_DIR)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"Saving processed dataset to '{output_path}'...")
-    processed_dataset.save_to_disk(str(output_path))
+    print(
+        f"Saving processed dataset to '{output_path}' with max shard size {MAX_SHARD_SIZE}..."
+    )
+    processed_dataset.save_to_disk(
+        str(output_path),
+        max_shard_size=MAX_SHARD_SIZE,
+    )
     print("Processing complete.")
 
 

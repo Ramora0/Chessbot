@@ -22,7 +22,7 @@ from evaluation import evaluate_model_elo, DEFAULT_EVAL_DATASET_DIR
 OUTPUT_DIR = "outputs"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 71
-PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
+PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/chessfens_consolidated"
 ELO_EVAL_STEPS = 2000
 EVAL_BATCH_SIZE = 4096
 
@@ -158,7 +158,7 @@ def train() -> None:
 
         per_device_train_batch_size=256,
         learning_rate=2e-4,
-        weight_decay=0.01,
+        weight_decay=0,
         max_grad_norm=1.0,
         bf16=True,
         save_strategy="steps",
