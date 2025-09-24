@@ -76,9 +76,19 @@ class ChessPolicyDataset(IterableDataset):
                 f"input_ids length {seq_len} does not match expected {EXPECTED_SEQ_LEN}"
             )
 
+        wdl = torch.as_tensor(example["wdl"])
+        if wdl.dtype != torch.float32:
+            wdl = wdl.to(dtype=torch.float32)
+
+        if wdl.ndim != 1 or wdl.shape[0] != 3:
+            raise ValueError(
+                f"wdl field expected shape (3,), received {tuple(wdl.shape)}"
+            )
+
         return {
             "policy": policy,
             "input_ids": input_ids,
+            "wdl": wdl,
         }
 
 
@@ -91,9 +101,11 @@ class ChessPolicyCollator:
     def __call__(self, batch: Iterable[Dict[str, object]]) -> Dict[str, torch.Tensor]:
         input_ids_list = []
         policy_list = []
+        wdl_list = []
         for item in batch:
             input_ids_list.append(item["input_ids"])
             policy_list.append(item["policy"])
+            wdl_list.append(item["wdl"])
 
         if not input_ids_list:
             raise ValueError("Empty batch provided to ChessPolicyCollator")
@@ -116,9 +128,18 @@ class ChessPolicyCollator:
                 f"received {policy_values.shape[1]}"
             )
 
+        wdl_values = torch.stack(wdl_list)
+        if wdl_values.dtype != torch.float32:
+            wdl_values = wdl_values.to(dtype=torch.float32)
+        if wdl_values.shape[1] != 3:
+            raise ValueError(
+                f"wdl tensor expected width 3, received {wdl_values.shape[1]}"
+            )
+
         return {
             "input_ids": input_ids,
             "policy": policy_values,
+            "wdl": wdl_values,
         }
 
 

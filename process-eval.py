@@ -24,6 +24,7 @@ BATCH_SIZE = 2_048
 POLICY_MOVES: List[str] = policy_index
 POLICY_SIZE = len(POLICY_MOVES)
 MOVE_TO_INDEX = {move: idx for idx, move in enumerate(POLICY_MOVES)}
+EXPECTED_SEQ_LEN = 71
 
 
 def chunked(iterable: List[dict], size: int) -> Iterable[List[dict]]:
@@ -124,6 +125,9 @@ def main() -> None:
 
     print("Loading tokenizer...")
     tokenizer = create_tokenizer()
+    act_token_id = tokenizer.token_to_id("<ACT>")
+    if act_token_id is None:
+        raise ValueError("Tokenizer does not contain the <ACT> token")
 
     processed_records: List[dict] = []
     for chunk in chunked(raw_examples, BATCH_SIZE):
@@ -133,12 +137,21 @@ def main() -> None:
 
         for item, encoding in zip(chunk, encodings):
             item.pop("fen", None)
+            ids = list(encoding.ids)
+            if not ids or ids[-1] != act_token_id:
+                ids.append(act_token_id)
+            if len(ids) != EXPECTED_SEQ_LEN:
+                raise ValueError(
+                    f"Processed sequence length {len(ids)} does not match expected {EXPECTED_SEQ_LEN}"
+                )
             processed_record = {
                 "puzzle_id": item["puzzle_id"],
                 "rating": item["rating"],
                 "target_policy_index": item["target_policy_index"],
                 "legal_moves_mask": item["legal_moves_mask"],
-                "input_ids": encoding.ids,
+                "target_move": policy_index[item["target_policy_index"]],
+                "target_probability": 1.0,
+                "input_ids": ids,
             }
             processed_records.append(processed_record)
 
