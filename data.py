@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, Iterator, List
 
 import torch
-from torch.utils.data import Dataset
-from datasets import Dataset as HFDataset
+from torch.utils.data import IterableDataset, get_worker_info
+from datasets import IterableDataset as HFIterableDataset
 
 from policy_index import policy_index
 
@@ -12,33 +12,54 @@ from policy_index import policy_index
 EXPECTED_SEQ_LEN = 71
 
 
-class ChessPolicyDataset(Dataset):
-    """Dataset wrapper that defers expensive preprocessing to the collator."""
+class ChessPolicyDataset(IterableDataset):
+    """Streaming-only dataset wrapper that validates incoming examples."""
 
-    def __init__(self, hf_dataset: HFDataset, act_token_id: int) -> None:
-        self.dataset = hf_dataset
-        self.policy_size = len(policy_index)
+    def __init__(self, hf_dataset: HFIterableDataset, act_token_id: int) -> None:
         if act_token_id is None:
             raise ValueError("act_token_id must be provided")
+        if not isinstance(hf_dataset, HFIterableDataset):
+            raise TypeError("ChessPolicyDataset requires a streaming Hugging Face dataset")
+
+        self.dataset = hf_dataset
         self.act_token_id = int(act_token_id)
+        self.policy_size = len(policy_index)
+
+    @property
+    def is_streaming(self) -> bool:
+        return True
 
     def __len__(self) -> int:
-        return len(self.dataset)
+        raise TypeError("ChessPolicyDataset wraps streaming data and has no length")
 
-    def __getitem__(self, index: int) -> Dict[str, object]:
-        example = self.dataset[int(index)]
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            shard = self.dataset.shard(worker_info.num_workers, worker_info.id)
+            iterator: Iterable[Dict[str, object]] = iter(shard)
+        else:
+            iterator = iter(self.dataset)
+
+        for example in iterator:
+            yield self._process_example(example)
+
+    def _process_example(self, example: Dict[str, object]) -> Dict[str, torch.Tensor]:
         policy_values = example["policy"]
-        if len(policy_values) != self.policy_size:
+        if torch.is_tensor(policy_values):
+            policy = policy_values.to(dtype=torch.float32)
+        else:
+            policy = torch.tensor(policy_values, dtype=torch.float32)
+
+        if policy.ndim != 1 or policy.shape[0] != self.policy_size:
             raise ValueError(
-                f"policy field expected length {self.policy_size}, "
-                f"received {len(policy_values)}"
+                f"policy field expected shape ({self.policy_size},), received {tuple(policy.shape)}"
             )
 
         input_ids = example["input_ids"]
-        if not torch.is_tensor(input_ids):
-            input_ids = torch.tensor(input_ids, dtype=torch.long)
+        if torch.is_tensor(input_ids):
+            input_ids = input_ids.to(dtype=torch.long)
         else:
-            input_ids = input_ids.to(torch.long)
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
 
         if input_ids.ndim != 1:
             raise ValueError(
@@ -60,7 +81,7 @@ class ChessPolicyDataset(Dataset):
             )
 
         return {
-            "policy": policy_values,
+            "policy": policy,
             "input_ids": input_ids,
         }
 
@@ -102,7 +123,7 @@ class ChessPolicyCollator:
 
 
 def create_dataloader(
-    hf_dataset: HFDataset,
+    hf_dataset: HFIterableDataset,
     act_token_id: int,
     batch_size: int = 32,
     shuffle: bool = True,
@@ -110,10 +131,15 @@ def create_dataloader(
 ) -> torch.utils.data.DataLoader:
     dataset = ChessPolicyDataset(hf_dataset, act_token_id=act_token_id)
     collator = ChessPolicyCollator()
+
+    if shuffle:
+        raise ValueError(
+            "Shuffling must be applied to the source dataset before wrapping in ChessPolicyDataset"
+        )
+
     return torch.utils.data.DataLoader(
-        dataset,
+        dataset=dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
         num_workers=num_workers,
         collate_fn=collator,
     )

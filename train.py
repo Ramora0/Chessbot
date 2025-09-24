@@ -10,7 +10,8 @@ from transformers import (
     TrainingArguments,
     TrainerCallback,
 )
-from datasets import load_from_disk
+from datasets import load_from_disk, load_dataset
+from datasets import IterableDataset as HFIterableDataset
 
 from data import ChessPolicyCollator, ChessPolicyDataset
 from model import ChessGPT2PolicyValue
@@ -22,9 +23,10 @@ from evaluation import evaluate_model_elo, DEFAULT_EVAL_DATASET_DIR
 OUTPUT_DIR = "outputs"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 71
-PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/chessfens_consolidated"
+PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
 ELO_EVAL_STEPS = 2000
 EVAL_BATCH_SIZE = 4096
+TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
 
 
 class EloEvaluationCallback(TrainerCallback):
@@ -105,18 +107,33 @@ def train() -> None:
         )
 
     print(f"Loading preprocessed dataset from '{processed_path}'...")
-    hf_dataset = load_from_disk(str(processed_path))
-    hf_dataset.set_format(
-        type="torch",
-        columns=["input_ids", "policy"],
+
+    # hf_dataset = load_from_disk(str(processed_path))
+    data_files = sorted(str(path)
+                        for path in processed_path.glob("data-*.arrow"))
+
+    hf_dataset = load_dataset(
+        "arrow",
+        data_files=data_files,
+        split="train",
+        streaming=True,
     )
+
+    # optional: approximate shuffle with a buffer
+    hf_dataset = hf_dataset.shuffle(buffer_size=100_000)
+
+    if not isinstance(hf_dataset, HFIterableDataset):
+        raise TypeError(
+            "Expected streaming dataset when loading training data")
 
     train_dataset = ChessPolicyDataset(
         hf_dataset,
         act_token_id=act_token_id,
     )
-    print(f"Dataset loaded - training samples: {len(train_dataset)}")
 
+    max_steps = 2_800_000
+    print(
+        f"Streaming dataset detected. Training will run for {max_steps} steps.")
     eval_dataset = None
     eval_path = Path(DEFAULT_EVAL_DATASET_DIR)
     if eval_path.exists():
@@ -154,7 +171,7 @@ def train() -> None:
     print("Setting up training arguments...")
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        num_train_epochs=1,
+        # num_train_epochs=1,
 
         per_device_train_batch_size=256,
         learning_rate=2e-4,
@@ -172,6 +189,7 @@ def train() -> None:
         dataloader_num_workers=8,
         dataloader_prefetch_factor=1,
         dataloader_pin_memory=True,
+        max_steps=max_steps,
     )
     print(f"Training config: {training_args.num_train_epochs} epochs, batch size {training_args.per_device_train_batch_size}, lr {training_args.learning_rate}")
 
