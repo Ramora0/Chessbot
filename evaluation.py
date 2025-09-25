@@ -239,9 +239,11 @@ def _write_move_distribution_log(
     per_puzzle_results: List[Tuple[int, float]],
     elo: float,
     elo_se: float,
+    expected_solved_puzzles: float,
+    solve_percentage: float,
     output_dir: Path = MOVE_DISTRIBUTION_OUTPUT_DIR,
 ) -> Path:
-    """Persist move probability samples for a subset of puzzles to disk."""
+    """Persist move probability samples and aggregate solve stats to disk."""
 
     total_puzzles = len(details.puzzle_order)
     if total_puzzles == 0:
@@ -289,11 +291,17 @@ def _write_move_distribution_log(
     output_path = output_dir / \
         f"move-distributions_elo-{safe_elo_label}_{timestamp_str}.json"
 
+    solve_percentage_value = None
+    if not np.isnan(solve_percentage):
+        solve_percentage_value = float(solve_percentage)
+
     payload = {
         "generated_at": timestamp_str,
         "elo_estimate": float(elo),
         "elo_standard_error": float(elo_se),
         "puzzle_count": total_puzzles,
+        "expected_solved_puzzles": float(expected_solved_puzzles),
+        "expected_solve_percentage": solve_percentage_value,
         "probability_threshold": MOVE_PROB_THRESHOLD,
         "selected_indices": selected_indices,
         "puzzles": selected_puzzles,
@@ -312,9 +320,10 @@ def evaluate_model_elo(
     device: Optional[torch.device] = None,
     init_rating: Optional[float] = None,
     dataset: Optional[Dataset] = None,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     """
-    Run evaluation and return an Elo estimate with its standard error.
+    Run evaluation and return an Elo estimate, its standard error, and the
+    expected puzzle solve percentage across the evaluation set.
 
     The estimator treats each puzzle solve probability as an independent Bernoulli
     trial under the Elo logistic model and fits the single Elo parameter R.
@@ -338,6 +347,15 @@ def evaluate_model_elo(
         probability for _, probability in per_puzzle_results
     ], dtype=np.float64)
 
+    total_puzzles = solve_probabilities.size
+    expected_solved_puzzles = float(np.sum(solve_probabilities))
+    if total_puzzles > 0:
+        solve_percentage = float(
+            (expected_solved_puzzles / float(total_puzzles)) * 100.0
+        )
+    else:
+        solve_percentage = float("nan")
+
     if init_rating is None and len(ratings) > 0:
         init_rating = float(np.median(ratings))
 
@@ -352,7 +370,18 @@ def evaluate_model_elo(
         per_puzzle_results=per_puzzle_results,
         elo=elo,
         elo_se=elo_se,
+        expected_solved_puzzles=expected_solved_puzzles,
+        solve_percentage=solve_percentage,
     )
     print(f"Wrote move distribution log to '{output_path}'.")
 
-    return elo, elo_se
+    if total_puzzles > 0:
+        print(
+            "Expected puzzle solve rate: "
+            f"{solve_percentage:.2f}% "
+            f"({expected_solved_puzzles:.2f}/{total_puzzles})"
+        )
+    else:
+        print("Expected puzzle solve rate: nan (no puzzles evaluated)")
+
+    return elo, elo_se, solve_percentage

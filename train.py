@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 import torch
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,8 +36,6 @@ BASE_MAX_STEPS = 2_800_000
 BASE_SAVE_STEPS = 10_000
 BASE_LOGGING_STEPS = 200
 BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
-POLICY_LOSS_WEIGHT = 0.9
-WDL_LOSS_WEIGHT = 0.1
 
 
 @dataclass
@@ -78,6 +77,7 @@ class TrackingTrainer(Trainer):
         self._last_policy_loss: Optional[float] = None
         self._last_wdl_loss: Optional[float] = None
         self._last_total_loss: Optional[float] = None
+        self._last_illegality_loss: Optional[float] = None
 
     def compute_loss(
         self,
@@ -114,6 +114,19 @@ class TrackingTrainer(Trainer):
         else:
             self._last_wdl_loss = None
 
+        illegality_loss = getattr(outputs, "illegality_loss", None)
+        if illegality_loss is not None:
+            illegality_weight = float(
+                getattr(model, "illegality_loss_weight", 0.0))
+            illegality_value = float(illegality_loss.detach().item())
+            self._last_illegality_loss = (
+                illegality_value / illegality_weight
+                if illegality_weight > 0
+                else illegality_value
+            )
+        else:
+            self._last_illegality_loss = None
+
         if return_outputs:
             return loss, outputs
         return loss
@@ -127,6 +140,8 @@ class TrackingTrainer(Trainer):
                 logs.setdefault("policy_loss", self._last_policy_loss)
             if self._last_wdl_loss is not None:
                 logs.setdefault("wdl_loss", self._last_wdl_loss)
+            if self._last_illegality_loss is not None:
+                logs.setdefault("illegality_loss", self._last_illegality_loss)
         super().log(logs, *args, **kwargs)
 
 
@@ -165,7 +180,7 @@ class EloEvaluationCallback(TrainerCallback):
 
         model = self.trainer.model
         was_training = model.training
-        elo, elo_se = evaluate_model_elo(
+        elo, elo_se, solve_percentage = evaluate_model_elo(
             model=model,
             batch_size=self.batch_size,
             dataset=self.eval_dataset,
@@ -177,6 +192,8 @@ class EloEvaluationCallback(TrainerCallback):
             "eval_elo": float(elo),
             "eval_elo_se": float(elo_se),
         }
+        if not math.isnan(solve_percentage):
+            metrics["eval_puzzle_accuracy"] = float(solve_percentage)
         self.trainer.log(metrics)
         self._last_step_logged = step
 
@@ -257,21 +274,19 @@ def train() -> None:
         )
 
     print("Creating model configuration...")
-    config = GPT2Config(
+    config_deeper_moderate = GPT2Config(
         vocab_size=vocab_size,
         n_positions=MAX_SEQ_LENGTH,
         n_ctx=MAX_SEQ_LENGTH,
-        n_embd=768,
-        n_layer=18,
-        n_head=12,
+        n_embd=544,          # ↓ width
+        n_layer=36,          # ↑ depth
+        n_head=8,            # 544 / 8 = 68
         resid_pdrop=DROPOUT,
         embd_pdrop=DROPOUT,
         attn_pdrop=DROPOUT,
         pad_token_id=pad_token_id,
     )
     config.policy_dim = len(policy_index)
-    config.policy_loss_weight = POLICY_LOSS_WEIGHT
-    config.wdl_loss_weight = WDL_LOSS_WEIGHT
     print(f"Model config created - policy dimension: {config.policy_dim}")
 
     print("Initializing ChessGPT2 model...")
@@ -299,6 +314,7 @@ def train() -> None:
         bf16=True,
         save_strategy="steps",
         save_steps=schedule.save_steps,
+        save_total_limit=2,
         logging_strategy="steps",
         logging_steps=schedule.logging_steps,
         report_to=["wandb"],

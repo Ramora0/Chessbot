@@ -10,9 +10,16 @@ from transformers import GPT2Model
 from transformers.modeling_outputs import ModelOutput
 from transformers.models.gpt2.modeling_gpt2 import GPT2PreTrainedModel
 
+from loss_weights import (
+    POLICY_LOSS_WEIGHT,
+    WDL_LOSS_WEIGHT,
+    ILLEGALITY_LOSS_WEIGHT,
+)
 
-DEFAULT_POLICY_LOSS_WEIGHT = 0.9
-DEFAULT_WDL_LOSS_WEIGHT = 0.1
+
+DEFAULT_POLICY_LOSS_WEIGHT = POLICY_LOSS_WEIGHT
+DEFAULT_WDL_LOSS_WEIGHT = WDL_LOSS_WEIGHT
+DEFAULT_ILLEGALITY_LOSS_WEIGHT = ILLEGALITY_LOSS_WEIGHT
 
 
 @dataclass
@@ -22,6 +29,7 @@ class ChessGPT2Output(ModelOutput):
     wdl_logits: torch.Tensor = None
     policy_loss: Optional[torch.Tensor] = None
     wdl_loss: Optional[torch.Tensor] = None
+    illegality_loss: Optional[torch.Tensor] = None
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
 
@@ -35,16 +43,9 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
         self.norm = nn.LayerNorm(config.n_embd)
         self.policy_head = nn.Linear(config.n_embd, self.policy_dim)
         self.wdl_head = nn.Linear(config.n_embd, 3)
-        self.policy_loss_weight = float(
-            getattr(config, "policy_loss_weight", DEFAULT_POLICY_LOSS_WEIGHT)
-        )
-        self.wdl_loss_weight = float(
-            getattr(config, "wdl_loss_weight", DEFAULT_WDL_LOSS_WEIGHT)
-        )
-        if self.policy_loss_weight < 0 or self.wdl_loss_weight < 0:
-            raise ValueError("Loss weights must be non-negative")
-        if self.policy_loss_weight + self.wdl_loss_weight == 0:
-            raise ValueError("At least one loss weight must be positive")
+        self.policy_loss_weight = float(DEFAULT_POLICY_LOSS_WEIGHT)
+        self.wdl_loss_weight = float(DEFAULT_WDL_LOSS_WEIGHT)
+        self.illegality_loss_weight = float(DEFAULT_ILLEGALITY_LOSS_WEIGHT)
         self.post_init()
 
     # type: ignore[override]
@@ -90,14 +91,15 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
         target_device = policy_logits.device
 
         policy_loss: Optional[torch.Tensor] = None
+        policy_mask_bool: Optional[torch.Tensor] = None
         if policy is not None:
             if policy.device != target_device:
                 policy = policy.to(target_device)
 
-            policy_mask = (policy >= 0).to(dtype=torch.bool)
-            policy = policy.masked_fill(~policy_mask, 0)
+            policy_mask_bool = (policy >= 0).to(dtype=torch.bool)
+            policy = policy.masked_fill(~policy_mask_bool, 0)
 
-            masked_logits = policy_logits.masked_fill(~policy_mask, -1e9)
+            masked_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
             policy_log_probs = F.log_softmax(masked_logits, dim=-1)
             raw_policy_loss = -(policy * policy_log_probs).sum(dim=-1).mean()
             policy_loss = self.policy_loss_weight * raw_policy_loss
@@ -111,13 +113,30 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
             raw_wdl_loss = -(wdl * wdl_log_probs).sum(dim=-1).mean()
             wdl_loss = self.wdl_loss_weight * raw_wdl_loss
 
+        illegality_loss: Optional[torch.Tensor] = None
+        if policy is not None and self.illegality_loss_weight > 0:
+            if policy_mask_bool is None:
+                raise ValueError("Policy mask missing while computing illegality loss")
+            illegal_mask = (~policy_mask_bool).to(dtype=policy_logits.dtype)
+            if illegal_mask.ndim == policy_logits.ndim:
+                illegal_probs = F.softmax(policy_logits, dim=-1)
+                summed_illegal_prob = (illegal_probs * illegal_mask).sum(dim=-1)
+                illegality_loss = self.illegality_loss_weight * (
+                    summed_illegal_prob.pow(2).mean()
+                )
+            else:
+                raise ValueError("Illegal mask shape mismatch when computing illegality loss")
+        elif policy is None and self.illegality_loss_weight > 0:
+            illegality_loss = None
+
+        loss_components = [
+            component
+            for component in (policy_loss, wdl_loss, illegality_loss)
+            if component is not None
+        ]
         loss: Optional[torch.Tensor] = None
-        if policy_loss is not None and wdl_loss is not None:
-            loss = policy_loss + wdl_loss
-        elif policy_loss is not None:
-            loss = policy_loss
-        elif wdl_loss is not None:
-            loss = wdl_loss
+        if loss_components:
+            loss = sum(loss_components)
 
         if not return_dict:
             outputs = (
@@ -134,6 +153,7 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
             wdl_logits=wdl_logits,
             policy_loss=policy_loss,
             wdl_loss=wdl_loss,
+            illegality_loss=illegality_loss,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
