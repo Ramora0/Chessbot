@@ -25,13 +25,13 @@ from evaluation import evaluate_model_elo, DEFAULT_EVAL_DATASET_DIR
 
 OUTPUT_DIR = "outputs"
 DROPOUT = 0.1
-MAX_SEQ_LENGTH = 71
+MAX_SEQ_LENGTH = 72
 PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
 ELO_EVAL_STEPS = 4000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
 BASE_BATCH_SIZE = 256
-BASE_LEARNING_RATE = 5e-5
+BASE_LEARNING_RATE = 2e-5
 BASE_MAX_STEPS = 2_800_000
 BASE_SAVE_STEPS = 10_000
 BASE_LOGGING_STEPS = 200
@@ -213,6 +213,9 @@ def train() -> None:
     act_token_id = tokenizer.token_to_id("<ACT>")
     if act_token_id is None:
         raise ValueError("Tokenizer is missing the <ACT> token")
+    think_token_id = tokenizer.token_to_id("<THINK>")
+    if think_token_id is None:
+        raise ValueError("Tokenizer is missing the <THINK> token")
     print(
         f"Tokenizer created - vocab size: {vocab_size}, pad token id: {pad_token_id}")
 
@@ -246,9 +249,10 @@ def train() -> None:
     train_dataset = ChessPolicyDataset(
         hf_dataset,
         act_token_id=act_token_id,
+        think_token_id=think_token_id,
     )
 
-    per_device_batch_size = 512
+    per_device_batch_size = 1024
     schedule = build_training_schedule(per_device_batch_size)
 
     print(
@@ -274,13 +278,13 @@ def train() -> None:
         )
 
     print("Creating model configuration...")
-    config_deeper_moderate = GPT2Config(
+    config = GPT2Config(
         vocab_size=vocab_size,
         n_positions=MAX_SEQ_LENGTH,
         n_ctx=MAX_SEQ_LENGTH,
-        n_embd=544,          # ↓ width
-        n_layer=36,          # ↑ depth
-        n_head=8,            # 544 / 8 = 68
+        n_embd=768,
+        n_layer=18,
+        n_head=12,
         resid_pdrop=DROPOUT,
         embd_pdrop=DROPOUT,
         attn_pdrop=DROPOUT,

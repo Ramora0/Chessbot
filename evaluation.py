@@ -23,6 +23,11 @@ def _collate_fn(batch: Iterable[dict]) -> Dict[str, object]:
     input_ids = torch.tensor([
         example["input_ids"] for example in batch_list
     ], dtype=torch.long)
+    seq_len = input_ids.shape[1]
+    if seq_len < 2:
+        raise ValueError("input_ids sequence too short to apply causal masking")
+    causal_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    causal_mask[:, seq_len - 2 :] = True
     target_indices = torch.tensor([
         example["target_policy_index"] for example in batch_list
     ], dtype=torch.long)
@@ -35,6 +40,7 @@ def _collate_fn(batch: Iterable[dict]) -> Dict[str, object]:
 
     return {
         "input_ids": input_ids,
+        "causal_mask": causal_mask,
         "target_indices": target_indices,
         "legal_masks": legal_masks,
         "puzzle_ids": puzzle_ids,
@@ -149,11 +155,13 @@ def evaluate_puzzles(
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch["input_ids"].to(model_device)
+            causal_mask = batch["causal_mask"].to(model_device)
             legal_masks = batch["legal_masks"].to(model_device)
             target_indices = batch["target_indices"].to(model_device)
 
             outputs = model(
                 input_ids=input_ids,
+                causal_mask=causal_mask,
                 return_dict=True,
             )
             logits = outputs.policy_logits

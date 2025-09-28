@@ -73,15 +73,93 @@ class ChessGPT2PolicyValue(GPT2PreTrainedModel):
             ones_bias = torch.ones_like(attn.bias)
             attn.register_buffer("bias", ones_bias)
 
+    def _build_causal_attention_mask(
+        self,
+        input_ids: torch.Tensor,
+        causal_mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        extended_attention_mask: Optional[torch.Tensor] = None
+        if attention_mask is not None:
+            if attention_mask.dim() == 4:
+                extended_attention_mask = attention_mask.to(dtype=self.transformer.dtype)
+            else:
+                if not torch.is_floating_point(attention_mask):
+                    attention_mask = attention_mask.to(dtype=self.transformer.dtype)
+                extended_attention_mask = self.get_extended_attention_mask(
+                    attention_mask,
+                    input_shape=input_ids.shape,
+                    device=input_ids.device,
+                    dtype=self.transformer.dtype,
+                )
+
+        if causal_mask is None:
+            return extended_attention_mask
+
+        if causal_mask.dim() != 2:
+            raise ValueError(
+                f"causal_mask must be 2D with shape (batch, seq_len); received {tuple(causal_mask.shape)}"
+            )
+
+        causal_mask_bool = causal_mask.to(dtype=torch.bool)
+        if causal_mask_bool.shape != input_ids.shape:
+            raise ValueError(
+                "causal_mask shape does not match input_ids shape"
+            )
+
+        if not causal_mask_bool.any():
+            return extended_attention_mask
+
+        batch_size, seq_len = causal_mask_bool.shape
+        device = input_ids.device
+        dtype = getattr(self.transformer, "dtype", self.transformer.wte.weight.dtype)
+
+        future_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+            diagonal=1,
+        )
+        restricted_positions = causal_mask_bool.unsqueeze(-1) & future_mask.unsqueeze(0)
+
+        causal_attention = torch.zeros(
+            batch_size,
+            seq_len,
+            seq_len,
+            device=device,
+            dtype=dtype,
+        )
+        if dtype in (torch.float16, torch.bfloat16):
+            neg_value = torch.tensor(-1e4, device=device, dtype=dtype)
+        else:
+            neg_value = torch.finfo(dtype).min
+        causal_attention.masked_fill_(restricted_positions, neg_value)
+        causal_attention = causal_attention.unsqueeze(1)
+
+        if extended_attention_mask is None:
+            return causal_attention
+
+        return extended_attention_mask + causal_attention
+
     def forward(
         self,
         input_ids: torch.Tensor,
         policy: Optional[torch.Tensor] = None,
         wdl: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        causal_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         **kwargs,
     ) -> ChessGPT2Output:
-        transformer_outputs = self.transformer(input_ids=input_ids, **kwargs)
+        combined_attention_mask = self._build_causal_attention_mask(
+            input_ids=input_ids,
+            causal_mask=causal_mask,
+            attention_mask=attention_mask,
+        )
+
+        transformer_outputs = self.transformer(
+            input_ids=input_ids,
+            attention_mask=combined_attention_mask,
+            **kwargs,
+        )
         hidden_states = transformer_outputs.last_hidden_state
         pooled = hidden_states.mean(dim=1)
         pooled = self.norm(pooled)

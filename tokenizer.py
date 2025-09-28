@@ -30,6 +30,7 @@ _CASTLING_TOKENS = {c: f"{c}-c" for c in _CASTLING_ORDER}
 _CASTLING_EMPTY = "e-c"
 _EN_PASSANT_EMPTY = "e-ep"
 _EN_PASSANT_SUFFIX = "-ep"
+_THINK_TOKEN = "<THINK>"
 _ACT_TOKEN = "<ACT>"
 
 
@@ -73,7 +74,7 @@ def process_fen(fen: str) -> str:
     # Sixth part (fullmove): add -fm
     # fullmove = parts[5] + '-fm'
 
-    return f"{board_result} {turn} {castling} {en_passant} {_ACT_TOKEN}"
+    return f"{board_result} {turn} {castling} {en_passant} {_THINK_TOKEN} {_ACT_TOKEN}"
 
 
 def process_fen_batch(fens: Iterable[str]) -> List[str]:
@@ -116,7 +117,7 @@ def process_fen_batch(fens: Iterable[str]) -> List[str]:
         )
 
         append_result(
-            f"{board_str} {turn_token} {castling_str} {en_passant_token} {_ACT_TOKEN}"
+            f"{board_str} {turn_token} {castling_str} {en_passant_token} {_THINK_TOKEN} {_ACT_TOKEN}"
         )
 
     return results
@@ -156,6 +157,7 @@ def create_vocabulary():
     # for i in range(1, 401):
     #     vocab.add(f"{i}-fm")
 
+    vocab.add(_THINK_TOKEN)
     vocab.add(_ACT_TOKEN)
 
     return sorted(vocab)

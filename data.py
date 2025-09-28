@@ -9,20 +9,30 @@ from datasets import IterableDataset as HFIterableDataset
 from policy_index import policy_index
 
 
-EXPECTED_SEQ_LEN = 71
+EXPECTED_SEQ_LEN = 72
+EXTRA_TOKENS = 2
 
 
 class ChessPolicyDataset(IterableDataset):
     """Streaming-only dataset wrapper that validates incoming examples."""
 
-    def __init__(self, hf_dataset: HFIterableDataset, act_token_id: int) -> None:
+    def __init__(
+        self,
+        hf_dataset: HFIterableDataset,
+        act_token_id: int,
+        think_token_id: int,
+    ) -> None:
         if act_token_id is None:
             raise ValueError("act_token_id must be provided")
+        if think_token_id is None:
+            raise ValueError("think_token_id must be provided")
         if not isinstance(hf_dataset, HFIterableDataset):
             raise TypeError("ChessPolicyDataset requires a streaming Hugging Face dataset")
 
         self.dataset = hf_dataset
         self.act_token_id = int(act_token_id)
+        self.think_token_id = int(think_token_id)
+        self.base_seq_len = EXPECTED_SEQ_LEN - EXTRA_TOKENS
         self.policy_size = len(policy_index)
 
     @property
@@ -64,17 +74,30 @@ class ChessPolicyDataset(IterableDataset):
 
         seq_len = input_ids.shape[0]
         if seq_len == EXPECTED_SEQ_LEN:
+            if input_ids[-2].item() != self.think_token_id or input_ids[-1].item() != self.act_token_id:
+                raise ValueError(
+                    "input_ids final tokens do not match expected <THINK> and <ACT> token ids"
+                )
+        elif seq_len == EXPECTED_SEQ_LEN - 1:
             if input_ids[-1].item() != self.act_token_id:
                 raise ValueError(
                     f"input_ids final token id {input_ids[-1].item()} does not match expected act token id {self.act_token_id}"
                 )
-        elif seq_len == EXPECTED_SEQ_LEN - 1:
+            think_token = input_ids.new_tensor([self.think_token_id])
             act_token = input_ids.new_tensor([self.act_token_id])
-            input_ids = torch.cat((input_ids, act_token))
+            input_ids = torch.cat((input_ids[:-1], think_token, act_token))
+        elif seq_len == EXPECTED_SEQ_LEN - EXTRA_TOKENS:
+            think_token = input_ids.new_tensor([self.think_token_id])
+            act_token = input_ids.new_tensor([self.act_token_id])
+            input_ids = torch.cat((input_ids, think_token, act_token))
         else:
             raise ValueError(
                 f"input_ids length {seq_len} does not match expected {EXPECTED_SEQ_LEN}"
             )
+
+        original_seq_len = input_ids.shape[0] - EXTRA_TOKENS
+        causal_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        causal_mask[original_seq_len:] = True
 
         wdl = torch.as_tensor(example["wdl"])
         if wdl.dtype != torch.float32:
@@ -88,6 +111,7 @@ class ChessPolicyDataset(IterableDataset):
         return {
             "policy": policy,
             "input_ids": input_ids,
+            "causal_mask": causal_mask,
             "wdl": wdl,
         }
 
@@ -102,10 +126,12 @@ class ChessPolicyCollator:
         input_ids_list = []
         policy_list = []
         wdl_list = []
+        causal_masks = []
         for item in batch:
             input_ids_list.append(item["input_ids"])
             policy_list.append(item["policy"])
             wdl_list.append(item["wdl"])
+            causal_masks.append(item["causal_mask"])
 
         if not input_ids_list:
             raise ValueError("Empty batch provided to ChessPolicyCollator")
@@ -117,6 +143,12 @@ class ChessPolicyCollator:
         if input_ids.ndim != 2 or input_ids.shape[1] != EXPECTED_SEQ_LEN:
             raise ValueError(
                 f"Batch tokenized length {input_ids.shape[1]} does not match expected {EXPECTED_SEQ_LEN}"
+            )
+
+        causal_mask_tensor = torch.stack(causal_masks)
+        if causal_mask_tensor.ndim != 2 or causal_mask_tensor.shape[1] != EXPECTED_SEQ_LEN:
+            raise ValueError(
+                "causal mask shape mismatch after batching"
             )
 
         policy_values = torch.stack(policy_list)
@@ -140,17 +172,23 @@ class ChessPolicyCollator:
             "input_ids": input_ids,
             "policy": policy_values,
             "wdl": wdl_values,
+            "causal_mask": causal_mask_tensor,
         }
 
 
 def create_dataloader(
     hf_dataset: HFIterableDataset,
     act_token_id: int,
+    think_token_id: int,
     batch_size: int = 32,
     shuffle: bool = True,
     num_workers: int = 0,
 ) -> torch.utils.data.DataLoader:
-    dataset = ChessPolicyDataset(hf_dataset, act_token_id=act_token_id)
+    dataset = ChessPolicyDataset(
+        hf_dataset,
+        act_token_id=act_token_id,
+        think_token_id=think_token_id,
+    )
     collator = ChessPolicyCollator()
 
     if shuffle:
