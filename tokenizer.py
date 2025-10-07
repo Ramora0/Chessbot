@@ -73,7 +73,7 @@ def process_fen(fen: str) -> str:
     # Sixth part (fullmove): add -fm
     # fullmove = parts[5] + '-fm'
 
-    return f"{board_result} {turn} {castling} {en_passant} {_ACT_TOKEN}"
+    return f"{board_result} {turn} {castling} {en_passant}"
 
 
 def process_fen_batch(fens: Iterable[str]) -> List[str]:
@@ -156,7 +156,7 @@ def create_vocabulary():
     # for i in range(1, 401):
     #     vocab.add(f"{i}-fm")
 
-    vocab.add(_ACT_TOKEN)
+    # vocab.add(_ACT_TOKEN)
 
     return sorted(vocab)
 

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from transformers import (
-    GPT2Config,
+    LlamaConfig,
     Trainer,
     TrainingArguments,
     TrainerCallback,
@@ -17,10 +17,10 @@ from datasets import load_from_disk, load_dataset
 from datasets import IterableDataset as HFIterableDataset
 
 from data import ChessPolicyCollator, ChessPolicyDataset
-from model import ChessGPT2PolicyValue
+from model import ChessPolicyValueModel
 from policy_index import policy_index
 from tokenizer import create_tokenizer
-from evaluation import evaluate_model_elo, DEFAULT_EVAL_DATASET_DIR
+from evaluation_puzzle import evaluate_model_elo, DEFAULT_EVAL_DATASET_DIR
 
 
 OUTPUT_DIR = "outputs"
@@ -31,7 +31,7 @@ ELO_EVAL_STEPS = 4000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
 BASE_BATCH_SIZE = 256
-BASE_LEARNING_RATE = 5e-5
+BASE_LEARNING_RATE = 2e-5
 BASE_MAX_STEPS = 2_800_000
 BASE_SAVE_STEPS = 10_000
 BASE_LOGGING_STEPS = 200
@@ -78,6 +78,9 @@ class TrackingTrainer(Trainer):
         self._last_wdl_loss: Optional[float] = None
         self._last_total_loss: Optional[float] = None
         self._last_illegality_loss: Optional[float] = None
+        self._last_illegality_rate: Optional[float] = None
+        self._last_top1_agreement: Optional[float] = None
+        self._last_model_entropy: Optional[float] = None
 
     def compute_loss(
         self,
@@ -127,6 +130,25 @@ class TrackingTrainer(Trainer):
         else:
             self._last_illegality_loss = None
 
+        # Extract metrics (not losses)
+        illegality_rate = getattr(outputs, "illegality_rate", None)
+        self._last_illegality_rate = (
+            float(illegality_rate.detach().item()
+                  ) if illegality_rate is not None else None
+        )
+
+        top1_agreement = getattr(outputs, "top1_agreement", None)
+        self._last_top1_agreement = (
+            float(top1_agreement.detach().item()
+                  ) if top1_agreement is not None else None
+        )
+
+        model_entropy = getattr(outputs, "model_entropy", None)
+        self._last_model_entropy = (
+            float(model_entropy.detach().item()
+                  ) if model_entropy is not None else None
+        )
+
         if return_outputs:
             return loss, outputs
         return loss
@@ -134,6 +156,7 @@ class TrackingTrainer(Trainer):
     def log(self, logs, *args, **kwargs):  # type: ignore[override]
         logs = dict(logs)
         if "loss" in logs:
+            # Log losses
             if self._last_total_loss is not None:
                 logs.setdefault("total_loss", self._last_total_loss)
             if self._last_policy_loss is not None:
@@ -142,6 +165,17 @@ class TrackingTrainer(Trainer):
                 logs.setdefault("wdl_loss", self._last_wdl_loss)
             if self._last_illegality_loss is not None:
                 logs.setdefault("illegality_loss", self._last_illegality_loss)
+
+            # Log metrics
+            if self._last_illegality_rate is not None:
+                logs.setdefault("illegality_rate",
+                                self._last_illegality_rate)
+            if self._last_top1_agreement is not None:
+                logs.setdefault("top1_agreement",
+                                self._last_top1_agreement)
+            if self._last_model_entropy is not None:
+                logs.setdefault("model_entropy",
+                                self._last_model_entropy)
         super().log(logs, *args, **kwargs)
 
 
@@ -248,7 +282,7 @@ def train() -> None:
         act_token_id=act_token_id,
     )
 
-    per_device_batch_size = 512
+    per_device_batch_size = 1024
     schedule = build_training_schedule(per_device_batch_size)
 
     print(
@@ -274,23 +308,23 @@ def train() -> None:
         )
 
     print("Creating model configuration...")
-    config_deeper_moderate = GPT2Config(
+    config = LlamaConfig(
         vocab_size=vocab_size,
-        n_positions=MAX_SEQ_LENGTH,
-        n_ctx=MAX_SEQ_LENGTH,
-        n_embd=544,          # ↓ width
-        n_layer=36,          # ↑ depth
-        n_head=8,            # 544 / 8 = 68
-        resid_pdrop=DROPOUT,
-        embd_pdrop=DROPOUT,
-        attn_pdrop=DROPOUT,
+        max_position_embeddings=MAX_SEQ_LENGTH,
+        hidden_size=768,
+        intermediate_size=768,
+        num_hidden_layers=20,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        attention_dropout=DROPOUT,
+        hidden_dropout=DROPOUT,
         pad_token_id=pad_token_id,
     )
     config.policy_dim = len(policy_index)
     print(f"Model config created - policy dimension: {config.policy_dim}")
 
-    print("Initializing ChessGPT2 model...")
-    model = ChessGPT2PolicyValue(config)
+    print("Initializing Chess LLaMA model...")
+    model = ChessPolicyValueModel(config)
     model.config.use_cache = False
     print(
         f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
@@ -318,7 +352,7 @@ def train() -> None:
         logging_strategy="steps",
         logging_steps=schedule.logging_steps,
         report_to=["wandb"],
-        run_name="chessformer-gpt2-policy",
+        run_name="testz",
         remove_unused_columns=False,
 
         dataloader_num_workers=8,

@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from datasets import Dataset, load_from_disk
+from tqdm import tqdm
 
 from policy_index import policy_index
 
@@ -113,6 +114,7 @@ def evaluate_puzzles(
     batch_size: int = 256,
     device: Optional[torch.device] = None,
     dataset: Optional[Dataset] = None,
+    verbose: bool = False,
 ) -> Tuple[List[Tuple[int, float]], EvaluationDetails]:
     """Run the model on the evaluation dataset and collect per-puzzle statistics.
 
@@ -147,7 +149,9 @@ def evaluate_puzzles(
     softmax = torch.nn.Softmax(dim=-1)
 
     with torch.no_grad():
-        for batch in dataloader:
+        dataloader_iter = tqdm(
+            dataloader, desc="Evaluating puzzles", unit="batch") if verbose else dataloader
+        for batch in dataloader_iter:
             input_ids = batch["input_ids"].to(model_device)
             legal_masks = batch["legal_masks"].to(model_device)
             target_indices = batch["target_indices"].to(model_device)
@@ -163,6 +167,8 @@ def evaluate_puzzles(
             selected_probs = probs.gather(
                 1, target_indices.unsqueeze(-1)).squeeze(-1)
 
+            input_ids_cpu = input_ids.cpu()
+            logits_cpu = logits.cpu()
             legal_masks_cpu = legal_masks.cpu()
             probs_cpu = probs.cpu()
             selected_probs = selected_probs.cpu().tolist()
@@ -182,7 +188,10 @@ def evaluate_puzzles(
 
                 correct_move_index = int(target_idx)
                 correct_move = POLICY_MOVES[correct_move_index]
-                correct_move_probability = float(probs_cpu[batch_index][correct_move_index])
+                correct_move_probability = float(
+                    probs_cpu[batch_index][correct_move_index])
+                correct_move_logit = float(
+                    logits_cpu[batch_index][correct_move_index])
 
                 legal_indices = torch.nonzero(
                     legal_masks_cpu[batch_index], as_tuple=False
@@ -190,8 +199,9 @@ def evaluate_puzzles(
                 moves: List[Dict[str, object]] = []
                 if legal_indices.numel() > 0:
                     legal_probs = probs_cpu[batch_index][legal_indices]
-                    for move_idx, move_prob in zip(
-                        legal_indices.tolist(), legal_probs.tolist()
+                    legal_logits = logits_cpu[batch_index][legal_indices]
+                    for move_idx, move_prob, move_logit in zip(
+                        legal_indices.tolist(), legal_probs.tolist(), legal_logits.tolist()
                     ):
                         if move_prob < MOVE_PROB_THRESHOLD:
                             continue
@@ -200,6 +210,7 @@ def evaluate_puzzles(
                                 "move": POLICY_MOVES[move_idx],
                                 "move_id": move_idx,
                                 "probability": float(move_prob),
+                                "logit": float(move_logit),
                             }
                         )
                     moves.sort(
@@ -208,9 +219,11 @@ def evaluate_puzzles(
                 puzzle_states[puzzle_id].append(
                     {
                         "state_index": puzzle_state_counters[puzzle_id],
+                        "input_ids": input_ids_cpu[batch_index].tolist(),
                         "correct_move": correct_move,
                         "correct_move_id": correct_move_index,
                         "correct_move_probability": correct_move_probability,
+                        "correct_move_logit": correct_move_logit,
                         "moves": moves,
                     }
                 )
@@ -320,6 +333,7 @@ def evaluate_model_elo(
     device: Optional[torch.device] = None,
     init_rating: Optional[float] = None,
     dataset: Optional[Dataset] = None,
+    verbose: bool = False,
 ) -> Tuple[float, float, float]:
     """
     Run evaluation and return an Elo estimate, its standard error, and the
@@ -335,6 +349,7 @@ def evaluate_model_elo(
         batch_size=batch_size,
         device=device,
         dataset=dataset,
+        verbose=verbose,
     )
 
     if not per_puzzle_results:
@@ -385,3 +400,39 @@ def evaluate_model_elo(
         print("Expected puzzle solve rate: nan (no puzzles evaluated)")
 
     return elo, elo_se, solve_percentage
+
+
+if __name__ == "__main__":
+    import torch
+    from model import ChessPolicyValueModel
+
+    # Configuration - same as test.py
+    CHECKPOINT_PATH = "./outputs/checkpoint-45000"
+
+    print("Loading model from checkpoint...")
+    model = ChessPolicyValueModel.from_pretrained_compiled(CHECKPOINT_PATH)
+
+    # Move to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model.eval()
+
+    print(f"Model loaded on {device}")
+    print("Starting puzzle evaluation...")
+    print()
+
+    # Run evaluation
+    elo, elo_se, solve_percentage = evaluate_model_elo(
+        model=model,
+        device=device,
+        batch_size=4096,
+        verbose=True,
+    )
+
+    print()
+    print("=" * 60)
+    print("PUZZLE EVALUATION COMPLETE")
+    print("=" * 60)
+    print(f"Estimated ELO: {elo:.0f} ± {elo_se:.0f}")
+    print(f"Solve percentage: {solve_percentage:.2f}%")
+    print("=" * 60)
