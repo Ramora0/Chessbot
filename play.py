@@ -204,7 +204,7 @@ def draw_board(screen: pygame.Surface, board: chess.Board, piece_images: dict,
 
 def main():
     # Configuration
-    CHECKPOINT_PATH = "./outputs/checkpoint-30000"
+    CHECKPOINT_PATH = "./outputs/checkpoint-85000"
 
     print("Loading model from checkpoint...")
     model = ChessPolicyValueModel.from_pretrained_compiled(CHECKPOINT_PATH)

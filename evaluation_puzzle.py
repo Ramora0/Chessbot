@@ -167,44 +167,53 @@ def evaluate_puzzles(
             selected_probs = probs.gather(
                 1, target_indices.unsqueeze(-1)).squeeze(-1)
 
-            input_ids_cpu = input_ids.cpu()
-            logits_cpu = logits.cpu()
-            legal_masks_cpu = legal_masks.cpu()
-            probs_cpu = probs.cpu()
-            selected_probs = selected_probs.cpu().tolist()
-            target_indices_cpu = target_indices.cpu().tolist()
+            # Filter legal moves on GPU before CPU transfer
+            prob_mask = probs >= MOVE_PROB_THRESHOLD
+            filtered_legal_masks = legal_masks & prob_mask
+
+            # Batch CPU transfer - single operation
+            batch_cpu = {
+                'input_ids': input_ids.cpu(),
+                'logits': logits.cpu(),
+                'probs': probs.cpu(),
+                'selected_probs': selected_probs.cpu(),
+                'target_indices': target_indices.cpu(),
+                'filtered_legal_masks': filtered_legal_masks.cpu(),
+            }
+
             puzzle_ids = batch["puzzle_ids"]
             ratings = batch["ratings"]
 
-            for batch_index, (puzzle_id, rating, prob, target_idx) in enumerate(
-                zip(puzzle_ids, ratings, selected_probs, target_indices_cpu)
+            for batch_index, (puzzle_id, rating) in enumerate(
+                zip(puzzle_ids, ratings)
             ):
                 if puzzle_id not in encountered_puzzles:
                     puzzle_order.append(puzzle_id)
                     encountered_puzzles.add(puzzle_id)
 
-                puzzle_probabilities[puzzle_id] *= float(prob)
+                prob = float(batch_cpu['selected_probs'][batch_index])
+                puzzle_probabilities[puzzle_id] *= prob
                 puzzle_ratings[puzzle_id] = rating
 
-                correct_move_index = int(target_idx)
-                correct_move = POLICY_MOVES[correct_move_index]
+                target_idx = int(batch_cpu['target_indices'][batch_index])
+                correct_move = POLICY_MOVES[target_idx]
                 correct_move_probability = float(
-                    probs_cpu[batch_index][correct_move_index])
+                    batch_cpu['probs'][batch_index][target_idx])
                 correct_move_logit = float(
-                    logits_cpu[batch_index][correct_move_index])
+                    batch_cpu['logits'][batch_index][target_idx])
 
+                # Get filtered legal moves
                 legal_indices = torch.nonzero(
-                    legal_masks_cpu[batch_index], as_tuple=False
+                    batch_cpu['filtered_legal_masks'][batch_index], as_tuple=False
                 ).flatten()
+
                 moves: List[Dict[str, object]] = []
                 if legal_indices.numel() > 0:
-                    legal_probs = probs_cpu[batch_index][legal_indices]
-                    legal_logits = logits_cpu[batch_index][legal_indices]
+                    legal_probs = batch_cpu['probs'][batch_index][legal_indices]
+                    legal_logits = batch_cpu['logits'][batch_index][legal_indices]
                     for move_idx, move_prob, move_logit in zip(
                         legal_indices.tolist(), legal_probs.tolist(), legal_logits.tolist()
                     ):
-                        if move_prob < MOVE_PROB_THRESHOLD:
-                            continue
                         moves.append(
                             {
                                 "move": POLICY_MOVES[move_idx],
@@ -219,9 +228,9 @@ def evaluate_puzzles(
                 puzzle_states[puzzle_id].append(
                     {
                         "state_index": puzzle_state_counters[puzzle_id],
-                        "input_ids": input_ids_cpu[batch_index].tolist(),
+                        "input_ids": batch_cpu['input_ids'][batch_index].tolist(),
                         "correct_move": correct_move,
-                        "correct_move_id": correct_move_index,
+                        "correct_move_id": target_idx,
                         "correct_move_probability": correct_move_probability,
                         "correct_move_logit": correct_move_logit,
                         "moves": moves,
@@ -229,19 +238,16 @@ def evaluate_puzzles(
                 )
                 puzzle_state_counters[puzzle_id] += 1
 
-    puzzle_probabilities_dict = dict(puzzle_probabilities)
-    puzzle_states_dict = {key: value for key, value in puzzle_states.items()}
-
     results: List[Tuple[int, float]] = []
     for puzzle_id in puzzle_order:
-        combined_prob = puzzle_probabilities_dict.get(puzzle_id, 0.0)
+        combined_prob = puzzle_probabilities.get(puzzle_id, 0.0)
         results.append((puzzle_ratings.get(puzzle_id, 0), combined_prob))
 
     details = EvaluationDetails(
         puzzle_order=puzzle_order,
-        puzzle_probabilities=puzzle_probabilities_dict,
+        puzzle_probabilities=dict(puzzle_probabilities),
         puzzle_ratings=dict(puzzle_ratings),
-        puzzle_states=puzzle_states_dict,
+        puzzle_states=dict(puzzle_states),
     )
 
     return results, details
@@ -425,7 +431,7 @@ if __name__ == "__main__":
     elo, elo_se, solve_percentage = evaluate_model_elo(
         model=model,
         device=device,
-        batch_size=4096,
+        batch_size=256,
         verbose=True,
     )
 

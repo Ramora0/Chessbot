@@ -156,7 +156,7 @@ def create_vocabulary():
     # for i in range(1, 401):
     #     vocab.add(f"{i}-fm")
 
-    # vocab.add(_ACT_TOKEN)
+    vocab.add(_ACT_TOKEN)
 
     return sorted(vocab)
 

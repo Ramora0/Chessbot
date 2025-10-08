@@ -23,7 +23,7 @@ from tokenizer import create_tokenizer
 from evaluation_puzzle import evaluate_model_elo, DEFAULT_EVAL_DATASET_DIR
 
 
-OUTPUT_DIR = "outputs"
+OUTPUT_DIR = "no-mask"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 71
 PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
@@ -37,6 +37,11 @@ BASE_SAVE_STEPS = 10_000
 BASE_LOGGING_STEPS = 200
 BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
 
+# Set to a checkpoint path to resume training (e.g., "./outputs/checkpoint-45000")
+# Set to None to start from scratch
+# RESUME_FROM_CHECKPOINT = "./outputs/checkpoint-90000"
+RESUME_FROM_CHECKPOINT = None
+
 
 @dataclass
 class TrainingSchedule:
@@ -45,6 +50,7 @@ class TrainingSchedule:
     save_steps: int
     logging_steps: int
     elo_eval_steps: int
+    warmup_steps: int
 
 
 def build_training_schedule(batch_size: int) -> TrainingSchedule:
@@ -59,6 +65,7 @@ def build_training_schedule(batch_size: int) -> TrainingSchedule:
     save_steps = max(1, int(BASE_SAVE_STEPS * inv_scale))
     logging_steps = max(1, int(BASE_LOGGING_STEPS * inv_scale))
     elo_eval_steps = max(1, int(BASE_ELO_EVAL_STEPS * inv_scale))
+    warmup_steps = max(1, int(max_steps * 0.02))  # 1% of total steps
 
     return TrainingSchedule(
         learning_rate=learning_rate,
@@ -66,6 +73,7 @@ def build_training_schedule(batch_size: int) -> TrainingSchedule:
         save_steps=save_steps,
         logging_steps=logging_steps,
         elo_eval_steps=elo_eval_steps,
+        warmup_steps=warmup_steps,
     )
 
 
@@ -291,6 +299,7 @@ def train() -> None:
         "Training schedule:",
         f"batch_size={per_device_batch_size}",
         f"learning_rate={schedule.learning_rate}",
+        f"warmup_steps={schedule.warmup_steps}",
         f"save_steps={schedule.save_steps}",
         f"logging_steps={schedule.logging_steps}",
         f"elo_eval_steps={schedule.elo_eval_steps}",
@@ -307,27 +316,36 @@ def train() -> None:
             "Elo evaluations during training will be skipped."
         )
 
-    print("Creating model configuration...")
-    config = LlamaConfig(
-        vocab_size=vocab_size,
-        max_position_embeddings=MAX_SEQ_LENGTH,
-        hidden_size=768,
-        intermediate_size=768,
-        num_hidden_layers=20,
-        num_attention_heads=8,
-        num_key_value_heads=8,
-        attention_dropout=DROPOUT,
-        hidden_dropout=DROPOUT,
-        pad_token_id=pad_token_id,
-    )
-    config.policy_dim = len(policy_index)
-    print(f"Model config created - policy dimension: {config.policy_dim}")
+    # Load model from checkpoint or create new
+    if RESUME_FROM_CHECKPOINT:
+        print(f"Loading model from checkpoint: {RESUME_FROM_CHECKPOINT}")
+        model = ChessPolicyValueModel.from_pretrained_compiled(
+            RESUME_FROM_CHECKPOINT)
+        model.config.use_cache = False
+        print(
+            f"Model loaded from checkpoint with {sum(p.numel() for p in model.parameters()):,} parameters")
+    else:
+        print("Creating model configuration...")
+        config = LlamaConfig(
+            vocab_size=vocab_size,
+            max_position_embeddings=MAX_SEQ_LENGTH,
+            hidden_size=768,
+            intermediate_size=768,
+            num_hidden_layers=20,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            attention_dropout=DROPOUT,
+            hidden_dropout=DROPOUT,
+            pad_token_id=pad_token_id,
+        )
+        config.policy_dim = len(policy_index)
+        print(f"Model config created - policy dimension: {config.policy_dim}")
 
-    print("Initializing Chess LLaMA model...")
-    model = ChessPolicyValueModel(config)
-    model.config.use_cache = False
-    print(
-        f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
+        print("Initializing Chess LLaMA model...")
+        model = ChessPolicyValueModel(config)
+        model.config.use_cache = False
+        print(
+            f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
 
     if hasattr(torch, "compile"):
         try:
@@ -343,6 +361,7 @@ def train() -> None:
 
         per_device_train_batch_size=per_device_batch_size,
         learning_rate=schedule.learning_rate,
+        warmup_steps=schedule.warmup_steps,
         weight_decay=0,
         max_grad_norm=1.0,
         bf16=True,
@@ -367,6 +386,7 @@ def train() -> None:
     print(
         "Effective schedule:",
         f"max_steps={training_args.max_steps}",
+        f"warmup_steps={training_args.warmup_steps}",
         f"save_steps={training_args.save_steps}",
         f"logging_steps={training_args.logging_steps}",
         f"elo_eval_steps={schedule.elo_eval_steps}",
@@ -396,7 +416,11 @@ def train() -> None:
         trainer.add_callback(elo_callback)
 
     print("Starting training...")
-    trainer.train()
+    if RESUME_FROM_CHECKPOINT:
+        print(f"Resuming from checkpoint: {RESUME_FROM_CHECKPOINT}")
+        trainer.train(resume_from_checkpoint=RESUME_FROM_CHECKPOINT)
+    else:
+        trainer.train()
     # trainer.save_model(OUTPUT_DIR)
     # trainer.save_state()
     print(f"Training complete. Final model saved to {OUTPUT_DIR}")

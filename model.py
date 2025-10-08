@@ -89,15 +89,18 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         model = cls(config)
 
         # Load state dict
-        state_dict_path = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin")
+        state_dict_path = os.path.join(
+            pretrained_model_name_or_path, "pytorch_model.bin")
         if not os.path.exists(state_dict_path):
             # Try model.safetensors
-            state_dict_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
+            state_dict_path = os.path.join(
+                pretrained_model_name_or_path, "model.safetensors")
             if os.path.exists(state_dict_path):
                 from safetensors.torch import load_file
                 state_dict = load_file(state_dict_path)
             else:
-                raise FileNotFoundError(f"Could not find model weights in {pretrained_model_name_or_path}")
+                raise FileNotFoundError(
+                    f"Could not find model weights in {pretrained_model_name_or_path}")
         else:
             import torch
             state_dict = torch.load(state_dict_path, map_location="cpu")
@@ -161,8 +164,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # policy_loss = self.policy_loss_weight * raw_policy_loss
 
             # Log reward maximization: maximize dot product with Stockfish qualities
-            masked_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
-            model_probs = F.softmax(masked_logits, dim=-1)
+            # masked_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
+            model_probs = F.softmax(policy_logits, dim=-1)
 
             # Expected quality under model's distribution
             expected_quality = (

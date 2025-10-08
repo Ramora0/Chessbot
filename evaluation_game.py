@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import math
 import random
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import chess
@@ -21,7 +23,7 @@ from tokenizer import process_fen
 # Stockfish configuration
 STOCKFISH_ELO = 1350
 STOCKFISH_SKILL_LEVEL = 0
-ENGINE_TIME_LIMIT = 0.1  # Time limit in seconds for Stockfish moves
+ENGINE_TIME_LIMIT = 1  # Time limit in seconds for Stockfish moves
 
 # Batching configuration
 DEFAULT_BATCH_SIZE = 32  # Number of games to run in parallel
@@ -29,6 +31,32 @@ DEFAULT_BATCH_SIZE = 32  # Number of games to run in parallel
 # ELO calculation constants
 LOG10 = float(np.log(10.0))
 ELO_K = LOG10 / 400.0
+
+
+def load_puzzle_positions(csv_path: str | Path, num_positions: int) -> List[Tuple[str, bool]]:
+    """Load random FEN positions from puzzles.csv.
+
+    Returns pairs of the same position for fairness (model plays both sides).
+    Each element is (fen, model_plays_white).
+    """
+    with open(csv_path, 'r') as f:
+        reader = csv.reader(f)
+        next(reader)  # Skip header
+        all_fens = [row[4] for row in reader]  # FEN is column 5 (index 4)
+
+    # Sample half the positions (we'll play each from both sides)
+    num_unique = (num_positions + 1) // 2
+    selected_fens = random.sample(all_fens, min(num_unique, len(all_fens)))
+
+    # Create pairs - same position, different colors
+    positions = []
+    for fen in selected_fens:
+        positions.append((fen, True))   # Model plays white
+        positions.append((fen, False))  # Model plays black
+
+    # Shuffle the pairs and trim to exact count
+    random.shuffle(positions)
+    return positions[:num_positions]
 
 
 def _move_to_policy_index(move: chess.Move) -> int:
@@ -283,9 +311,10 @@ async def _play_game_async(
 class GameState:
     """Manages the state of an ongoing game."""
 
-    def __init__(self, game_id: int, model_plays_white: bool):
+    def __init__(self, game_id: int, model_plays_white: bool, starting_fen: Optional[str] = None):
         self.game_id = game_id
-        self.board = chess.Board()
+        self.board = chess.Board(
+            starting_fen) if starting_fen else chess.Board()
         self.model_plays_white = model_plays_white
         self.move_count = 0
         self.max_moves = 200
@@ -328,21 +357,27 @@ async def play_games_batched(
     batch_size: int = DEFAULT_BATCH_SIZE,
     stockfish_elo: int = STOCKFISH_ELO,
     verbose: bool = True,
+    starting_positions: Optional[List[Tuple[str, bool]]] = None,
 ) -> Tuple[int, int, int, int]:
     """
     Play multiple games in parallel with batched model inference.
 
     Args:
         stockfish_elo: ELO rating to configure Stockfish to play at
+        starting_positions: Optional list of (fen, model_plays_white) tuples
 
     Returns:
         Tuple of (wins, draws, losses, total_moves)
     """
-    # Create game states with random color assignment
+    # Create game states with random color assignment or from starting positions
     game_states = []
     for i in range(num_games):
-        game_states.append(
-            GameState(i, model_plays_white=random.random() < 0.5))
+        if starting_positions and i < len(starting_positions):
+            fen, model_plays_white = starting_positions[i]
+            game_states.append(GameState(i, model_plays_white, fen))
+        else:
+            game_states.append(
+                GameState(i, model_plays_white=random.random() < 0.5))
 
     # Initialize batch_size engines in parallel (reuse them across games)
     async def init_engine():
@@ -489,6 +524,7 @@ def evaluate_model_against_stockfish(
     batch_size: int = DEFAULT_BATCH_SIZE,
     opponent_elo: int = STOCKFISH_ELO,
     verbose: bool = True,
+    puzzle_csv_path: Optional[str | Path] = None,
 ) -> Tuple[float, float]:
     """
     Evaluate a model by playing multiple games against Stockfish with batched inference.
@@ -501,6 +537,8 @@ def evaluate_model_against_stockfish(
         batch_size: Number of games to run in parallel
         opponent_elo: ELO rating to configure Stockfish and use for estimation
         verbose: Whether to print progress updates
+        puzzle_csv_path: Optional path to puzzles.csv to load starting positions.
+                        Games will be played in pairs from each position for fairness.
 
     Returns:
         Tuple of (estimated_elo, standard_error)
@@ -511,9 +549,23 @@ def evaluate_model_against_stockfish(
         from tokenizer import create_tokenizer
         tokenizer = create_tokenizer()
 
+    # Load starting positions if requested
+    starting_positions = None
+    if puzzle_csv_path:
+        if verbose:
+            print(f"Loading starting positions from {puzzle_csv_path}...")
+        starting_positions = load_puzzle_positions(puzzle_csv_path, num_games)
+        if verbose:
+            print(
+                f"Loaded {len(starting_positions)} positions (each played from both sides)\n")
+
     if verbose:
-        print(f"Playing {num_games} games against Stockfish (ELO {opponent_elo})...")
-        print(f"  Model plays random color each game")
+        print(
+            f"Playing {num_games} games against Stockfish (ELO {opponent_elo})...")
+        if starting_positions:
+            print(f"  Using puzzle positions from CSV")
+        else:
+            print(f"  Model plays random color each game")
         print(f"  Batch size: {batch_size} (parallel games)")
         print()
 
@@ -528,6 +580,7 @@ def evaluate_model_against_stockfish(
             batch_size=batch_size,
             stockfish_elo=opponent_elo,
             verbose=verbose,
+            starting_positions=starting_positions,
         )
     )
 
@@ -551,3 +604,60 @@ def evaluate_model_against_stockfish(
         print("=" * 60)
 
     return (estimated_elo, standard_error)
+
+
+def main():
+    """Test script to evaluate model from checkpoint against Stockfish."""
+    import torch
+    from model import ChessPolicyValueModel
+
+    # Configuration
+    CHECKPOINT_PATH = "./outputs/checkpoint-90000"
+    # Adjust path as needed
+    STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
+    NUM_GAMES = 400
+    BATCH_SIZE = 128
+    # TRUE_PERCENT = 1  # 100% random moves for testing
+    TRUE_EVAL = 1350
+
+    # Set to a path to load starting positions from puzzles.csv
+    # Games will be played in pairs (one from each side) for fairness
+    # Set to None to use standard starting position
+    PUZZLE_CSV_PATH = "data/puzzles.csv"
+
+    print("Loading model from checkpoint...")
+
+    # Load model (handles _orig_mod. prefix from torch.compile)
+    model = ChessPolicyValueModel.from_pretrained_compiled(CHECKPOINT_PATH)
+
+    # Move to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model.eval()
+
+    print(f"Model loaded on {device}")
+    print(
+        f"Starting evaluation with {NUM_GAMES} games (batch size: {BATCH_SIZE})...")
+    print()
+
+    # Run evaluation
+    estimated_elo, std_error = evaluate_model_against_stockfish(
+        model=model,
+        stockfish_path=STOCKFISH_PATH,
+        num_games=NUM_GAMES,
+        batch_size=BATCH_SIZE,
+        opponent_elo=TRUE_EVAL,
+        verbose=True,
+        puzzle_csv_path=PUZZLE_CSV_PATH,
+    )
+
+    print()
+    print("=" * 60)
+    print("EVALUATION COMPLETE")
+    print("=" * 60)
+    print(f"Estimated ELO: {estimated_elo:.0f} ± {std_error:.0f}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

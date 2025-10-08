@@ -15,11 +15,12 @@ EXPECTED_SEQ_LEN = 71
 class ChessPolicyDataset(IterableDataset):
     """Streaming-only dataset wrapper that validates incoming examples."""
 
-    def __init__(self, hf_dataset: HFIterableDataset, act_token_id: int) -> None:
+    def __init__(self, hf_dataset: HFIterableDataset, act_token_id: int = -1) -> None:
         if act_token_id is None:
             raise ValueError("act_token_id must be provided")
         if not isinstance(hf_dataset, HFIterableDataset):
-            raise TypeError("ChessPolicyDataset requires a streaming Hugging Face dataset")
+            raise TypeError(
+                "ChessPolicyDataset requires a streaming Hugging Face dataset")
 
         self.dataset = hf_dataset
         self.act_token_id = int(act_token_id)
@@ -30,7 +31,8 @@ class ChessPolicyDataset(IterableDataset):
         return True
 
     def __len__(self) -> int:
-        raise TypeError("ChessPolicyDataset wraps streaming data and has no length")
+        raise TypeError(
+            "ChessPolicyDataset wraps streaming data and has no length")
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         worker_info = get_worker_info()
