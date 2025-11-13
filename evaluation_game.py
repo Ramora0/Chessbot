@@ -22,7 +22,6 @@ from tokenizer import process_fen
 
 # Stockfish configuration
 STOCKFISH_ELO = 1350
-STOCKFISH_SKILL_LEVEL = 0
 ENGINE_TIME_LIMIT = 1  # Time limit in seconds for Stockfish moves
 
 # Batching configuration
@@ -86,10 +85,16 @@ def _select_moves_from_model_batch(
     boards: List[chess.Board],
     device: torch.device,
     tokenizer,
-) -> List[Optional[chess.Move]]:
-    """Use the model to select moves for a batch of positions."""
+) -> Tuple[List[Optional[chess.Move]], float]:
+    """
+    Use the model to select moves for a batch of positions.
+
+    Returns:
+        Tuple of (moves, avg_illegality_rate) where illegality_rate is the fraction
+        of probability mass on illegal moves averaged across the batch.
+    """
     if not boards:
-        return []
+        return [], 0.0
 
     # Process all FENs and tokenize
     fens = [board.fen() for board in boards]
@@ -97,6 +102,8 @@ def _select_moves_from_model_batch(
     encodings = [tokenizer.encode(p) for p in processed]
     input_ids = torch.tensor(
         [enc.ids for enc in encodings], dtype=torch.long, device=device)
+    input_ids = input_ids - 1
+    input_ids = input_ids[:, :-1]
 
     # Get model predictions for entire batch
     with torch.no_grad():
@@ -105,9 +112,18 @@ def _select_moves_from_model_batch(
 
     # Process each position in the batch
     moves = []
+    illegality_rates = []
+
     for i, board in enumerate(boards):
         # Mask illegal moves
         legal_mask = _get_legal_moves_mask(board).to(device)
+
+        # Calculate illegality rate before masking
+        all_probs = F.softmax(policy_logits[i], dim=-1)
+        illegal_mask = ~legal_mask
+        illegality_rate = (all_probs * illegal_mask.float()).sum().item()
+        illegality_rates.append(illegality_rate)
+
         masked_logits = policy_logits[i].masked_fill(
             ~legal_mask, float("-inf"))
 
@@ -130,7 +146,9 @@ def _select_moves_from_model_batch(
             legal_moves = list(board.legal_moves)
             moves.append(legal_moves[0] if legal_moves else None)
 
-    return moves
+    avg_illegality = sum(illegality_rates) / \
+        len(illegality_rates) if illegality_rates else 0.0
+    return moves, avg_illegality
 
 
 def _select_move_from_model(
@@ -140,7 +158,9 @@ def _select_move_from_model(
     tokenizer,
 ) -> Optional[chess.Move]:
     """Use the model to select a move from the current position (single position)."""
-    return _select_moves_from_model_batch(model, [board], device, tokenizer)[0]
+    moves, _ = _select_moves_from_model_batch(
+        model, [board], device, tokenizer)
+    return moves[0]
 
 
 def play_game(
@@ -367,7 +387,7 @@ async def play_games_batched(
         starting_positions: Optional list of (fen, model_plays_white) tuples
 
     Returns:
-        Tuple of (wins, draws, losses, total_moves)
+        Tuple of (wins, draws, losses, total_moves, total_illegality, illegality_count)
     """
     # Create game states with random color assignment or from starting positions
     game_states = []
@@ -412,6 +432,8 @@ async def play_games_batched(
     losses = 0
     total_moves = 0
     completed_count = 0
+    total_illegality = 0.0
+    illegality_count = 0
 
     try:
         # Create progress bar for game moves
@@ -437,8 +459,12 @@ async def play_games_batched(
                 # Batch process model moves
                 if games_needing_model:
                     boards = [game.board for game in games_needing_model]
-                    moves = _select_moves_from_model_batch(
+                    moves, avg_illegality = _select_moves_from_model_batch(
                         model, boards, device, tokenizer)
+
+                    # Track illegality
+                    total_illegality += avg_illegality * len(boards)
+                    illegality_count += len(boards)
 
                     for game, move in zip(games_needing_model, moves):
                         if move is None or move not in game.board.legal_moves:
@@ -513,7 +539,7 @@ async def play_games_batched(
         for _, engine in engines:
             await engine.quit()
 
-    return (wins, draws, losses, total_moves)
+    return (wins, draws, losses, total_moves, total_illegality, illegality_count)
 
 
 def evaluate_model_against_stockfish(
@@ -570,7 +596,7 @@ def evaluate_model_against_stockfish(
         print()
 
     # Run batched games
-    wins, draws, losses, total_moves = asyncio.run(
+    wins, draws, losses, total_moves, total_illegality, illegality_count = asyncio.run(
         play_games_batched(
             model=model,
             stockfish_path=stockfish_path,
@@ -598,6 +624,9 @@ def evaluate_model_against_stockfish(
         print(
             f"Score: {wins + 0.5 * draws}/{num_games} ({(wins + 0.5 * draws)/num_games:.1%})")
         print(f"Average game length: {total_moves/num_games:.1f} moves")
+        if illegality_count > 0:
+            avg_illegality = total_illegality / illegality_count
+            print(f"Average illegality rate: {avg_illegality:.2%}")
         print()
         print(f"Estimated ELO: {estimated_elo:.0f} ± {standard_error:.0f}")
         print(f"Opponent ELO: {opponent_elo}")
@@ -612,7 +641,7 @@ def main():
     from model import ChessPolicyValueModel
 
     # Configuration
-    CHECKPOINT_PATH = "./outputs/checkpoint-90000"
+    CHECKPOINT_PATH = "./no-mask/checkpoint-30000"
     # Adjust path as needed
     STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
     NUM_GAMES = 400
@@ -623,7 +652,8 @@ def main():
     # Set to a path to load starting positions from puzzles.csv
     # Games will be played in pairs (one from each side) for fairness
     # Set to None to use standard starting position
-    PUZZLE_CSV_PATH = "data/puzzles.csv"
+    # PUZZLE_CSV_PATH = "data/puzzles.csv"
+    PUZZLE_CSV_PATH = None  # Use standard starting position
 
     print("Loading model from checkpoint...")
 
