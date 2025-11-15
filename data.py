@@ -95,10 +95,20 @@ class ChessPolicyDataset(IterableDataset):
 
 
 class ChessPolicyCollator:
-    """Collator that batches tensor creation for already-tokenized data."""
+    """Collator that batches tensor creation for already-tokenized data.
 
-    def __init__(self) -> None:
+    Optionally applies masked token prediction by randomly masking 15% of tokens
+    in 50% of examples.
+    """
+
+    def __init__(self, mask_token_id: int | None = None, mask_prob: float = 0.15) -> None:
         self.policy_size = len(policy_index)
+        self.mask_token_id = mask_token_id
+        self.mask_prob = mask_prob
+
+        # Maskable positions: board (0-63), castling (65-68), en passant (69)
+        # Never mask: turn (64), <ACT> (70)
+        self.maskable_positions = list(range(64)) + list(range(65, 70))
 
     def __call__(self, batch: Iterable[Dict[str, object]]) -> Dict[str, torch.Tensor]:
         input_ids_list = []
@@ -138,11 +148,53 @@ class ChessPolicyCollator:
                 f"wdl tensor expected width 3, received {wdl_values.shape[1]}"
             )
 
-        return {
+        # Apply masked token prediction if mask_token_id is provided
+        original_input_ids = None
+        masked_positions = None
+
+        if self.mask_token_id is not None:
+            # Store original input_ids before masking
+            original_input_ids = input_ids.clone()
+
+            # Initialize masked_positions (all False initially)
+            batch_size, seq_len = input_ids.shape
+            masked_positions = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+
+            # For each example, randomly decide whether to apply masking (50% chance)
+            for i in range(batch_size):
+                if torch.rand(1).item() < 0.5:
+                    # Apply masking to this example
+                    # Calculate number of tokens to mask (15% of maskable positions)
+                    num_maskable = len(self.maskable_positions)
+                    num_to_mask = max(1, int(num_maskable * self.mask_prob))
+
+                    # Randomly select positions to mask
+                    maskable_indices = torch.tensor(self.maskable_positions, dtype=torch.long)
+                    perm = torch.randperm(num_maskable)[:num_to_mask]
+                    positions_to_mask = maskable_indices[perm]
+
+                    # Mark these positions as masked
+                    masked_positions[i, positions_to_mask] = True
+
+                    # For each masked position, decide whether to replace with [MASK] (90%) or keep (10%)
+                    for pos in positions_to_mask:
+                        if torch.rand(1).item() < 0.9:
+                            # Replace with [MASK] token
+                            input_ids[i, pos] = self.mask_token_id
+                        # else: keep original token (10% of the time)
+
+        result = {
             "input_ids": input_ids,
             "policy": policy_values,
             "wdl": wdl_values,
         }
+
+        # Add masking-related fields if masking was applied
+        if original_input_ids is not None:
+            result["original_input_ids"] = original_input_ids
+            result["masked_positions"] = masked_positions
+
+        return result
 
 
 def create_dataloader(

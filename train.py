@@ -23,7 +23,7 @@ from tokenizer import create_tokenizer
 from evaluation_puzzle import evaluate_model_elo, DEFAULT_EVAL_DATASET_DIR
 
 
-OUTPUT_DIR = "no-mask"
+OUTPUT_DIR = "new"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 71
 PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
@@ -85,8 +85,11 @@ class TrackingTrainer(Trainer):
         self._last_policy_loss: Optional[float] = None
         self._last_wdl_loss: Optional[float] = None
         self._last_total_loss: Optional[float] = None
-        self._last_illegality_loss: Optional[float] = None
+        self._last_illegality_head_loss: Optional[float] = None
+        self._last_masked_token_loss: Optional[float] = None
         self._last_illegality_rate: Optional[float] = None
+        self._last_illegality_head_accuracy: Optional[float] = None
+        self._last_masked_token_accuracy: Optional[float] = None
         self._last_top1_agreement: Optional[float] = None
         self._last_model_entropy: Optional[float] = None
 
@@ -125,24 +128,50 @@ class TrackingTrainer(Trainer):
         else:
             self._last_wdl_loss = None
 
-        illegality_loss = getattr(outputs, "illegality_loss", None)
-        if illegality_loss is not None:
-            illegality_weight = float(
-                getattr(model, "illegality_loss_weight", 0.0))
-            illegality_value = float(illegality_loss.detach().item())
-            self._last_illegality_loss = (
-                illegality_value / illegality_weight
-                if illegality_weight > 0
-                else illegality_value
+        illegality_head_loss = getattr(outputs, "illegality_head_loss", None)
+        if illegality_head_loss is not None:
+            illegality_head_weight = float(
+                getattr(model, "illegality_head_loss_weight", 0.0))
+            illegality_head_value = float(illegality_head_loss.detach().item())
+            self._last_illegality_head_loss = (
+                illegality_head_value / illegality_head_weight
+                if illegality_head_weight > 0
+                else illegality_head_value
             )
         else:
-            self._last_illegality_loss = None
+            self._last_illegality_head_loss = None
+
+        masked_token_loss = getattr(outputs, "masked_token_loss", None)
+        if masked_token_loss is not None:
+            masked_token_weight = float(
+                getattr(model, "masked_token_loss_weight", 0.0))
+            masked_token_value = float(masked_token_loss.detach().item())
+            self._last_masked_token_loss = (
+                masked_token_value / masked_token_weight
+                if masked_token_weight > 0
+                else masked_token_value
+            )
+        else:
+            self._last_masked_token_loss = None
 
         # Extract metrics (not losses)
         illegality_rate = getattr(outputs, "illegality_rate", None)
         self._last_illegality_rate = (
             float(illegality_rate.detach().item()
                   ) if illegality_rate is not None else None
+        )
+
+        illegality_head_accuracy = getattr(
+            outputs, "illegality_head_accuracy", None)
+        self._last_illegality_head_accuracy = (
+            float(illegality_head_accuracy.detach().item()
+                  ) if illegality_head_accuracy is not None else None
+        )
+
+        masked_token_accuracy = getattr(outputs, "masked_token_accuracy", None)
+        self._last_masked_token_accuracy = (
+            float(masked_token_accuracy.detach().item()
+                  ) if masked_token_accuracy is not None else None
         )
 
         top1_agreement = getattr(outputs, "top1_agreement", None)
@@ -171,13 +200,23 @@ class TrackingTrainer(Trainer):
                 logs.setdefault("policy_loss", self._last_policy_loss)
             if self._last_wdl_loss is not None:
                 logs.setdefault("wdl_loss", self._last_wdl_loss)
-            if self._last_illegality_loss is not None:
-                logs.setdefault("illegality_loss", self._last_illegality_loss)
+            if self._last_illegality_head_loss is not None:
+                logs.setdefault("illegality_head_loss",
+                                self._last_illegality_head_loss)
+            if self._last_masked_token_loss is not None:
+                logs.setdefault("masked_token_loss",
+                                self._last_masked_token_loss)
 
             # Log metrics
             if self._last_illegality_rate is not None:
                 logs.setdefault("illegality_rate",
                                 self._last_illegality_rate)
+            if self._last_illegality_head_accuracy is not None:
+                logs.setdefault("illegality_head_accuracy",
+                                self._last_illegality_head_accuracy)
+            if self._last_masked_token_accuracy is not None:
+                logs.setdefault("masked_token_accuracy",
+                                self._last_masked_token_accuracy)
             if self._last_top1_agreement is not None:
                 logs.setdefault("top1_agreement",
                                 self._last_top1_agreement)
@@ -253,10 +292,17 @@ def train() -> None:
     vocab_size = len(tokenizer.get_vocab())
     pad_token_id = tokenizer.token_to_id("[PAD]")
     act_token_id = tokenizer.token_to_id("<ACT>")
+    mask_token_id = tokenizer.token_to_id("[MASK]")
+    empty_square_token_id = tokenizer.token_to_id("e-p")
     if act_token_id is None:
         raise ValueError("Tokenizer is missing the <ACT> token")
+    if mask_token_id is None:
+        raise ValueError("Tokenizer is missing the [MASK] token")
+    if empty_square_token_id is None:
+        raise ValueError("Tokenizer is missing the empty square token 'e-p'")
     print(
-        f"Tokenizer created - vocab size: {vocab_size}, pad token id: {pad_token_id}")
+        f"Tokenizer created - vocab size: {vocab_size}, pad token id: {pad_token_id}, "
+        f"mask token id: {mask_token_id}, empty square token id: {empty_square_token_id}")
 
     processed_path = Path(PROCESSED_DATASET_DIR)
     if not processed_path.exists():
@@ -322,6 +368,9 @@ def train() -> None:
         model = ChessPolicyValueModel.from_pretrained_compiled(
             RESUME_FROM_CHECKPOINT)
         model.config.use_cache = False
+        # Ensure empty_token_id is set (for backwards compatibility with old checkpoints)
+        if not hasattr(model.config, 'empty_token_id'):
+            model.config.empty_token_id = empty_square_token_id
         print(
             f"Model loaded from checkpoint with {sum(p.numel() for p in model.parameters()):,} parameters")
     else:
@@ -339,6 +388,7 @@ def train() -> None:
             pad_token_id=pad_token_id,
         )
         config.policy_dim = len(policy_index)
+        config.empty_token_id = empty_square_token_id
         print(f"Model config created - policy dimension: {config.policy_dim}")
 
         print("Initializing Chess LLaMA model...")
@@ -393,7 +443,7 @@ def train() -> None:
     )
 
     print("Creating trainer...")
-    data_collator = ChessPolicyCollator()
+    data_collator = ChessPolicyCollator(mask_token_id=mask_token_id)
 
     trainer = TrackingTrainer(
         model=model,

@@ -13,13 +13,81 @@ from transformers.models.llama.modeling_llama import LlamaPreTrainedModel
 from loss_weights import (
     POLICY_LOSS_WEIGHT,
     WDL_LOSS_WEIGHT,
-    ILLEGALITY_LOSS_WEIGHT,
+    ILLEGALITY_HEAD_LOSS_WEIGHT,
+    MASKED_TOKEN_LOSS_WEIGHT,
 )
+
+
+class MultiTaskAttentionPooling(nn.Module):
+    """Multi-task attention pooling with shared K/V projections.
+
+    Computes multiple task-specific outputs in a single forward pass by using
+    separate learnable queries for each task while sharing the K/V projections.
+    """
+    def __init__(self, hidden_size: int, task_output_dims: dict[str, int]) -> None:
+        """
+        Args:
+            hidden_size: Dimension of input hidden states
+            task_output_dims: Dict mapping task names to output dimensions
+                             e.g., {'policy': 1858, 'wdl': 3}
+        """
+        super().__init__()
+        self.task_names = list(task_output_dims.keys())
+        self.num_tasks = len(self.task_names)
+
+        # Shared K/V projections across all tasks
+        self.key_proj = nn.Linear(hidden_size, hidden_size)
+        self.value_proj = nn.Linear(hidden_size, hidden_size)
+        self.scale = hidden_size ** -0.5
+
+        # Task-specific queries, norms, and output projections
+        self.queries = nn.ParameterDict({
+            name: nn.Parameter(torch.randn(1, hidden_size))
+            for name in self.task_names
+        })
+        self.norms = nn.ModuleDict({
+            name: nn.LayerNorm(hidden_size)
+            for name in self.task_names
+        })
+        self.output_projs = nn.ModuleDict({
+            name: nn.Linear(hidden_size, output_dim)
+            for name, output_dim in task_output_dims.items()
+        })
+
+    def forward(self, hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
+        """
+        Args:
+            hidden_states: [batch_size, seq_len, hidden_size]
+        Returns:
+            Dict mapping task names to outputs: {task_name: [batch_size, output_dim]}
+        """
+        # Shared K/V projections (computed once)
+        k = self.key_proj(hidden_states)    # [batch, seq_len, hidden]
+        v = self.value_proj(hidden_states)  # [batch, seq_len, hidden]
+
+        outputs = {}
+        for task_name in self.task_names:
+            # Task-specific query
+            q = self.queries[task_name].unsqueeze(0)  # [1, 1, hidden]
+
+            # Compute attention weights
+            attn_weights = torch.matmul(q, k.transpose(1, 2)) * self.scale  # [batch, 1, seq_len]
+            attn_weights = F.softmax(attn_weights, dim=-1)
+
+            # Weighted sum of values
+            pooled = torch.matmul(attn_weights, v).squeeze(1)  # [batch, hidden]
+
+            # Task-specific normalization and projection
+            pooled = self.norms[task_name](pooled)
+            outputs[task_name] = self.output_projs[task_name](pooled)
+
+        return outputs
 
 
 DEFAULT_POLICY_LOSS_WEIGHT = POLICY_LOSS_WEIGHT
 DEFAULT_WDL_LOSS_WEIGHT = WDL_LOSS_WEIGHT
-DEFAULT_ILLEGALITY_LOSS_WEIGHT = ILLEGALITY_LOSS_WEIGHT
+DEFAULT_ILLEGALITY_HEAD_LOSS_WEIGHT = ILLEGALITY_HEAD_LOSS_WEIGHT
+DEFAULT_MASKED_TOKEN_LOSS_WEIGHT = MASKED_TOKEN_LOSS_WEIGHT
 
 
 @dataclass
@@ -27,11 +95,15 @@ class ChessPolicyValueOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     policy_logits: torch.Tensor = None
     wdl_logits: torch.Tensor = None
+    illegality_logits: torch.Tensor = None
     policy_loss: Optional[torch.Tensor] = None
     wdl_loss: Optional[torch.Tensor] = None
-    illegality_loss: Optional[torch.Tensor] = None
+    illegality_head_loss: Optional[torch.Tensor] = None
+    masked_token_loss: Optional[torch.Tensor] = None
     # Metrics (not losses)
     illegality_rate: Optional[torch.Tensor] = None
+    illegality_head_accuracy: Optional[torch.Tensor] = None
+    masked_token_accuracy: Optional[torch.Tensor] = None
     top1_agreement: Optional[torch.Tensor] = None
     model_entropy: Optional[torch.Tensor] = None
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
@@ -42,15 +114,28 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.policy_dim = config.policy_dim
+        self.empty_token_id = getattr(config, 'empty_token_id', None)
         self.transformer = LlamaModel(config)
         self._disable_causal_mask()
         hidden_size = config.hidden_size
-        self.norm = nn.LayerNorm(hidden_size)
-        self.policy_head = nn.Linear(hidden_size, self.policy_dim)
-        self.wdl_head = nn.Linear(hidden_size, 3)
+
+        # Multi-task attention pooling (shared K/V, task-specific queries)
+        self.task_head = MultiTaskAttentionPooling(
+            hidden_size=hidden_size,
+            task_output_dims={
+                'policy': self.policy_dim,
+                'wdl': 3,
+                'illegality': self.policy_dim,  # Predict legality for each move
+            }
+        )
+
+        # Language modeling head for masked token prediction
+        self.lm_head = nn.Linear(hidden_size, config.vocab_size, bias=False)
+
         self.policy_loss_weight = float(DEFAULT_POLICY_LOSS_WEIGHT)
         self.wdl_loss_weight = float(DEFAULT_WDL_LOSS_WEIGHT)
-        self.illegality_loss_weight = float(DEFAULT_ILLEGALITY_LOSS_WEIGHT)
+        self.illegality_head_loss_weight = float(DEFAULT_ILLEGALITY_HEAD_LOSS_WEIGHT)
+        self.masked_token_loss_weight = float(DEFAULT_MASKED_TOKEN_LOSS_WEIGHT)
         self.post_init()
 
     # type: ignore[override]
@@ -128,15 +213,19 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         input_ids: torch.Tensor,
         policy: Optional[torch.Tensor] = None,
         wdl: Optional[torch.Tensor] = None,
+        masked_positions: Optional[torch.Tensor] = None,
+        original_input_ids: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         **kwargs,
     ) -> ChessPolicyValueOutput:
         transformer_outputs = self.transformer(input_ids=input_ids, **kwargs)
         hidden_states = transformer_outputs.last_hidden_state
-        pooled = hidden_states.mean(dim=1)
-        pooled = self.norm(pooled)
-        policy_logits = self.policy_head(pooled)
-        wdl_logits = self.wdl_head(pooled)
+
+        # Multi-task attention pooling (single forward pass)
+        task_outputs = self.task_head(hidden_states)
+        policy_logits = task_outputs['policy']
+        wdl_logits = task_outputs['wdl']
+        illegality_logits = task_outputs['illegality']
 
         target_device = policy_logits.device
 
@@ -149,23 +238,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             policy_mask_bool = (policy >= 0).to(dtype=torch.bool)
             policy = policy.masked_fill(~policy_mask_bool, 0)
 
-            # Old wide-reaching cross-entropy loss:
-            # masked_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
-            # policy_log_probs = F.log_softmax(masked_logits, dim=-1)
-            # raw_policy_loss = -(policy * policy_log_probs).sum(dim=-1).mean()
-            # policy_loss = self.policy_loss_weight * raw_policy_loss
-
-            # Old mode-centered MSE loss on probabilities:
-            # masked_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
-            # policy_probs = F.softmax(masked_logits, dim=-1)
-            # legal_pred = policy_probs[policy_mask_bool]
-            # legal_target = policy[policy_mask_bool]
-            # raw_policy_loss = 100.0 * F.mse_loss(legal_pred, legal_target, reduction='mean')
-            # policy_loss = self.policy_loss_weight * raw_policy_loss
-
-            # Log reward maximization: maximize dot product with Stockfish qualities
-            # masked_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
-            model_probs = F.softmax(policy_logits, dim=-1)
+            # NEW: Mask illegal moves before computing softmax (clean policy loss)
+            masked_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
+            model_probs = F.softmax(masked_logits, dim=-1)
 
             # Expected quality under model's distribution
             expected_quality = (
@@ -184,44 +259,97 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             raw_wdl_loss = -(wdl * wdl_log_probs).sum(dim=-1).mean()
             wdl_loss = self.wdl_loss_weight * raw_wdl_loss
 
+        # NEW: Illegality head loss (binary cross-entropy for legality prediction)
+        illegality_head_loss: Optional[torch.Tensor] = None
+        illegality_head_accuracy: Optional[torch.Tensor] = None
+        if policy is not None and policy_mask_bool is not None:
+            # Target: 1 for legal moves, 0 for illegal moves
+            illegality_target = policy_mask_bool.float()
+
+            # Compute BCE loss with logits
+            raw_illegality_head_loss = F.binary_cross_entropy_with_logits(
+                illegality_logits, illegality_target, reduction='mean'
+            )
+            illegality_head_loss = self.illegality_head_loss_weight * raw_illegality_head_loss
+
+            # Compute % of legal moves marked as legal (recall for legal class)
+            illegality_preds = (torch.sigmoid(illegality_logits) > 0.5).float()
+            legal_mask = (illegality_target == 1)
+            illegality_head_accuracy = illegality_preds[legal_mask].mean()
+
+        # Masked token prediction loss (language modeling objective)
+        masked_token_loss: Optional[torch.Tensor] = None
+        masked_token_accuracy: Optional[torch.Tensor] = None
+        if masked_positions is not None and original_input_ids is not None:
+            # Only compute loss on positions that were masked
+            if masked_positions.any():
+                # Get logits for all positions: [batch_size, seq_len, vocab_size]
+                lm_logits = self.lm_head(hidden_states)
+
+                # Move tensors to same device if needed
+                if original_input_ids.device != target_device:
+                    original_input_ids = original_input_ids.to(target_device)
+                if masked_positions.device != target_device:
+                    masked_positions = masked_positions.to(target_device)
+
+                # Flatten for loss computation
+                lm_logits_flat = lm_logits.view(-1, lm_logits.size(-1))  # [batch*seq, vocab]
+                original_ids_flat = original_input_ids.view(-1)  # [batch*seq]
+                masked_positions_flat = masked_positions.view(-1)  # [batch*seq]
+
+                # Only compute loss on masked positions
+                masked_lm_logits = lm_logits_flat[masked_positions_flat]
+                masked_labels = original_ids_flat[masked_positions_flat]
+
+                if masked_labels.numel() > 0:
+                    raw_masked_token_loss = F.cross_entropy(
+                        masked_lm_logits, masked_labels, reduction='mean'
+                    )
+                    masked_token_loss = self.masked_token_loss_weight * raw_masked_token_loss
+
+                    # Compute accuracy only on masked positions that are pieces (not empty squares)
+                    masked_preds = masked_lm_logits.argmax(dim=-1)
+                    if self.empty_token_id is not None:
+                        # Filter out empty squares - only count accuracy on piece squares
+                        non_empty_mask = (masked_labels != self.empty_token_id)
+                        if non_empty_mask.any():
+                            masked_token_accuracy = (
+                                (masked_preds[non_empty_mask] == masked_labels[non_empty_mask])
+                                .float().mean()
+                            )
+                        # If all masked tokens are empty squares, don't report accuracy
+                    else:
+                        # Fallback: compute accuracy on all masked positions
+                        masked_token_accuracy = (masked_preds == masked_labels).float().mean()
+
         # Compute metrics for reporting (not used in loss)
         illegality_rate: Optional[torch.Tensor] = None
         top1_agreement: Optional[torch.Tensor] = None
         model_entropy: Optional[torch.Tensor] = None
 
         if policy is not None and policy_mask_bool is not None:
-            # Compute illegality metrics (shared computation for rate and loss)
+            # Illegality rate: fraction of probability mass on illegal moves (from policy head)
             illegal_mask = (~policy_mask_bool).to(dtype=policy_logits.dtype)
             illegal_probs = F.softmax(policy_logits, dim=-1)
             summed_illegal_prob = (illegal_probs * illegal_mask).sum(dim=-1)
-
-            # Illegality rate: fraction of probability mass on illegal moves
             illegality_rate = summed_illegal_prob.mean()
 
             # Top-1 agreement: how often model's top move matches Stockfish's
-            model_top_move = policy_logits.argmax(dim=-1)
+            # Use masked logits for fair comparison (only legal moves)
+            masked_logits_for_top1 = policy_logits.masked_fill(~policy_mask_bool, -1e9)
+            model_top_move = masked_logits_for_top1.argmax(dim=-1)
             stockfish_top_move = policy.argmax(dim=-1)
-            top1_agreement = (model_top_move ==
-                              stockfish_top_move).float().mean()
+            top1_agreement = (model_top_move == stockfish_top_move).float().mean()
 
             # Model entropy: measure of model's confidence/diversity
-            masked_logits_for_entropy = policy_logits.masked_fill(
-                ~policy_mask_bool, -1e9)
-            model_probs_for_entropy = F.softmax(
-                masked_logits_for_entropy, dim=-1)
+            masked_logits_for_entropy = policy_logits.masked_fill(~policy_mask_bool, -1e9)
+            model_probs_for_entropy = F.softmax(masked_logits_for_entropy, dim=-1)
             model_entropy = -(model_probs_for_entropy *
                               torch.log(model_probs_for_entropy + 1e-9)).sum(dim=-1).mean()
 
-        # Illegality loss (using precomputed illegality rate)
-        illegality_loss: Optional[torch.Tensor] = None
-        if policy is not None and self.illegality_loss_weight > 0 and illegality_rate is not None:
-            # Use squared illegality rate as loss
-            illegality_loss = self.illegality_loss_weight * \
-                (illegality_rate ** 2)
-
         loss_components = [
             component
-            for component in (policy_loss, wdl_loss, illegality_loss)
+            for component in (policy_loss, wdl_loss, illegality_head_loss, masked_token_loss)
             if component is not None
         ]
         loss: Optional[torch.Tensor] = None
@@ -232,6 +360,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             outputs = (
                 policy_logits,
                 wdl_logits,
+                illegality_logits,
                 transformer_outputs.hidden_states,
                 transformer_outputs.attentions,
             )
@@ -241,10 +370,14 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             loss=loss,
             policy_logits=policy_logits,
             wdl_logits=wdl_logits,
+            illegality_logits=illegality_logits,
             policy_loss=policy_loss,
             wdl_loss=wdl_loss,
-            illegality_loss=illegality_loss,
+            illegality_head_loss=illegality_head_loss,
+            masked_token_loss=masked_token_loss,
             illegality_rate=illegality_rate,
+            illegality_head_accuracy=illegality_head_accuracy,
+            masked_token_accuracy=masked_token_accuracy,
             top1_agreement=top1_agreement,
             model_entropy=model_entropy,
             hidden_states=transformer_outputs.hidden_states,

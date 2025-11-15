@@ -167,7 +167,7 @@ def create_tokenizer():
     vocab_dict = {token: i for i, token in enumerate(vocab_list)}
 
     # Add essential special tokens only
-    special_tokens = ["[PAD]", "[UNK]"]
+    special_tokens = ["[PAD]", "[UNK]", "[MASK]"]
     for token in special_tokens:
         vocab_dict[token] = len(vocab_dict)
 
