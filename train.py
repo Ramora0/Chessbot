@@ -21,11 +21,13 @@ from model import ChessPolicyValueModel
 from policy_index import policy_index
 from tokenizer import create_tokenizer
 from evaluation_puzzle import evaluate_model_elo, DEFAULT_EVAL_DATASET_DIR
+from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 
 OUTPUT_DIR = "new"
 DROPOUT = 0.1
-MAX_SEQ_LENGTH = 71
+NUM_THINKING_TOKENS = 0  # Set to 0 to disable thinking tokens (72 board tokens + thinking tokens)
+MAX_SEQ_LENGTH = 256  # Must be >= 72 + NUM_THINKING_TOKENS
 PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
 ELO_EVAL_STEPS = 4000
 EVAL_BATCH_SIZE = 4096
@@ -92,6 +94,7 @@ class TrackingTrainer(Trainer):
         self._last_masked_token_accuracy: Optional[float] = None
         self._last_top1_agreement: Optional[float] = None
         self._last_model_entropy: Optional[float] = None
+        self._last_white_advantage_mae: Optional[float] = None
 
     def compute_loss(
         self,
@@ -186,6 +189,12 @@ class TrackingTrainer(Trainer):
                   ) if model_entropy is not None else None
         )
 
+        white_advantage_mae = getattr(outputs, "white_advantage_mae", None)
+        self._last_white_advantage_mae = (
+            float(white_advantage_mae.detach().item()
+                  ) if white_advantage_mae is not None else None
+        )
+
         if return_outputs:
             return loss, outputs
         return loss
@@ -223,6 +232,9 @@ class TrackingTrainer(Trainer):
             if self._last_model_entropy is not None:
                 logs.setdefault("model_entropy",
                                 self._last_model_entropy)
+            if self._last_white_advantage_mae is not None:
+                logs.setdefault("white_advantage_mae",
+                                self._last_white_advantage_mae)
         super().log(logs, *args, **kwargs)
 
 
@@ -389,7 +401,21 @@ def train() -> None:
         )
         config.policy_dim = len(policy_index)
         config.empty_token_id = empty_square_token_id
+        config.num_thinking_tokens = NUM_THINKING_TOKENS
+
+        # Sanity check: ensure MAX_SEQ_LENGTH is large enough
+        min_seq_length = 72 + NUM_THINKING_TOKENS
+        if MAX_SEQ_LENGTH < min_seq_length:
+            raise ValueError(
+                f"MAX_SEQ_LENGTH ({MAX_SEQ_LENGTH}) is too small for "
+                f"72 board tokens + {NUM_THINKING_TOKENS} thinking tokens = {min_seq_length} tokens"
+            )
+
         print(f"Model config created - policy dimension: {config.policy_dim}")
+        if NUM_THINKING_TOKENS > 0:
+            print(f"✓ Thinking tokens enabled: {NUM_THINKING_TOKENS} tokens (total sequence length: {72 + NUM_THINKING_TOKENS})")
+        else:
+            print("✓ Thinking tokens disabled (sequence length: 72)")
 
         print("Initializing Chess LLaMA model...")
         model = ChessPolicyValueModel(config)
@@ -443,7 +469,9 @@ def train() -> None:
     )
 
     print("Creating trainer...")
-    data_collator = ChessPolicyCollator(mask_token_id=mask_token_id)
+    # Only enable token masking if MASKED_TOKEN_LOSS_WEIGHT > 0
+    effective_mask_token_id = mask_token_id if MASKED_TOKEN_LOSS_WEIGHT > 0 else None
+    data_collator = ChessPolicyCollator(mask_token_id=effective_mask_token_id)
 
     trainer = TrackingTrainer(
         model=model,

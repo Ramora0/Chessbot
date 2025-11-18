@@ -106,6 +106,7 @@ class ChessPolicyValueOutput(ModelOutput):
     masked_token_accuracy: Optional[torch.Tensor] = None
     top1_agreement: Optional[torch.Tensor] = None
     model_entropy: Optional[torch.Tensor] = None
+    white_advantage_mae: Optional[torch.Tensor] = None
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
 
@@ -118,6 +119,15 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.transformer = LlamaModel(config)
         self._disable_causal_mask()
         hidden_size = config.hidden_size
+
+        # Thinking tokens - learnable embeddings for additional compute
+        # Set to 0 to disable thinking tokens
+        self.num_thinking_tokens = getattr(config, 'num_thinking_tokens', 64)
+        if self.num_thinking_tokens > 0:
+            self.thinking_tokens = nn.Parameter(
+                torch.randn(1, self.num_thinking_tokens, hidden_size) * 0.02
+            )
+            self._thinking_tokens_logged = False  # For one-time logging
 
         # Multi-task attention pooling (shared K/V, task-specific queries)
         self.task_head = MultiTaskAttentionPooling(
@@ -218,7 +228,34 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         return_dict: bool = True,
         **kwargs,
     ) -> ChessPolicyValueOutput:
-        transformer_outputs = self.transformer(input_ids=input_ids, **kwargs)
+        # Convert input_ids to embeddings
+        batch_size = input_ids.size(0)
+        input_embeds = self.transformer.embed_tokens(input_ids)
+        original_seq_len = input_embeds.size(1)
+
+        # Append thinking tokens BEFORE transformer processing (if enabled)
+        if self.num_thinking_tokens > 0:
+            thinking_tokens = self.thinking_tokens.expand(batch_size, -1, -1)
+            input_embeds = torch.cat([input_embeds, thinking_tokens], dim=1)
+
+            # Sanity check: verify thinking tokens were added
+            expected_seq_len = original_seq_len + self.num_thinking_tokens
+            actual_seq_len = input_embeds.size(1)
+            if actual_seq_len != expected_seq_len:
+                raise RuntimeError(
+                    f"Thinking tokens concatenation failed! "
+                    f"Expected seq_len={expected_seq_len} (board={original_seq_len} + thinking={self.num_thinking_tokens}), "
+                    f"but got {actual_seq_len}. Shape: {input_embeds.shape}"
+                )
+
+            # One-time log to confirm thinking tokens are active
+            if not self._thinking_tokens_logged and self.training:
+                print(f"✓ Thinking tokens active: {original_seq_len} board tokens + {self.num_thinking_tokens} thinking tokens = {actual_seq_len} total")
+                print(f"✓ All {actual_seq_len} tokens will be processed through transformer's {len(self.transformer.layers)} layers")
+                self._thinking_tokens_logged = True
+
+        # Process ALL tokens (board + thinking) through transformer
+        transformer_outputs = self.transformer(inputs_embeds=input_embeds, **kwargs)
         hidden_states = transformer_outputs.last_hidden_state
 
         # Multi-task attention pooling (single forward pass)
@@ -239,8 +276,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             policy = policy.masked_fill(~policy_mask_bool, 0)
 
             # NEW: Mask illegal moves before computing softmax (clean policy loss)
-            masked_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
-            model_probs = F.softmax(masked_logits, dim=-1)
+            # masked_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
+            # model_probs = F.softmax(masked_logits, dim=-1)
+            # CHANGED: No masking - model is punished for putting probability on illegal moves
+            model_probs = F.softmax(policy_logits, dim=-1)
 
             # Expected quality under model's distribution
             expected_quality = (
@@ -251,6 +290,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             policy_loss = self.policy_loss_weight * raw_policy_loss
 
         wdl_loss: Optional[torch.Tensor] = None
+        white_advantage_mae: Optional[torch.Tensor] = None
         if wdl is not None:
             if wdl.device != target_device:
                 wdl = wdl.to(target_device)
@@ -258,6 +298,12 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             wdl_log_probs = F.log_softmax(wdl_logits, dim=-1)
             raw_wdl_loss = -(wdl * wdl_log_probs).sum(dim=-1).mean()
             wdl_loss = self.wdl_loss_weight * raw_wdl_loss
+
+            # White advantage MAE: mean absolute error of (win - loss) prediction
+            wdl_probs = F.softmax(wdl_logits, dim=-1)
+            predicted_advantage = wdl_probs[:, 0] - wdl_probs[:, 2]  # win - loss
+            target_advantage = wdl[:, 0] - wdl[:, 2]  # win - loss
+            white_advantage_mae = torch.abs(predicted_advantage - target_advantage).mean()
 
         # NEW: Illegality head loss (binary cross-entropy for legality prediction)
         illegality_head_loss: Optional[torch.Tensor] = None
@@ -283,8 +329,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         if masked_positions is not None and original_input_ids is not None:
             # Only compute loss on positions that were masked
             if masked_positions.any():
-                # Get logits for all positions: [batch_size, seq_len, vocab_size]
-                lm_logits = self.lm_head(hidden_states)
+                # Get logits only for board tokens (not thinking tokens)
+                # hidden_states[:, :original_input_ids.size(1)] extracts first 72 tokens
+                board_hidden = hidden_states[:, :original_input_ids.size(1), :]
+                lm_logits = self.lm_head(board_hidden)
 
                 # Move tensors to same device if needed
                 if original_input_ids.device != target_device:
@@ -380,6 +428,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             masked_token_accuracy=masked_token_accuracy,
             top1_agreement=top1_agreement,
             model_entropy=model_entropy,
+            white_advantage_mae=white_advantage_mae,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
