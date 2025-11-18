@@ -305,16 +305,26 @@ def train() -> None:
     pad_token_id = tokenizer.token_to_id("[PAD]")
     act_token_id = tokenizer.token_to_id("<ACT>")
     mask_token_id = tokenizer.token_to_id("[MASK]")
-    empty_square_token_id = tokenizer.token_to_id("e-p")
+
+    # Create set of all empty square token IDs (a1-p through h8-p)
+    empty_square_token_ids = set()
+    files = 'abcdefgh'
+    ranks = '12345678'
+    for file in files:
+        for rank in ranks:
+            token_id = tokenizer.token_to_id(f"{file}{rank}-p")
+            if token_id is not None:
+                empty_square_token_ids.add(token_id)
+
     if act_token_id is None:
         raise ValueError("Tokenizer is missing the <ACT> token")
     if mask_token_id is None:
         raise ValueError("Tokenizer is missing the [MASK] token")
-    if empty_square_token_id is None:
-        raise ValueError("Tokenizer is missing the empty square token 'e-p'")
+    if len(empty_square_token_ids) != 64:
+        raise ValueError(f"Expected 64 empty square tokens, found {len(empty_square_token_ids)}")
     print(
         f"Tokenizer created - vocab size: {vocab_size}, pad token id: {pad_token_id}, "
-        f"mask token id: {mask_token_id}, empty square token id: {empty_square_token_id}")
+        f"mask token id: {mask_token_id}, empty square token count: {len(empty_square_token_ids)}")
 
     processed_path = Path(PROCESSED_DATASET_DIR)
     if not processed_path.exists():
@@ -380,9 +390,9 @@ def train() -> None:
         model = ChessPolicyValueModel.from_pretrained_compiled(
             RESUME_FROM_CHECKPOINT)
         model.config.use_cache = False
-        # Ensure empty_token_id is set (for backwards compatibility with old checkpoints)
-        if not hasattr(model.config, 'empty_token_id'):
-            model.config.empty_token_id = empty_square_token_id
+        # Ensure empty_token_ids is set (for backwards compatibility with old checkpoints)
+        if not hasattr(model.config, 'empty_token_ids'):
+            model.config.empty_token_ids = list(empty_square_token_ids)
         print(
             f"Model loaded from checkpoint with {sum(p.numel() for p in model.parameters()):,} parameters")
     else:
@@ -400,7 +410,7 @@ def train() -> None:
             pad_token_id=pad_token_id,
         )
         config.policy_dim = len(policy_index)
-        config.empty_token_id = empty_square_token_id
+        config.empty_token_ids = list(empty_square_token_ids)
         config.num_thinking_tokens = NUM_THINKING_TOKENS
 
         # Sanity check: ensure MAX_SEQ_LENGTH is large enough

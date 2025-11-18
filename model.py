@@ -115,7 +115,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.policy_dim = config.policy_dim
-        self.empty_token_id = getattr(config, 'empty_token_id', None)
+        # Get empty token IDs (can be list or None)
+        empty_token_ids_list = getattr(config, 'empty_token_ids', None)
+        self.empty_token_ids = set(empty_token_ids_list) if empty_token_ids_list else None
         self.transformer = LlamaModel(config)
         self._disable_causal_mask()
         hidden_size = config.hidden_size
@@ -357,9 +359,16 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
                     # Compute accuracy only on masked positions that are pieces (not empty squares)
                     masked_preds = masked_lm_logits.argmax(dim=-1)
-                    if self.empty_token_id is not None:
+                    if self.empty_token_ids is not None:
                         # Filter out empty squares - only count accuracy on piece squares
-                        non_empty_mask = (masked_labels != self.empty_token_id)
+                        # Create tensor of empty token IDs for efficient comparison
+                        empty_ids_tensor = torch.tensor(
+                            list(self.empty_token_ids),
+                            device=masked_labels.device,
+                            dtype=masked_labels.dtype
+                        )
+                        # Create mask: True for non-empty squares
+                        non_empty_mask = ~torch.isin(masked_labels, empty_ids_tensor)
                         if non_empty_mask.any():
                             masked_token_accuracy = (
                                 (masked_preds[non_empty_mask] == masked_labels[non_empty_mask])
