@@ -641,7 +641,7 @@ def main():
     from model import ChessPolicyValueModel
 
     # Configuration
-    CHECKPOINT_PATH = "./no-mask/checkpoint-30000"
+    CHECKPOINT_PATH = "./long"
     # Adjust path as needed
     STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
     NUM_GAMES = 400

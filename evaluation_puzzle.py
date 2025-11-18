@@ -413,7 +413,7 @@ if __name__ == "__main__":
     from model import ChessPolicyValueModel
 
     # Configuration - same as test.py
-    CHECKPOINT_PATH = "./outputs/checkpoint-45000"
+    CHECKPOINT_PATH = "./long"
 
     print("Loading model from checkpoint...")
     model = ChessPolicyValueModel.from_pretrained_compiled(CHECKPOINT_PATH)
