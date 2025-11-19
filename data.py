@@ -7,6 +7,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 from datasets import IterableDataset as HFIterableDataset
 
 from policy_index import policy_index
+from tokenizer import process_fen
 
 
 EXPECTED_SEQ_LEN = 71
@@ -78,6 +79,83 @@ class ChessPolicyDataset(IterableDataset):
                 f"input_ids length {seq_len} does not match expected {EXPECTED_SEQ_LEN}"
             )
 
+        wdl = torch.as_tensor(example["wdl"])
+        if wdl.dtype != torch.float32:
+            wdl = wdl.to(dtype=torch.float32)
+
+        if wdl.ndim != 1 or wdl.shape[0] != 3:
+            raise ValueError(
+                f"wdl field expected shape (3,), received {tuple(wdl.shape)}"
+            )
+
+        return {
+            "policy": policy,
+            "input_ids": input_ids,
+            "wdl": wdl,
+        }
+
+
+class ChessPolicyDatasetRuntimeTokenization(IterableDataset):
+    """Streaming dataset that tokenizes FENs at runtime.
+    
+    This ensures the tokenizer used during training matches the one used during inference.
+    """
+
+    def __init__(self, hf_dataset: HFIterableDataset, tokenizer) -> None:
+        if not isinstance(hf_dataset, HFIterableDataset):
+            raise TypeError(
+                "ChessPolicyDatasetRuntimeTokenization requires a streaming Hugging Face dataset")
+
+        self.dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.act_token_id = tokenizer.token_to_id("<ACT>")
+        if self.act_token_id is None:
+            raise ValueError("Tokenizer must have <ACT> token")
+        
+        self.policy_size = len(policy_index)
+
+    @property
+    def is_streaming(self) -> bool:
+        return True
+
+    def __len__(self) -> int:
+        raise TypeError(
+            "ChessPolicyDatasetRuntimeTokenization wraps streaming data and has no length")
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            shard = self.dataset.shard(worker_info.num_workers, worker_info.id)
+            iterator: Iterable[Dict[str, object]] = iter(shard)
+        else:
+            iterator = iter(self.dataset)
+
+        for example in iterator:
+            yield self._process_example(example)
+
+    def _process_example(self, example: Dict[str, object]) -> Dict[str, torch.Tensor]:
+        # Extract policy
+        policy = torch.as_tensor(example["policy"])
+        if policy.dtype != torch.float32:
+            policy = policy.to(dtype=torch.float32)
+
+        if policy.ndim != 1 or policy.shape[0] != self.policy_size:
+            raise ValueError(
+                f"policy field expected shape ({self.policy_size},), received {tuple(policy.shape)}"
+            )
+
+        # Tokenize FEN at runtime
+        fen = example["fen"]
+        processed = process_fen(fen) + " <ACT>"
+        encoding = self.tokenizer.encode(processed)
+        input_ids = torch.tensor(encoding.ids, dtype=torch.long)
+
+        if input_ids.shape[0] != EXPECTED_SEQ_LEN:
+            raise ValueError(
+                f"Tokenized FEN has length {input_ids.shape[0]}, expected {EXPECTED_SEQ_LEN}. FEN: {fen}"
+            )
+
+        # Extract WDL
         wdl = torch.as_tensor(example["wdl"])
         if wdl.dtype != torch.float32:
             wdl = wdl.to(dtype=torch.float32)

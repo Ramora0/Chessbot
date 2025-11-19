@@ -1,4 +1,4 @@
-data/
+data/puzzles.csv
 .venv/
 eval/
 __pycache__/

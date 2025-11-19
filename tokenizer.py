@@ -5,6 +5,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 
 
+_EMPTY_SQUARE_TOKEN = "e-p"
 _PIECE_TOKENS = {
     "r": "r-p",
     "n": "n-p",
@@ -19,6 +20,10 @@ _PIECE_TOKENS = {
     "K": "K-p",
     "P": "P-p",
 }
+_DIGIT_TOKENS = {
+    str(i): tuple([_EMPTY_SQUARE_TOKEN] * i)
+    for i in range(1, 9)
+}
 _TURN_TOKENS = {"w": "w-t", "b": "b-t"}
 _CASTLING_ORDER = "KQkq"
 _CASTLING_TOKENS = {c: f"{c}-c" for c in _CASTLING_ORDER}
@@ -32,29 +37,17 @@ def process_fen(fen: str) -> str:
     """Convert a FEN string into a space-delimited token sequence."""
     parts = fen.split()
 
-    # First part (board): expand digits to position tokens, pieces to '<piece>-p'
+    # First part (board): expand digits to 'e-p' tokens, pieces to '<piece>-p'
     board = parts[0]
     board_rows = board.split('/')
     board_processed = []
-    files = 'abcdefgh'
-
-    for rank_idx, row in enumerate(board_rows):
-        rank = 8 - rank_idx  # FEN starts from rank 8
+    for row in board_rows:
         row_tokens = []
-        file_idx = 0
-
         for c in row:
             if c.isdigit():
-                # Empty squares - use position tokens
-                for _ in range(int(c)):
-                    position = f"{files[file_idx]}{rank}-p"
-                    row_tokens.append(position)
-                    file_idx += 1
+                row_tokens.extend(['e-p'] * int(c))
             else:
-                # Piece token
                 row_tokens.append(f'{c}-p')
-                file_idx += 1
-
         spaced_line = ' '.join(row_tokens)
         board_processed.append(spaced_line)
     board_result = ' '.join(board_processed)
@@ -89,35 +82,26 @@ def process_fen_batch(fens: Iterable[str]) -> List[str]:
     append_result = results.append
 
     piece_tokens = _PIECE_TOKENS
+    digit_tokens = _DIGIT_TOKENS
     turn_tokens = _TURN_TOKENS
     castling_tokens = _CASTLING_TOKENS
     castling_order = _CASTLING_ORDER
     castling_empty = _CASTLING_EMPTY
     en_passant_empty = _EN_PASSANT_EMPTY
     en_passant_suffix = _EN_PASSANT_SUFFIX
-    files = 'abcdefgh'
 
     for fen in fens:
         board, turn, castling, en_passant, *_ = fen.split()
 
         board_tokens: List[str] = []
         board_append = board_tokens.append
-
-        for rank_idx, row in enumerate(board.split('/')):
-            rank = 8 - rank_idx  # FEN starts from rank 8
-            file_idx = 0
-
+        board_extend = board_tokens.extend
+        for row in board.split('/'):
             for char in row:
                 if char in piece_tokens:
                     board_append(piece_tokens[char])
-                    file_idx += 1
                 else:
-                    # Empty squares - use position tokens
-                    for _ in range(int(char)):
-                        position = f"{files[file_idx]}{rank}-p"
-                        board_append(position)
-                        file_idx += 1
-
+                    board_extend(digit_tokens[char])
         board_str = " ".join(board_tokens)
 
         turn_token = turn_tokens[turn]
@@ -142,17 +126,10 @@ def create_vocabulary():
     """Create the full vocabulary used for inputs only (no move tokens)."""
     vocab = set()
 
-    # 1. Board pieces with -p (12 pieces)
-    pieces = ['r', 'n', 'b', 'q', 'k', 'p', 'R', 'N', 'B', 'Q', 'K', 'P']
+    # 1. Board pieces with -p (12 pieces + empty)
+    pieces = ['r', 'n', 'b', 'q', 'k', 'p', 'R', 'N', 'B', 'Q', 'K', 'P', 'e']
     for piece in pieces:
         vocab.add(f"{piece}-p")
-
-    # Empty square positions with -p (all 64 squares)
-    files = 'abcdefgh'
-    ranks = '12345678'
-    for file in files:
-        for rank in ranks:
-            vocab.add(f"{file}{rank}-p")
 
     # 2. Turn tokens with -t
     for turn in ['w', 'b']:

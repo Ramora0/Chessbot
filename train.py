@@ -20,7 +20,7 @@ from data import ChessPolicyCollator, ChessPolicyDataset
 from model import ChessPolicyValueModel
 from policy_index import policy_index
 from tokenizer import create_tokenizer
-from evaluation_puzzle import evaluate_model_elo, DEFAULT_EVAL_DATASET_DIR
+from evaluation_puzzle import evaluate_model_elo, DEFAULT_EVAL_CSV_PATH
 from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 
@@ -42,7 +42,7 @@ BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
 # Set to a checkpoint path to resume training (e.g., "./outputs/checkpoint-45000")
 # Set to None to start from scratch
 # RESUME_FROM_CHECKPOINT = "./outputs/checkpoint-90000"
-RESUME_FROM_CHECKPOINT = None
+RESUME_FROM_CHECKPOINT = 'new/checkpoint-72500'
 
 
 @dataclass
@@ -243,12 +243,16 @@ class EloEvaluationCallback(TrainerCallback):
         self,
         eval_dataset,
         frequency: int,
+        tokenizer,
         batch_size: int = EVAL_BATCH_SIZE,
+        csv_path=None,
     ) -> None:
         super().__init__()
         self.eval_dataset = eval_dataset
         self.frequency = max(0, int(frequency))
+        self.tokenizer = tokenizer
         self.batch_size = batch_size
+        self.csv_path = csv_path
         self.trainer: Optional[Trainer] = None
         self._last_step_logged: int = -1
 
@@ -277,6 +281,8 @@ class EloEvaluationCallback(TrainerCallback):
             model=model,
             batch_size=self.batch_size,
             dataset=self.eval_dataset,
+            tokenizer=self.tokenizer,
+            csv_path=self.csv_path,
         )
         if was_training:
             model.train()
@@ -306,42 +312,12 @@ def train() -> None:
     act_token_id = tokenizer.token_to_id("<ACT>")
     mask_token_id = tokenizer.token_to_id("[MASK]")
 
-    # Create set of all empty square token IDs (a1-p through h8-p)
-    empty_square_token_ids = set()
-    files = 'abcdefgh'
-    ranks = '12345678'
-    for file in files:
-        for rank in ranks:
-            token_id = tokenizer.token_to_id(f"{file}{rank}-p")
-            if token_id is not None:
-                empty_square_token_ids.add(token_id)
-
-    if act_token_id is None:
-        raise ValueError("Tokenizer is missing the <ACT> token")
-    if mask_token_id is None:
-        raise ValueError("Tokenizer is missing the [MASK] token")
-    if len(empty_square_token_ids) != 64:
-        raise ValueError(f"Expected 64 empty square tokens, found {len(empty_square_token_ids)}")
-    print(
-        f"Tokenizer created - vocab size: {vocab_size}, pad token id: {pad_token_id}, "
-        f"mask token id: {mask_token_id}, empty square token count: {len(empty_square_token_ids)}")
-
-    processed_path = Path(PROCESSED_DATASET_DIR)
-    if not processed_path.exists():
-        raise FileNotFoundError(
-            f"Processed dataset not found at '{processed_path}'. "
-            "Run process.py first to generate it."
-        )
-
-    print(f"Loading preprocessed dataset from '{processed_path}'...")
-
-    # hf_dataset = load_from_disk(str(processed_path))
-    data_files = sorted(str(path)
-                        for path in processed_path.glob("data-*.arrow"))
-
+    # Load raw FENs from HuggingFace and tokenize at runtime
+    # This ensures the tokenizer used during training matches inference
+    print(f"Loading raw dataset from 'Maxlegrec/ChessFENS'...")
+    
     hf_dataset = load_dataset(
-        "arrow",
-        data_files=data_files,
+        "Maxlegrec/ChessFENS",
         split="train",
         streaming=True,
     )
@@ -353,9 +329,12 @@ def train() -> None:
         raise TypeError(
             "Expected streaming dataset when loading training data")
 
-    train_dataset = ChessPolicyDataset(
+    # Import the runtime tokenization dataset class
+    from data import ChessPolicyDatasetRuntimeTokenization
+    
+    train_dataset = ChessPolicyDatasetRuntimeTokenization(
         hf_dataset,
-        act_token_id=act_token_id,
+        tokenizer=tokenizer,
     )
 
     per_device_batch_size = 1024
@@ -373,14 +352,14 @@ def train() -> None:
         f"elo_eval_steps={schedule.elo_eval_steps}",
     )
     eval_dataset = None
-    eval_path = Path(DEFAULT_EVAL_DATASET_DIR)
-    if eval_path.exists():
+    csv_path = DEFAULT_EVAL_CSV_PATH
+    if csv_path.exists():
         print(
-            f"Loading evaluation dataset from '{eval_path}' once for Elo tracking...")
-        eval_dataset = load_from_disk(str(eval_path))
+            f"Loading evaluation puzzles from '{csv_path}'...")
+        eval_dataset = None  # Will load from CSV
     else:
         print(
-            f"Evaluation dataset not found at '{eval_path}'. "
+            f"CSV file not found at '{csv_path}'. "
             "Elo evaluations during training will be skipped."
         )
 
@@ -390,9 +369,6 @@ def train() -> None:
         model = ChessPolicyValueModel.from_pretrained_compiled(
             RESUME_FROM_CHECKPOINT)
         model.config.use_cache = False
-        # Ensure empty_token_ids is set (for backwards compatibility with old checkpoints)
-        if not hasattr(model.config, 'empty_token_ids'):
-            model.config.empty_token_ids = list(empty_square_token_ids)
         print(
             f"Model loaded from checkpoint with {sum(p.numel() for p in model.parameters()):,} parameters")
     else:
@@ -410,7 +386,6 @@ def train() -> None:
             pad_token_id=pad_token_id,
         )
         config.policy_dim = len(policy_index)
-        config.empty_token_ids = list(empty_square_token_ids)
         config.num_thinking_tokens = NUM_THINKING_TOKENS
 
         # Sanity check: ensure MAX_SEQ_LENGTH is large enough
@@ -465,6 +440,7 @@ def train() -> None:
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
         max_steps=schedule.max_steps,
+        ignore_data_skip=True,  # Skip dataloader state restoration for streaming datasets
     )
     print(
         f"Training config: {training_args.num_train_epochs} epochs, batch size {training_args.per_device_train_batch_size}, "
@@ -490,7 +466,7 @@ def train() -> None:
         data_collator=data_collator,
     )
 
-    if eval_dataset is not None and schedule.elo_eval_steps > 0:
+    if csv_path.exists() and schedule.elo_eval_steps > 0:
         print(
             f"Registering Elo evaluation callback every {schedule.elo_eval_steps} steps "
             f"(batch size {EVAL_BATCH_SIZE})"
@@ -499,6 +475,8 @@ def train() -> None:
             eval_dataset=eval_dataset,
             frequency=schedule.elo_eval_steps,
             batch_size=EVAL_BATCH_SIZE,
+            tokenizer=tokenizer,
+            csv_path=csv_path,
         )
         elo_callback.attach_trainer(trainer)
         trainer.add_callback(elo_callback)

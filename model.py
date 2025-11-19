@@ -24,6 +24,7 @@ class MultiTaskAttentionPooling(nn.Module):
     Computes multiple task-specific outputs in a single forward pass by using
     separate learnable queries for each task while sharing the K/V projections.
     """
+
     def __init__(self, hidden_size: int, task_output_dims: dict[str, int]) -> None:
         """
         Args:
@@ -71,11 +72,13 @@ class MultiTaskAttentionPooling(nn.Module):
             q = self.queries[task_name].unsqueeze(0)  # [1, 1, hidden]
 
             # Compute attention weights
-            attn_weights = torch.matmul(q, k.transpose(1, 2)) * self.scale  # [batch, 1, seq_len]
+            attn_weights = torch.matmul(q, k.transpose(
+                1, 2)) * self.scale  # [batch, 1, seq_len]
             attn_weights = F.softmax(attn_weights, dim=-1)
 
             # Weighted sum of values
-            pooled = torch.matmul(attn_weights, v).squeeze(1)  # [batch, hidden]
+            pooled = torch.matmul(attn_weights, v).squeeze(
+                1)  # [batch, hidden]
 
             # Task-specific normalization and projection
             pooled = self.norms[task_name](pooled)
@@ -117,7 +120,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.policy_dim = config.policy_dim
         # Get empty token IDs (can be list or None)
         empty_token_ids_list = getattr(config, 'empty_token_ids', None)
-        self.empty_token_ids = set(empty_token_ids_list) if empty_token_ids_list else None
+        self.empty_token_ids = set(
+            empty_token_ids_list) if empty_token_ids_list else None
         self.transformer = LlamaModel(config)
         self._disable_causal_mask()
         hidden_size = config.hidden_size
@@ -146,7 +150,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         self.policy_loss_weight = float(DEFAULT_POLICY_LOSS_WEIGHT)
         self.wdl_loss_weight = float(DEFAULT_WDL_LOSS_WEIGHT)
-        self.illegality_head_loss_weight = float(DEFAULT_ILLEGALITY_HEAD_LOSS_WEIGHT)
+        self.illegality_head_loss_weight = float(
+            DEFAULT_ILLEGALITY_HEAD_LOSS_WEIGHT)
         self.masked_token_loss_weight = float(DEFAULT_MASKED_TOKEN_LOSS_WEIGHT)
         self.post_init()
 
@@ -252,12 +257,15 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
             # One-time log to confirm thinking tokens are active
             if not self._thinking_tokens_logged and self.training:
-                print(f"✓ Thinking tokens active: {original_seq_len} board tokens + {self.num_thinking_tokens} thinking tokens = {actual_seq_len} total")
-                print(f"✓ All {actual_seq_len} tokens will be processed through transformer's {len(self.transformer.layers)} layers")
+                print(
+                    f"✓ Thinking tokens active: {original_seq_len} board tokens + {self.num_thinking_tokens} thinking tokens = {actual_seq_len} total")
+                print(
+                    f"✓ All {actual_seq_len} tokens will be processed through transformer's {len(self.transformer.layers)} layers")
                 self._thinking_tokens_logged = True
 
         # Process ALL tokens (board + thinking) through transformer
-        transformer_outputs = self.transformer(inputs_embeds=input_embeds, **kwargs)
+        transformer_outputs = self.transformer(
+            inputs_embeds=input_embeds, **kwargs)
         hidden_states = transformer_outputs.last_hidden_state
 
         # Multi-task attention pooling (single forward pass)
@@ -276,6 +284,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
             policy_mask_bool = (policy >= 0).to(dtype=torch.bool)
             policy = policy.masked_fill(~policy_mask_bool, 0)
+
+            # Normalize policy so max value is always 1
+            # policy_max = policy.max(dim=-1, keepdim=True).values
+            # policy = policy / (policy_max + 1e-9)
 
             # NEW: Mask illegal moves before computing softmax (clean policy loss)
             # masked_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
@@ -303,9 +315,11 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
             # White advantage MAE: mean absolute error of (win - loss) prediction
             wdl_probs = F.softmax(wdl_logits, dim=-1)
-            predicted_advantage = wdl_probs[:, 0] - wdl_probs[:, 2]  # win - loss
+            predicted_advantage = wdl_probs[:,
+                                            0] - wdl_probs[:, 2]  # win - loss
             target_advantage = wdl[:, 0] - wdl[:, 2]  # win - loss
-            white_advantage_mae = torch.abs(predicted_advantage - target_advantage).mean()
+            white_advantage_mae = torch.abs(
+                predicted_advantage - target_advantage).mean()
 
         # NEW: Illegality head loss (binary cross-entropy for legality prediction)
         illegality_head_loss: Optional[torch.Tensor] = None
@@ -343,9 +357,11 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                     masked_positions = masked_positions.to(target_device)
 
                 # Flatten for loss computation
-                lm_logits_flat = lm_logits.view(-1, lm_logits.size(-1))  # [batch*seq, vocab]
+                # [batch*seq, vocab]
+                lm_logits_flat = lm_logits.view(-1, lm_logits.size(-1))
                 original_ids_flat = original_input_ids.view(-1)  # [batch*seq]
-                masked_positions_flat = masked_positions.view(-1)  # [batch*seq]
+                # [batch*seq]
+                masked_positions_flat = masked_positions.view(-1)
 
                 # Only compute loss on masked positions
                 masked_lm_logits = lm_logits_flat[masked_positions_flat]
@@ -368,16 +384,19 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                             dtype=masked_labels.dtype
                         )
                         # Create mask: True for non-empty squares
-                        non_empty_mask = ~torch.isin(masked_labels, empty_ids_tensor)
+                        non_empty_mask = ~torch.isin(
+                            masked_labels, empty_ids_tensor)
                         if non_empty_mask.any():
                             masked_token_accuracy = (
-                                (masked_preds[non_empty_mask] == masked_labels[non_empty_mask])
+                                (masked_preds[non_empty_mask] ==
+                                 masked_labels[non_empty_mask])
                                 .float().mean()
                             )
                         # If all masked tokens are empty squares, don't report accuracy
                     else:
                         # Fallback: compute accuracy on all masked positions
-                        masked_token_accuracy = (masked_preds == masked_labels).float().mean()
+                        masked_token_accuracy = (
+                            masked_preds == masked_labels).float().mean()
 
         # Compute metrics for reporting (not used in loss)
         illegality_rate: Optional[torch.Tensor] = None
@@ -393,14 +412,18 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
             # Top-1 agreement: how often model's top move matches Stockfish's
             # Use masked logits for fair comparison (only legal moves)
-            masked_logits_for_top1 = policy_logits.masked_fill(~policy_mask_bool, -1e9)
+            masked_logits_for_top1 = policy_logits.masked_fill(
+                ~policy_mask_bool, -1e9)
             model_top_move = masked_logits_for_top1.argmax(dim=-1)
             stockfish_top_move = policy.argmax(dim=-1)
-            top1_agreement = (model_top_move == stockfish_top_move).float().mean()
+            top1_agreement = (model_top_move ==
+                              stockfish_top_move).float().mean()
 
             # Model entropy: measure of model's confidence/diversity
-            masked_logits_for_entropy = policy_logits.masked_fill(~policy_mask_bool, -1e9)
-            model_probs_for_entropy = F.softmax(masked_logits_for_entropy, dim=-1)
+            masked_logits_for_entropy = policy_logits.masked_fill(
+                ~policy_mask_bool, -1e9)
+            model_probs_for_entropy = F.softmax(
+                masked_logits_for_entropy, dim=-1)
             model_entropy = -(model_probs_for_entropy *
                               torch.log(model_probs_for_entropy + 1e-9)).sum(dim=-1).mean()
 

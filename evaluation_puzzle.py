@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+import chess
 
 import numpy as np
 
@@ -17,30 +20,55 @@ from datasets import Dataset, load_from_disk
 from tqdm import tqdm
 
 from policy_index import policy_index
+from tokenizer import process_fen
+
+
+class RuntimeTokenizationCollate:
+    def __init__(self, tokenizer=None):
+        self.tokenizer = tokenizer
+        self.act_token_id = tokenizer.token_to_id("<ACT>") if tokenizer else None
+
+    def __call__(self, batch: Iterable[dict]) -> Dict[str, object]:
+        batch_list = list(batch)
+        
+        if self.tokenizer:
+            # Runtime tokenization
+            input_ids_list = []
+            for example in batch_list:
+                fen = example["fen"]
+                processed = process_fen(fen) + " <ACT>"
+                encoding = self.tokenizer.encode(processed)
+                input_ids_list.append(torch.tensor(encoding.ids, dtype=torch.long))
+            
+            input_ids = torch.stack(input_ids_list)
+        else:
+            # Pre-tokenized
+            input_ids = torch.tensor([
+                example["input_ids"] for example in batch_list
+            ], dtype=torch.long)
+
+        target_indices = torch.tensor([
+            example["target_policy_index"] for example in batch_list
+        ], dtype=torch.long)
+        legal_masks = torch.tensor([
+            example["legal_moves_mask"] for example in batch_list
+        ], dtype=torch.bool)
+
+        puzzle_ids = [example["puzzle_id"] for example in batch_list]
+        ratings = [int(example.get("rating", 0)) for example in batch_list]
+
+        return {
+            "input_ids": input_ids,
+            "target_indices": target_indices,
+            "legal_masks": legal_masks,
+            "puzzle_ids": puzzle_ids,
+            "ratings": ratings,
+        }
 
 
 def _collate_fn(batch: Iterable[dict]) -> Dict[str, object]:
-    batch_list = list(batch)
-    input_ids = torch.tensor([
-        example["input_ids"] for example in batch_list
-    ], dtype=torch.long)
-    target_indices = torch.tensor([
-        example["target_policy_index"] for example in batch_list
-    ], dtype=torch.long)
-    legal_masks = torch.tensor([
-        example["legal_moves_mask"] for example in batch_list
-    ], dtype=torch.bool)
-
-    puzzle_ids = [example["puzzle_id"] for example in batch_list]
-    ratings = [int(example.get("rating", 0)) for example in batch_list]
-
-    return {
-        "input_ids": input_ids,
-        "target_indices": target_indices,
-        "legal_masks": legal_masks,
-        "puzzle_ids": puzzle_ids,
-        "ratings": ratings,
-    }
+    # Legacy support for when no tokenizer is provided
+    return RuntimeTokenizationCollate(tokenizer=None)(batch)
 
 
 LOG10 = float(np.log(10.0))
@@ -48,9 +76,122 @@ ELO_K = LOG10 / 400.0
 CLIP_EPS = 1e-6
 DEFAULT_EVAL_DATASET_DIR = Path(
     "/fs/scratch/PAS3150/lees_stuff/processed_puzzles_eval")
+DEFAULT_EVAL_CSV_PATH = Path("data/puzzles.csv")
 MOVE_PROB_THRESHOLD = 0.01
 MOVE_DISTRIBUTION_OUTPUT_DIR = Path("eval")
 POLICY_MOVES: List[str] = policy_index
+
+
+def generate_legal_moves_mask(fen: str) -> List[bool]:
+    """Generate a boolean mask of legal moves for a given FEN position."""
+    board = chess.Board(fen)
+    legal_moves_set = {move.uci() for move in board.legal_moves}
+    
+    # Create mask: True if move is legal, False otherwise
+    mask = [move in legal_moves_set for move in POLICY_MOVES]
+    return mask
+
+
+def get_target_policy_index(moves_str: str) -> int:
+    """Extract the first move from the solution and return its policy index."""
+    moves = moves_str.strip().split()
+    if not moves:
+        raise ValueError(f"No moves found in solution: {moves_str}")
+    
+    target_move = moves[0]
+    try:
+        return POLICY_MOVES.index(target_move)
+    except ValueError:
+        raise ValueError(f"Move {target_move} not found in policy_index")
+
+
+def load_puzzles_from_csv(csv_path: str | Path) -> List[Dict[str, object]]:
+    """Load puzzles from CSV file and prepare them for evaluation.
+    
+    Each puzzle with multiple moves in the solution will be expanded into
+    multiple evaluation states (one per move). All states share the same
+    puzzle_id so their probabilities can be multiplied together.
+    
+    Returns a list of dictionaries with keys:
+    - puzzle_id: str (same for all moves in a puzzle)
+    - rating: int
+    - fen: str (position after opponent's move)
+    - target_policy_index: int (the correct move to make)
+    - legal_moves_mask: List[bool]
+    """
+    puzzles = []
+    csv_path = Path(csv_path)
+    
+    with csv_path.open('r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            puzzle_id = row['PuzzleId']
+            rating = int(row['Rating'])
+            initial_fen = row['FEN']
+            moves_str = row['Moves']
+            
+            try:
+                # Parse all moves in the solution
+                moves = moves_str.strip().split()
+                if not moves:
+                    print(f"Warning: Skipping puzzle {puzzle_id}: no moves in solution")
+                    continue
+                
+                # Create a board from the initial position
+                board = chess.Board(initial_fen)
+                
+                # Process each move in the solution
+                # Moves alternate: opponent (0), player (1), opponent (2), player (3), ...
+                # We only evaluate the model on player moves (odd indices)
+                for move_idx, move_uci in enumerate(moves):
+                    # Apply opponent moves without evaluation
+                    if move_idx % 2 == 0:
+                        # This is an opponent move - just apply it to the board
+                        try:
+                            move = chess.Move.from_uci(move_uci)
+                            board.push(move)
+                        except Exception as e:
+                            print(f"Warning: Invalid opponent move {move_uci} in puzzle {puzzle_id}: {e}")
+                            break
+                        continue
+                    
+                    # This is a player move - evaluate the model on this
+                    current_fen = board.fen()
+                    
+                    # Generate legal moves for this position
+                    legal_moves_mask = generate_legal_moves_mask(current_fen)
+                    
+                    # Get the target move index
+                    try:
+                        target_policy_index = POLICY_MOVES.index(move_uci)
+                    except ValueError:
+                        print(f"Warning: Move {move_uci} not in policy_index for puzzle {puzzle_id}")
+                        break
+                    
+                    # Add this state to the puzzle list
+                    puzzles.append({
+                        'puzzle_id': puzzle_id,
+                        'rating': rating,
+                        'fen': current_fen,
+                        'target_policy_index': target_policy_index,
+                        'legal_moves_mask': legal_moves_mask,
+                    })
+                    
+                    # Make the player move on the board to get to the next position
+                    try:
+                        move = chess.Move.from_uci(move_uci)
+                        board.push(move)
+                    except Exception as e:
+                        print(f"Warning: Invalid player move {move_uci} in puzzle {puzzle_id}: {e}")
+                        break
+
+                    
+            except Exception as e:
+                print(f"Warning: Skipping puzzle {puzzle_id}: {e}")
+                continue
+    
+    return puzzles
+
 
 
 @dataclass
@@ -115,6 +256,8 @@ def evaluate_puzzles(
     device: Optional[torch.device] = None,
     dataset: Optional[Dataset] = None,
     verbose: bool = False,
+    tokenizer=None,
+    csv_path: Optional[str | Path] = None,
 ) -> Tuple[List[Tuple[int, float]], EvaluationDetails]:
     """Run the model on the evaluation dataset and collect per-puzzle statistics.
 
@@ -125,16 +268,31 @@ def evaluate_puzzles(
     state-level move distributions for downstream logging.
     """
 
-    if dataset is not None:
+    if csv_path is not None:
+        # Load from CSV
+        puzzles = load_puzzles_from_csv(csv_path)
+        dataloader = DataLoader(
+            puzzles,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=RuntimeTokenizationCollate(tokenizer=tokenizer),
+        )
+    elif dataset is not None:
         hf_dataset = dataset
+        dataloader = DataLoader(
+            hf_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=RuntimeTokenizationCollate(tokenizer=tokenizer),
+        )
     else:
         hf_dataset = load_from_disk(str(dataset_dir))
-    dataloader = DataLoader(
-        hf_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=_collate_fn,
-    )
+        dataloader = DataLoader(
+            hf_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=RuntimeTokenizationCollate(tokenizer=tokenizer),
+        )
 
     model_device = device or next(model.parameters()).device
     model.eval()
@@ -340,6 +498,8 @@ def evaluate_model_elo(
     init_rating: Optional[float] = None,
     dataset: Optional[Dataset] = None,
     verbose: bool = False,
+    tokenizer=None,
+    csv_path: Optional[str | Path] = None,
 ) -> Tuple[float, float, float]:
     """
     Run evaluation and return an Elo estimate, its standard error, and the
@@ -356,6 +516,8 @@ def evaluate_model_elo(
         device=device,
         dataset=dataset,
         verbose=verbose,
+        tokenizer=tokenizer,
+        csv_path=csv_path,
     )
 
     if not per_puzzle_results:
