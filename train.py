@@ -13,10 +13,10 @@ from transformers import (
     TrainingArguments,
     TrainerCallback,
 )
-from datasets import load_from_disk, load_dataset
-from datasets import IterableDataset as HFIterableDataset
+from datasets import load_from_disk
 
-from data import ChessPolicyCollator, ChessPolicyDataset
+from data import ChessPolicyCollator
+from action_value_dataset import ActionValueDataset
 from model import ChessPolicyValueModel
 from policy_index import policy_index
 from tokenizer import create_tokenizer
@@ -28,7 +28,7 @@ OUTPUT_DIR = "new"
 DROPOUT = 0.1
 NUM_THINKING_TOKENS = 0  # Set to 0 to disable thinking tokens (72 board tokens + thinking tokens)
 MAX_SEQ_LENGTH = 256  # Must be >= 72 + NUM_THINKING_TOKENS
-PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
+PROCESSED_DATASET_DIR = "/fs/scratch/PAS2836/lees_stuff/action_value"
 ELO_EVAL_STEPS = 4000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
@@ -42,7 +42,7 @@ BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
 # Set to a checkpoint path to resume training (e.g., "./outputs/checkpoint-45000")
 # Set to None to start from scratch
 # RESUME_FROM_CHECKPOINT = "./outputs/checkpoint-90000"
-RESUME_FROM_CHECKPOINT = 'new/checkpoint-72500'
+RESUME_FROM_CHECKPOINT = None
 
 
 @dataclass
@@ -94,7 +94,7 @@ class TrackingTrainer(Trainer):
         self._last_masked_token_accuracy: Optional[float] = None
         self._last_top1_agreement: Optional[float] = None
         self._last_model_entropy: Optional[float] = None
-        self._last_white_advantage_mae: Optional[float] = None
+        self._last_value_mae: Optional[float] = None
 
     def compute_loss(
         self,
@@ -189,10 +189,10 @@ class TrackingTrainer(Trainer):
                   ) if model_entropy is not None else None
         )
 
-        white_advantage_mae = getattr(outputs, "white_advantage_mae", None)
-        self._last_white_advantage_mae = (
-            float(white_advantage_mae.detach().item()
-                  ) if white_advantage_mae is not None else None
+        value_mae = getattr(outputs, "value_mae", None)
+        self._last_value_mae = (
+            float(value_mae.detach().item()
+                  ) if value_mae is not None else None
         )
 
         if return_outputs:
@@ -232,9 +232,9 @@ class TrackingTrainer(Trainer):
             if self._last_model_entropy is not None:
                 logs.setdefault("model_entropy",
                                 self._last_model_entropy)
-            if self._last_white_advantage_mae is not None:
-                logs.setdefault("white_advantage_mae",
-                                self._last_white_advantage_mae)
+            if self._last_value_mae is not None:
+                logs.setdefault("value_mae",
+                                self._last_value_mae)
         super().log(logs, *args, **kwargs)
 
 
@@ -312,29 +312,14 @@ def train() -> None:
     act_token_id = tokenizer.token_to_id("<ACT>")
     mask_token_id = tokenizer.token_to_id("[MASK]")
 
-    # Load raw FENs from HuggingFace and tokenize at runtime
+    # Load action-value dataset and tokenize at runtime
     # This ensures the tokenizer used during training matches inference
-    print(f"Loading raw dataset from 'Maxlegrec/ChessFENS'...")
-    
-    hf_dataset = load_dataset(
-        "Maxlegrec/ChessFENS",
-        split="train",
-        streaming=True,
-    )
+    print(f"Loading action-value dataset from '{PROCESSED_DATASET_DIR}'...")
 
-    # optional: approximate shuffle with a buffer
-    hf_dataset = hf_dataset.shuffle(buffer_size=100_000)
-
-    if not isinstance(hf_dataset, HFIterableDataset):
-        raise TypeError(
-            "Expected streaming dataset when loading training data")
-
-    # Import the runtime tokenization dataset class
-    from data import ChessPolicyDatasetRuntimeTokenization
-    
-    train_dataset = ChessPolicyDatasetRuntimeTokenization(
-        hf_dataset,
+    train_dataset = ActionValueDataset(
+        dataset_path=PROCESSED_DATASET_DIR,
         tokenizer=tokenizer,
+        streaming=True,
     )
 
     per_device_batch_size = 1024
@@ -435,7 +420,7 @@ def train() -> None:
         run_name="testz",
         remove_unused_columns=False,
 
-        dataloader_num_workers=8,
+        dataloader_num_workers=1,
         dataloader_prefetch_factor=1,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,

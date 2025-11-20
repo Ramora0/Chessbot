@@ -13,7 +13,7 @@ DATASET_NAME = "Maxlegrec/ChessFENS"
 DATASET_SPLIT = "train"
 OUTPUT_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
 BATCH_SIZE = 1_024
-EXPECTED_SEQ_LEN = 71
+EXPECTED_SEQ_LEN = 70
 # Controls the on-disk shard size when saving the processed dataset.
 MAX_SHARD_SIZE = "1500MB"
 
@@ -21,9 +21,6 @@ MAX_SHARD_SIZE = "1500MB"
 def main() -> None:
     print("Loading tokenizer...")
     tokenizer = create_tokenizer()
-    act_token_id = tokenizer.token_to_id("<ACT>")
-    if act_token_id is None:
-        raise ValueError("Tokenizer does not contain the <ACT> token")
 
     print(f"Loading dataset '{DATASET_NAME}' (split: {DATASET_SPLIT})...")
     dataset = load_dataset(DATASET_NAME, split=DATASET_SPLIT)
@@ -39,8 +36,6 @@ def main() -> None:
         append_ids = input_ids.append
         for encoding in encodings:
             ids = list(encoding.ids)
-            if not ids or ids[-1] != act_token_id:
-                ids.append(act_token_id)
             if len(ids) != EXPECTED_SEQ_LEN:
                 raise ValueError(
                     f"Processed sequence length {len(ids)} does not match expected {EXPECTED_SEQ_LEN}"

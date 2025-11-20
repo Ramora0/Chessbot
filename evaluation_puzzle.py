@@ -36,7 +36,7 @@ class RuntimeTokenizationCollate:
             input_ids_list = []
             for example in batch_list:
                 fen = example["fen"]
-                processed = process_fen(fen) + " <ACT>"
+                processed = process_fen(fen)
                 encoding = self.tokenizer.encode(processed)
                 input_ids_list.append(torch.tensor(encoding.ids, dtype=torch.long))
             

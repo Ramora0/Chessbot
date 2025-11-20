@@ -10,7 +10,7 @@ from policy_index import policy_index
 from tokenizer import process_fen
 
 
-EXPECTED_SEQ_LEN = 71
+EXPECTED_SEQ_LEN = 70
 
 
 class ChessPolicyDataset(IterableDataset):
@@ -83,9 +83,9 @@ class ChessPolicyDataset(IterableDataset):
         if wdl.dtype != torch.float32:
             wdl = wdl.to(dtype=torch.float32)
 
-        if wdl.ndim != 1 or wdl.shape[0] != 3:
+        if wdl.ndim != 1 or wdl.shape[0] != 128:
             raise ValueError(
-                f"wdl field expected shape (3,), received {tuple(wdl.shape)}"
+                f"wdl field expected shape (128,), received {tuple(wdl.shape)}"
             )
 
         return {
@@ -146,7 +146,7 @@ class ChessPolicyDatasetRuntimeTokenization(IterableDataset):
 
         # Tokenize FEN at runtime
         fen = example["fen"]
-        processed = process_fen(fen) + " <ACT>"
+        processed = process_fen(fen)
         encoding = self.tokenizer.encode(processed)
         input_ids = torch.tensor(encoding.ids, dtype=torch.long)
 
@@ -221,9 +221,9 @@ class ChessPolicyCollator:
         wdl_values = torch.stack(wdl_list)
         if wdl_values.dtype != torch.float32:
             wdl_values = wdl_values.to(dtype=torch.float32)
-        if wdl_values.shape[1] != 3:
+        if wdl_values.shape[1] != 128:
             raise ValueError(
-                f"wdl tensor expected width 3, received {wdl_values.shape[1]}"
+                f"wdl tensor expected width 128, received {wdl_values.shape[1]}"
             )
 
         # Apply masked token prediction if mask_token_id is provided
@@ -261,11 +261,21 @@ class ChessPolicyCollator:
                             input_ids[i, pos] = self.mask_token_id
                         # else: keep original token (10% of the time)
 
+        # Handle true_value if present (for value head metrics)
+        true_value_list = []
+        for item in batch:
+            if "true_value" in item:
+                true_value_list.append(item["true_value"])
+
         result = {
             "input_ids": input_ids,
             "policy": policy_values,
             "wdl": wdl_values,
         }
+
+        if true_value_list:
+            true_values = torch.stack(true_value_list)
+            result["true_value"] = true_values
 
         # Add masking-related fields if masking was applied
         if original_input_ids is not None:

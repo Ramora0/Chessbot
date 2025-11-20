@@ -109,7 +109,7 @@ class ChessPolicyValueOutput(ModelOutput):
     masked_token_accuracy: Optional[torch.Tensor] = None
     top1_agreement: Optional[torch.Tensor] = None
     model_entropy: Optional[torch.Tensor] = None
-    white_advantage_mae: Optional[torch.Tensor] = None
+    value_mae: Optional[torch.Tensor] = None
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
 
@@ -136,11 +136,13 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             self._thinking_tokens_logged = False  # For one-time logging
 
         # Multi-task attention pooling (shared K/V, task-specific queries)
+        # WDL head now predicts win% in 128 bins (0.0 to 1.0)
+        self.num_value_bins = 128
         self.task_head = MultiTaskAttentionPooling(
             hidden_size=hidden_size,
             task_output_dims={
                 'policy': self.policy_dim,
-                'wdl': 3,
+                'wdl': self.num_value_bins,  # 128 bins for win probability
                 'illegality': self.policy_dim,  # Predict legality for each move
             }
         )
@@ -230,6 +232,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         input_ids: torch.Tensor,
         policy: Optional[torch.Tensor] = None,
         wdl: Optional[torch.Tensor] = None,
+        true_value: Optional[torch.Tensor] = None,
         masked_positions: Optional[torch.Tensor] = None,
         original_input_ids: Optional[torch.Tensor] = None,
         return_dict: bool = True,
@@ -282,44 +285,53 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             if policy.device != target_device:
                 policy = policy.to(target_device)
 
-            policy_mask_bool = (policy >= 0).to(dtype=torch.bool)
-            policy = policy.masked_fill(~policy_mask_bool, 0)
+            # TEST MODE: Override policy targets for sanity check
+            # Target: index 0 = 0 (best), all others = -1 (worst)
+            policy = torch.full_like(policy, -1.0)
+            policy[:, 0] = 0.0
 
-            # Normalize policy so max value is always 1
-            # policy_max = policy.max(dim=-1, keepdim=True).values
-            # policy = policy / (policy_max + 1e-9)
+            # Identify legal moves for metrics (even though we're not using real targets)
+            policy_mask_bool = (policy > -0.99).to(dtype=torch.bool)
 
-            # NEW: Mask illegal moves before computing softmax (clean policy loss)
-            # masked_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
-            # model_probs = F.softmax(masked_logits, dim=-1)
-            # CHANGED: No masking - model is punished for putting probability on illegal moves
+            # TEST: No masking - just raw softmax to see if model can learn at all
             model_probs = F.softmax(policy_logits, dim=-1)
 
             # Expected quality under model's distribution
-            expected_quality = (
-                model_probs * policy).sum(dim=-1)  # Range: [0, 1]
+            expected_quality = (model_probs * policy).sum(dim=-1)
 
-            # Minimize negative log expected quality (stronger gradients early training)
-            raw_policy_loss = -torch.log(expected_quality + 1e-9).mean()
+            # Minimize negative expected quality (maximize expected win probability)
+            raw_policy_loss = -expected_quality.mean()
             policy_loss = self.policy_loss_weight * raw_policy_loss
 
         wdl_loss: Optional[torch.Tensor] = None
-        white_advantage_mae: Optional[torch.Tensor] = None
+        value_mae: Optional[torch.Tensor] = None
         if wdl is not None:
+            # WDL head now predicts win% distribution over 128 bins
+            # Use Huber loss on expected values (smooth, distance-aware)
             if wdl.device != target_device:
                 wdl = wdl.to(target_device)
 
-            wdl_log_probs = F.log_softmax(wdl_logits, dim=-1)
-            raw_wdl_loss = -(wdl * wdl_log_probs).sum(dim=-1).mean()
+            # Compute predicted win% as weighted average over bins
+            bin_centers = torch.linspace(0, 1, self.num_value_bins, device=target_device)
+            wdl_probs = F.softmax(wdl_logits, dim=-1)
+            predicted_value = (wdl_probs * bin_centers).sum(dim=-1)
+
+            # Use true_value if provided, otherwise fall back to distribution center
+            if true_value is not None:
+                if true_value.device != target_device:
+                    true_value = true_value.to(target_device)
+                target_value = true_value
+            else:
+                # Fallback: compare to center of target distribution
+                target_value = (wdl * bin_centers).sum(dim=-1)
+
+            # Huber loss: smooth L1 that's quadratic for small errors, linear for large
+            # This is smooth AND cares about distance between bins
+            raw_wdl_loss = F.huber_loss(predicted_value, target_value, delta=0.1)
             wdl_loss = self.wdl_loss_weight * raw_wdl_loss
 
-            # White advantage MAE: mean absolute error of (win - loss) prediction
-            wdl_probs = F.softmax(wdl_logits, dim=-1)
-            predicted_advantage = wdl_probs[:,
-                                            0] - wdl_probs[:, 2]  # win - loss
-            target_advantage = wdl[:, 0] - wdl[:, 2]  # win - loss
-            white_advantage_mae = torch.abs(
-                predicted_advantage - target_advantage).mean()
+            # MAE metric (same as before)
+            value_mae = torch.abs(predicted_value - target_value).mean()
 
         # NEW: Illegality head loss (binary cross-entropy for legality prediction)
         illegality_head_loss: Optional[torch.Tensor] = None
@@ -460,7 +472,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             masked_token_accuracy=masked_token_accuracy,
             top1_agreement=top1_agreement,
             model_entropy=model_entropy,
-            white_advantage_mae=white_advantage_mae,
+            value_mae=value_mae,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
