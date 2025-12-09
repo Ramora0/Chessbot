@@ -235,6 +235,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         true_value: Optional[torch.Tensor] = None,
         masked_positions: Optional[torch.Tensor] = None,
         original_input_ids: Optional[torch.Tensor] = None,
+        legal_move_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         **kwargs,
     ) -> ChessPolicyValueOutput:
@@ -285,23 +286,40 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             if policy.device != target_device:
                 policy = policy.to(target_device)
 
-            # TEST MODE: Override policy targets for sanity check
-            # Target: index 0 = 0 (best), all others = -1 (worst)
-            policy = torch.full_like(policy, -1.0)
-            policy[:, 0] = 0.0
+            # TEST MODE: Use actual legal move mask from chess board
+            # All legal moves = 0, all illegal moves = -1
+            if legal_move_mask is not None:
+                # Move to same device as policy
+                if legal_move_mask.device != target_device:
+                    legal_move_mask = legal_move_mask.to(target_device)
+                # legal_move_mask: 1.0 for legal, 0.0 for illegal
+                policy_mask_bool = (legal_move_mask > 0.5).to(dtype=torch.bool)
+                # Set all legal moves to 0, illegal to -1
+                policy = torch.where(policy_mask_bool, torch.zeros_like(policy), torch.full_like(policy, -1.0))
+            else:
+                # Fallback: infer from dataset policy values
+                policy_mask_bool = (policy > -0.99).to(dtype=torch.bool)
+                policy = torch.where(policy_mask_bool, torch.zeros_like(policy), torch.full_like(policy, -1.0))
 
-            # Identify legal moves for metrics (even though we're not using real targets)
-            policy_mask_bool = (policy > -0.99).to(dtype=torch.bool)
-
-            # TEST: No masking - just raw softmax to see if model can learn at all
+            # Expected quality loss: maximize expected value of chosen moves
             model_probs = F.softmax(policy_logits, dim=-1)
-
-            # Expected quality under model's distribution
             expected_quality = (model_probs * policy).sum(dim=-1)
-
-            # Minimize negative expected quality (maximize expected win probability)
             raw_policy_loss = -expected_quality.mean()
             policy_loss = self.policy_loss_weight * raw_policy_loss
+
+            # CROSS-ENTROPY LOSS (COMMENTED OUT):
+            # # Mask illegal moves
+            # masked_policy_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
+            #
+            # # Create uniform target distribution over legal moves
+            # # policy_mask_bool has True for legal moves
+            # num_legal_moves = policy_mask_bool.float().sum(dim=-1, keepdim=True)  # [batch, 1]
+            # target_probs = policy_mask_bool.float() / num_legal_moves.clamp(min=1)  # Uniform over legal
+            #
+            # # Cross-entropy: -sum(target * log(pred))
+            # model_log_probs = F.log_softmax(masked_policy_logits, dim=-1)
+            # raw_policy_loss = -(target_probs * model_log_probs).sum(dim=-1).mean()
+            # policy_loss = self.policy_loss_weight * raw_policy_loss
 
         wdl_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None

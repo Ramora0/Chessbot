@@ -26,7 +26,8 @@ from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 OUTPUT_DIR = "new"
 DROPOUT = 0.1
-NUM_THINKING_TOKENS = 0  # Set to 0 to disable thinking tokens (72 board tokens + thinking tokens)
+# Set to 0 to disable thinking tokens (72 board tokens + thinking tokens)
+NUM_THINKING_TOKENS = 0
 MAX_SEQ_LENGTH = 256  # Must be >= 72 + NUM_THINKING_TOKENS
 PROCESSED_DATASET_DIR = "/fs/scratch/PAS2836/lees_stuff/action_value"
 ELO_EVAL_STEPS = 4000
@@ -312,15 +313,68 @@ def train() -> None:
     act_token_id = tokenizer.token_to_id("<ACT>")
     mask_token_id = tokenizer.token_to_id("[MASK]")
 
-    # Load action-value dataset and tokenize at runtime
-    # This ensures the tokenizer used during training matches inference
     print(f"Loading action-value dataset from '{PROCESSED_DATASET_DIR}'...")
-
     train_dataset = ActionValueDataset(
         dataset_path=PROCESSED_DATASET_DIR,
         tokenizer=tokenizer,
         streaming=True,
+        shuffle_buffer_size=100_000,
     )
+
+    # TEMPORARY: Load from Maxlegrec/ChessFENS HuggingFace dataset instead of local dataset
+    # print("Loading dataset from HuggingFace: Maxlegrec/ChessFENS...")
+    # hf_dataset = load_dataset("Maxlegrec/ChessFENS", split="train", streaming=True)
+
+    # # Simple wrapper that only uses FEN strings
+    # from torch.utils.data import IterableDataset
+    # import chess
+    # import numpy as np
+    # from tokenizer import process_fen
+
+    # class SimpleFENDataset(IterableDataset):
+    #     def __init__(self, hf_dataset, tokenizer):
+    #         self.dataset = hf_dataset
+    #         self.tokenizer = tokenizer
+    #         self.policy_size = len(policy_index)
+    #         self.move_to_idx = {move: idx for idx, move in enumerate(policy_index)}
+
+    #     def __iter__(self):
+    #         for example in self.dataset:
+    #             try:
+    #                 fen = example["fen"]
+
+    #                 # Tokenize FEN
+    #                 processed = process_fen(fen)
+    #                 encoding = self.tokenizer.encode(processed)
+    #                 input_ids = torch.tensor(encoding.ids, dtype=torch.long)
+
+    #                 # Get legal moves
+    #                 board = chess.Board(fen)
+    #                 legal_move_mask = np.zeros(self.policy_size, dtype=np.float32)
+    #                 policy = np.full(self.policy_size, -1.0, dtype=np.float32)
+
+    #                 for move in board.legal_moves:
+    #                     move_uci = move.uci()
+    #                     if move_uci in self.move_to_idx:
+    #                         idx = self.move_to_idx[move_uci]
+    #                         legal_move_mask[idx] = 1.0
+    #                         policy[idx] = 0.0  # All legal moves have value 0
+
+    #                 # Dummy WDL (uniform distribution)
+    #                 wdl = np.ones(128, dtype=np.float32) / 128
+
+    #                 yield {
+    #                     "input_ids": input_ids,
+    #                     "policy": torch.tensor(policy, dtype=torch.float32),
+    #                     "wdl": torch.tensor(wdl, dtype=torch.float32),
+    #                     "true_value": torch.tensor(0.5, dtype=torch.float32),
+    #                     "legal_move_mask": torch.tensor(legal_move_mask, dtype=torch.float32),
+    #                 }
+    #             except Exception as e:
+    #                 print(f"Warning: Skipping example due to error: {e}")
+    #                 continue
+
+    # train_dataset = SimpleFENDataset(hf_dataset, tokenizer)
 
     per_device_batch_size = 1024
     schedule = build_training_schedule(per_device_batch_size)
@@ -383,7 +437,8 @@ def train() -> None:
 
         print(f"Model config created - policy dimension: {config.policy_dim}")
         if NUM_THINKING_TOKENS > 0:
-            print(f"✓ Thinking tokens enabled: {NUM_THINKING_TOKENS} tokens (total sequence length: {72 + NUM_THINKING_TOKENS})")
+            print(
+                f"✓ Thinking tokens enabled: {NUM_THINKING_TOKENS} tokens (total sequence length: {72 + NUM_THINKING_TOKENS})")
         else:
             print("✓ Thinking tokens disabled (sequence length: 72)")
 

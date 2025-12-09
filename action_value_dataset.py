@@ -55,7 +55,7 @@ class ActionValueDataset(IterableDataset):
         dataset_path: str | Path,
         tokenizer,
         streaming: bool = True,
-        shuffle_buffer_size: int = 10000,
+        shuffle_buffer_size: int = 0,
     ) -> None:
         """
         Args:
@@ -81,6 +81,10 @@ class ActionValueDataset(IterableDataset):
 
         # Create move to index mapping for fast lookup
         self.move_to_idx = {move: idx for idx, move in enumerate(policy_index)}
+
+        # TESTING: Track seen FENs to detect duplicates
+        self.seen_fens = {}  # fen -> count
+        self.total_examples = 0
 
     @property
     def is_streaming(self) -> bool:
@@ -123,6 +127,15 @@ class ActionValueDataset(IterableDataset):
         """
         # 1. Tokenize FEN at runtime
         fen = example["fen"]
+
+        # TESTING: Track duplicate FENs
+        self.total_examples += 1
+        if fen in self.seen_fens:
+            self.seen_fens[fen] += 1
+            print(f"WARNING: Duplicate FEN detected! '{fen}' seen {self.seen_fens[fen]} times (total examples processed: {self.total_examples})")
+        else:
+            self.seen_fens[fen] = 1
+
         processed = process_fen(fen)
         encoding = self.tokenizer.encode(processed)
         input_ids = torch.tensor(encoding.ids, dtype=torch.long)
@@ -209,9 +222,20 @@ class ActionValueDataset(IterableDataset):
         # Also pass the true scalar value for metric computation
         true_value = torch.tensor(max_p_win, dtype=torch.float32)
 
+        # TESTING: Compute legal move mask from actual chess board
+        board = chess.Board(fen)
+        legal_move_mask = np.zeros(self.policy_size, dtype=np.float32)
+        for move in board.legal_moves:
+            move_uci = move.uci()
+            if move_uci in self.move_to_idx:
+                legal_move_mask[self.move_to_idx[move_uci]] = 1.0
+        legal_move_mask = torch.tensor(legal_move_mask, dtype=torch.float32)
+
         return {
             "input_ids": input_ids,
             "policy": policy,
             "wdl": wdl,
             "true_value": true_value,
+            "legal_move_mask": legal_move_mask,
+            "fen": fen,  # TESTING: Include FEN for debugging
         }

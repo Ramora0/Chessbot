@@ -192,10 +192,13 @@ class ChessPolicyCollator:
         input_ids_list = []
         policy_list = []
         wdl_list = []
+        legal_move_mask_list = []
         for item in batch:
             input_ids_list.append(item["input_ids"])
             policy_list.append(item["policy"])
             wdl_list.append(item["wdl"])
+            if "legal_move_mask" in item:
+                legal_move_mask_list.append(item["legal_move_mask"])
 
         if not input_ids_list:
             raise ValueError("Empty batch provided to ChessPolicyCollator")
@@ -276,6 +279,10 @@ class ChessPolicyCollator:
         if true_value_list:
             true_values = torch.stack(true_value_list)
             result["true_value"] = true_values
+
+        if legal_move_mask_list:
+            legal_move_masks = torch.stack(legal_move_mask_list)
+            result["legal_move_mask"] = legal_move_masks
 
         # Add masking-related fields if masking was applied
         if original_input_ids is not None:
