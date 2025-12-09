@@ -312,8 +312,10 @@ def train() -> None:
     pad_token_id = tokenizer.token_to_id("[PAD]")
     mask_token_id = tokenizer.token_to_id("[MASK]")
 
-    print(f"Loading chess fens policy dataset from HuggingFace: {DATASET_NAME}...")
-    hf_dataset = load_dataset(DATASET_NAME, split=DATASET_SPLIT, streaming=True)
+    print(
+        f"Loading chess fens policy dataset from HuggingFace: {DATASET_NAME}...")
+    hf_dataset = load_dataset(
+        DATASET_NAME, split=DATASET_SPLIT, streaming=True)
     # Add shuffling to prevent periodic oscillations from sorted shards
     hf_dataset = hf_dataset.shuffle(buffer_size=100_000, seed=42)
     train_dataset = ChessPolicyDatasetRuntimeTokenization(
@@ -428,8 +430,9 @@ def train() -> None:
         ignore_data_skip=True,  # Skip dataloader state restoration for streaming datasets
     )
     print(
-        f"Training config: {training_args.num_train_epochs} epochs, batch size {training_args.per_device_train_batch_size}, "
-        f"lr {training_args.learning_rate}")
+        f"Training config: {training_args.num_train_epochs} epochs, "
+        f"batch_size={training_args.per_device_train_batch_size}, "
+        f"lr={training_args.learning_rate}")
     print(
         "Effective schedule:",
         f"max_steps={training_args.max_steps}",

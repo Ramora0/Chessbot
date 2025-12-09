@@ -4,4 +4,5 @@ POLICY_LOSS_WEIGHT: float = 1
 WDL_LOSS_WEIGHT: float = 0
 # Loss weight for illegality prediction head
 ILLEGALITY_HEAD_LOSS_WEIGHT: float = 0
-MASKED_TOKEN_LOSS_WEIGHT: float = 0  # Loss weight for masked token prediction
+# Masked token prediction - helps model learn board state representation
+MASKED_TOKEN_LOSS_WEIGHT: float = 1.0

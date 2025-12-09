@@ -177,6 +177,39 @@ class ChessPolicyCollator:
         # Never mask: turn (64)
         self.maskable_positions = list(range(64)) + list(range(65, 70))
 
+    def _convert_3bin_to_128bin(self, wdl_3bin: torch.Tensor) -> torch.Tensor:
+        """Convert 3-bin WDL [W, D, L] to 128-bin value distribution.
+
+        Args:
+            wdl_3bin: [batch_size, 3] tensor with [win, draw, loss] probabilities
+
+        Returns:
+            [batch_size, 128] tensor with smooth distribution over win probability bins
+        """
+        device = wdl_3bin.device
+
+        # Compute expected win probability: W + 0.5*D
+        # (win counts as 1.0, draw as 0.5, loss as 0.0)
+        win_prob = wdl_3bin[:, 0] + 0.5 * wdl_3bin[:, 1]  # [batch_size]
+
+        # Create 128-bin smooth distribution centered on win_prob
+        bin_centers = torch.linspace(0, 1, 128, device=device)  # [128]
+
+        # Gaussian distribution with small std to create smooth target
+        sigma = 0.05  # Smoothing factor (5% std)
+
+        # Expand dimensions for broadcasting: [batch_size, 1] and [1, 128]
+        win_prob_expanded = win_prob.unsqueeze(1)  # [batch_size, 1]
+        bin_centers_expanded = bin_centers.unsqueeze(0)  # [1, 128]
+
+        # Compute Gaussian: exp(-0.5 * ((x - mean) / sigma)^2)
+        value_dist = torch.exp(-0.5 * ((bin_centers_expanded - win_prob_expanded) / sigma) ** 2)
+
+        # Normalize each row to sum to 1
+        value_dist = value_dist / value_dist.sum(dim=1, keepdim=True)  # [batch_size, 128]
+
+        return value_dist
+
     def __call__(self, batch: Iterable[Dict[str, object]]) -> Dict[str, torch.Tensor]:
         input_ids_list = []
         policy_list = []
@@ -226,6 +259,10 @@ class ChessPolicyCollator:
             raise ValueError(
                 f"wdl tensor expected width 3 or 128, received {wdl_width}"
             )
+
+        # Convert 3-bin WDL to 128-bin format if needed
+        if wdl_width == 3:
+            wdl_values = self._convert_3bin_to_128bin(wdl_values)
 
         # Apply masked token prediction if mask_token_id is provided
         original_input_ids = None
