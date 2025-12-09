@@ -13,10 +13,9 @@ from transformers import (
     TrainingArguments,
     TrainerCallback,
 )
-from datasets import load_from_disk
+from datasets import load_dataset
 
-from data import ChessPolicyCollator
-from action_value_dataset import ActionValueDataset
+from data import ChessPolicyCollator, ChessPolicyDatasetRuntimeTokenization
 from model import ChessPolicyValueModel
 from policy_index import policy_index
 from tokenizer import create_tokenizer
@@ -29,7 +28,8 @@ DROPOUT = 0.1
 # Set to 0 to disable thinking tokens (72 board tokens + thinking tokens)
 NUM_THINKING_TOKENS = 0
 MAX_SEQ_LENGTH = 256  # Must be >= 72 + NUM_THINKING_TOKENS
-PROCESSED_DATASET_DIR = "/fs/scratch/PAS2836/lees_stuff/action_value"
+DATASET_NAME = "Maxlegrec/ChessFENS"
+DATASET_SPLIT = "train"
 ELO_EVAL_STEPS = 4000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
@@ -310,71 +310,16 @@ def train() -> None:
     tokenizer = create_tokenizer()
     vocab_size = len(tokenizer.get_vocab())
     pad_token_id = tokenizer.token_to_id("[PAD]")
-    act_token_id = tokenizer.token_to_id("<ACT>")
     mask_token_id = tokenizer.token_to_id("[MASK]")
 
-    print(f"Loading action-value dataset from '{PROCESSED_DATASET_DIR}'...")
-    train_dataset = ActionValueDataset(
-        dataset_path=PROCESSED_DATASET_DIR,
+    print(f"Loading chess fens policy dataset from HuggingFace: {DATASET_NAME}...")
+    hf_dataset = load_dataset(DATASET_NAME, split=DATASET_SPLIT, streaming=True)
+    # Add shuffling to prevent periodic oscillations from sorted shards
+    hf_dataset = hf_dataset.shuffle(buffer_size=100_000, seed=42)
+    train_dataset = ChessPolicyDatasetRuntimeTokenization(
+        hf_dataset=hf_dataset,
         tokenizer=tokenizer,
-        streaming=True,
-        shuffle_buffer_size=100_000,
     )
-
-    # TEMPORARY: Load from Maxlegrec/ChessFENS HuggingFace dataset instead of local dataset
-    # print("Loading dataset from HuggingFace: Maxlegrec/ChessFENS...")
-    # hf_dataset = load_dataset("Maxlegrec/ChessFENS", split="train", streaming=True)
-
-    # # Simple wrapper that only uses FEN strings
-    # from torch.utils.data import IterableDataset
-    # import chess
-    # import numpy as np
-    # from tokenizer import process_fen
-
-    # class SimpleFENDataset(IterableDataset):
-    #     def __init__(self, hf_dataset, tokenizer):
-    #         self.dataset = hf_dataset
-    #         self.tokenizer = tokenizer
-    #         self.policy_size = len(policy_index)
-    #         self.move_to_idx = {move: idx for idx, move in enumerate(policy_index)}
-
-    #     def __iter__(self):
-    #         for example in self.dataset:
-    #             try:
-    #                 fen = example["fen"]
-
-    #                 # Tokenize FEN
-    #                 processed = process_fen(fen)
-    #                 encoding = self.tokenizer.encode(processed)
-    #                 input_ids = torch.tensor(encoding.ids, dtype=torch.long)
-
-    #                 # Get legal moves
-    #                 board = chess.Board(fen)
-    #                 legal_move_mask = np.zeros(self.policy_size, dtype=np.float32)
-    #                 policy = np.full(self.policy_size, -1.0, dtype=np.float32)
-
-    #                 for move in board.legal_moves:
-    #                     move_uci = move.uci()
-    #                     if move_uci in self.move_to_idx:
-    #                         idx = self.move_to_idx[move_uci]
-    #                         legal_move_mask[idx] = 1.0
-    #                         policy[idx] = 0.0  # All legal moves have value 0
-
-    #                 # Dummy WDL (uniform distribution)
-    #                 wdl = np.ones(128, dtype=np.float32) / 128
-
-    #                 yield {
-    #                     "input_ids": input_ids,
-    #                     "policy": torch.tensor(policy, dtype=torch.float32),
-    #                     "wdl": torch.tensor(wdl, dtype=torch.float32),
-    #                     "true_value": torch.tensor(0.5, dtype=torch.float32),
-    #                     "legal_move_mask": torch.tensor(legal_move_mask, dtype=torch.float32),
-    #                 }
-    #             except Exception as e:
-    #                 print(f"Warning: Skipping example due to error: {e}")
-    #                 continue
-
-    # train_dataset = SimpleFENDataset(hf_dataset, tokenizer)
 
     per_device_batch_size = 1024
     schedule = build_training_schedule(per_device_batch_size)

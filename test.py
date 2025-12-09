@@ -5,12 +5,17 @@ Test script to inspect what the RAW dataset contains.
 from pathlib import Path
 from datasets import load_from_disk
 import chess
+import numpy as np
+from policy_index import policy_index
 
 # Match train.py settings
-PROCESSED_DATASET_DIR = "/fs/scratch/PAS2836/lees_stuff/action_value"
+PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens_consolidated"
 
 print(f"Loading RAW dataset from '{PROCESSED_DATASET_DIR}'...")
 raw_dataset = load_from_disk(PROCESSED_DATASET_DIR).to_iterable_dataset()
+
+# Create move index lookup
+move_to_idx = {move: idx for idx, move in enumerate(policy_index)}
 
 print("\n" + "="*80)
 print("First 10 RAW examples from dataset (as stored on disk):")
@@ -35,46 +40,67 @@ for i, example in enumerate(raw_dataset):
     board = chess.Board(fen)
     chess_legal_moves = set(move.uci() for move in board.legal_moves)
 
-    # Print RAW moves and p_win values
-    moves = example["moves"]
-    p_wins = example["p_win"]
-    dataset_moves = set(moves)
+    # Print policy and WDL information
+    policy = np.array(example["policy"])
+    wdl = np.array(example["wdl"])
 
-    print(f"\nNumber of moves in dataset: {len(moves)}")
-    print(f"Number of p_win values: {len(p_wins)}")
+    print(f"\nPolicy shape: {policy.shape}")
+    print(f"WDL shape: {wdl.shape}")
     print(f"Number of legal moves from chess library: {len(chess_legal_moves)}")
 
-    # Compare dataset moves with chess library legal moves
-    moves_match = dataset_moves == chess_legal_moves
-    if moves_match:
-        print("✓ Dataset moves MATCH chess library legal moves")
+    # Extract moves with policy values > 0
+    move_policies = []
+    for move_idx, policy_val in enumerate(policy):
+        if policy_val > 0:
+            move_uci = policy_index[move_idx]
+            move_policies.append((move_uci, policy_val))
+
+    print(f"Number of moves with positive policy values: {len(move_policies)}")
+
+    # Sort by policy value (best to worst)
+    move_policies.sort(key=lambda x: x[1], reverse=True)
+
+    # Check if policy moves match legal moves
+    policy_moves = set(move for move, _ in move_policies)
+    if policy_moves == chess_legal_moves:
+        print("✓ Policy moves MATCH chess library legal moves")
     else:
-        print("✗ MISMATCH between dataset and chess library!")
-        in_dataset_not_legal = dataset_moves - chess_legal_moves
-        in_legal_not_dataset = chess_legal_moves - dataset_moves
-        if in_dataset_not_legal:
-            print(f"  Moves in dataset but NOT legal: {in_dataset_not_legal}")
-        if in_legal_not_dataset:
-            print(f"  Legal moves NOT in dataset: {in_legal_not_dataset}")
+        print("✗ MISMATCH between policy and chess library!")
+        in_policy_not_legal = policy_moves - chess_legal_moves
+        in_legal_not_policy = chess_legal_moves - policy_moves
+        if in_policy_not_legal:
+            print(f"  Moves in policy but NOT legal: {in_policy_not_legal}")
+        if in_legal_not_policy:
+            print(f"  Legal moves NOT in policy: {in_legal_not_policy}")
 
-    # Print all moves with their raw p_win values
-    print("\nRAW MOVES AND WIN PROBABILITIES:")
-    move_data = list(zip(moves, p_wins))
-    # Sort by p_win (best to worst)
-    move_data.sort(key=lambda x: x[1], reverse=True)
+    # Print moves with policy values
+    print("\nMOVES AND POLICY VALUES:")
+    for move_uci, policy_val in move_policies[:10]:  # Show top 10
+        print(f"  {move_uci:6s}: policy = {policy_val:.6f}")
+    if len(move_policies) > 10:
+        print(f"  ... and {len(move_policies) - 10} more moves")
 
-    for move_uci, p_win in move_data:
-        print(f"  {move_uci:6s}: p_win = {p_win:.6f}")
+    # Print WDL information
+    if len(wdl) == 3:
+        print(f"\nWDL (Win/Draw/Loss): W={wdl[0]:.4f}, D={wdl[1]:.4f}, L={wdl[2]:.4f}")
+    elif len(wdl) == 128:
+        # 128 bins representing win probability distribution
+        print(f"\nWDL: 128-bin value distribution (sum={wdl.sum():.4f})")
+        # Find peak bin
+        peak_bin = np.argmax(wdl)
+        peak_value = peak_bin / 127.0  # Convert bin to win probability
+        print(f"  Peak bin: {peak_bin} (win% ≈ {peak_value:.3f})")
 
     # For first example, show even more detail
     if i == 0:
         print("\n" + "="*80)
         print("FIRST EXAMPLE - EXTRA DETAIL")
         print("="*80)
-        print(f"Best move: {move_data[0][0]} with p_win = {move_data[0][1]:.6f}")
-        print(f"Worst move: {move_data[-1][0]} with p_win = {move_data[-1][1]:.6f}")
-        print(f"Win probability range: {move_data[-1][1]:.6f} to {move_data[0][1]:.6f}")
-        print(f"Difference: {move_data[0][1] - move_data[-1][1]:.6f}")
+        if move_policies:
+            print(f"Best move: {move_policies[0][0]} with policy = {move_policies[0][1]:.6f}")
+            print(f"Worst move: {move_policies[-1][0]} with policy = {move_policies[-1][1]:.6f}")
+            print(f"Policy range: {move_policies[-1][1]:.6f} to {move_policies[0][1]:.6f}")
+            print(f"Sum of all policy values: {sum(p for _, p in move_policies):.6f}")
         print("="*80)
 
 print("\n" + "="*80)

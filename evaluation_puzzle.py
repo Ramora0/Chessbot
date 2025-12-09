@@ -26,7 +26,6 @@ from tokenizer import process_fen
 class RuntimeTokenizationCollate:
     def __init__(self, tokenizer=None):
         self.tokenizer = tokenizer
-        self.act_token_id = tokenizer.token_to_id("<ACT>") if tokenizer else None
 
     def __call__(self, batch: Iterable[dict]) -> Dict[str, object]:
         batch_list = list(batch)
