@@ -301,25 +301,20 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 policy_mask_bool = (policy > -0.99).to(dtype=torch.bool)
                 policy = torch.where(policy_mask_bool, torch.zeros_like(policy), torch.full_like(policy, -1.0))
 
-            # Expected quality loss: maximize expected value of chosen moves
-            model_probs = F.softmax(policy_logits, dim=-1)
-            expected_quality = (model_probs * policy).sum(dim=-1)
-            raw_policy_loss = -expected_quality.mean()
-            policy_loss = self.policy_loss_weight * raw_policy_loss
+            # Cross-entropy loss against Stockfish policy distribution
+            # Mask illegal moves with large negative value
+            masked_policy_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
 
-            # CROSS-ENTROPY LOSS (COMMENTED OUT):
-            # # Mask illegal moves
-            # masked_policy_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
-            #
-            # # Create uniform target distribution over legal moves
-            # # policy_mask_bool has True for legal moves
-            # num_legal_moves = policy_mask_bool.float().sum(dim=-1, keepdim=True)  # [batch, 1]
-            # target_probs = policy_mask_bool.float() / num_legal_moves.clamp(min=1)  # Uniform over legal
-            #
-            # # Cross-entropy: -sum(target * log(pred))
-            # model_log_probs = F.log_softmax(masked_policy_logits, dim=-1)
-            # raw_policy_loss = -(target_probs * model_log_probs).sum(dim=-1).mean()
-            # policy_loss = self.policy_loss_weight * raw_policy_loss
+            # Use Stockfish policy as target distribution
+            # Policy values are logits/scores - convert to probabilities
+            target_logits = policy.clone()
+            target_logits[~policy_mask_bool] = -1e9  # Mask illegal moves
+            target_probs = F.softmax(target_logits, dim=-1)
+
+            # Cross-entropy: -sum(target * log(pred))
+            model_log_probs = F.log_softmax(masked_policy_logits, dim=-1)
+            raw_policy_loss = -(target_probs * model_log_probs).sum(dim=-1).mean()
+            policy_loss = self.policy_loss_weight * raw_policy_loss
 
         wdl_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None

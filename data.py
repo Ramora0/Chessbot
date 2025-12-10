@@ -164,18 +164,18 @@ class ChessPolicyDatasetRuntimeTokenization(IterableDataset):
 class ChessPolicyCollator:
     """Collator that batches tensor creation for already-tokenized data.
 
-    Optionally applies masked token prediction by randomly masking 15% of tokens
+    Optionally applies masked token prediction by randomly masking 5% of tokens
     in 50% of examples.
     """
 
-    def __init__(self, mask_token_id: int | None = None, mask_prob: float = 0.15) -> None:
+    def __init__(self, mask_token_id: int | None = None, mask_prob: float = 0.05) -> None:
         self.policy_size = len(policy_index)
         self.mask_token_id = mask_token_id
         self.mask_prob = mask_prob
 
-        # Maskable positions: board (0-63), castling (65-68), en passant (69)
-        # Never mask: turn (64)
-        self.maskable_positions = list(range(64)) + list(range(65, 70))
+        # Maskable positions: board (0-63), castling (65-68)
+        # Never mask: turn (64), en passant (69) - both are time-dependent
+        self.maskable_positions = list(range(64)) + list(range(65, 69))
 
     def _convert_3bin_to_128bin(self, wdl_3bin: torch.Tensor) -> torch.Tensor:
         """Convert 3-bin WDL [W, D, L] to 128-bin value distribution.
