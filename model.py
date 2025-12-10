@@ -302,8 +302,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 policy = torch.where(policy_mask_bool, torch.zeros_like(policy), torch.full_like(policy, -1.0))
 
             # Cross-entropy loss against Stockfish policy distribution
-            # Mask illegal moves with large negative value
-            masked_policy_logits = policy_logits.masked_fill(~policy_mask_bool, -1e9)
+            masked_policy_logits = policy_logits
 
             # Use Stockfish policy as target distribution
             # Policy values are logits/scores - convert to probabilities
@@ -437,18 +436,14 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
             # Top-1 agreement: how often model's top move matches Stockfish's
             # Use masked logits for fair comparison (only legal moves)
-            masked_logits_for_top1 = policy_logits.masked_fill(
-                ~policy_mask_bool, -1e9)
-            model_top_move = masked_logits_for_top1.argmax(dim=-1)
+            model_top_move = policy_logits.argmax(dim=-1)
             stockfish_top_move = policy.argmax(dim=-1)
             top1_agreement = (model_top_move ==
                               stockfish_top_move).float().mean()
 
             # Model entropy: measure of model's confidence/diversity
-            masked_logits_for_entropy = policy_logits.masked_fill(
-                ~policy_mask_bool, -1e9)
             model_probs_for_entropy = F.softmax(
-                masked_logits_for_entropy, dim=-1)
+                policy_logits, dim=-1)
             model_entropy = -(model_probs_for_entropy *
                               torch.log(model_probs_for_entropy + 1e-9)).sum(dim=-1).mean()
 

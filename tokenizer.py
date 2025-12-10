@@ -44,7 +44,7 @@ def process_fen(fen: str) -> str:
         row_tokens = []
         for c in row:
             if c.isdigit():
-                row_tokens.extend(['e-p'] * int(c))
+                row_tokens.extend(_DIGIT_TOKENS[c])
             else:
                 row_tokens.append(f'{c}-p')
         spaced_line = ' '.join(row_tokens)
