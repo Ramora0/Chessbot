@@ -279,9 +279,11 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         # Multi-task attention pooling (single forward pass)
         task_outputs = self.task_head(hidden_states)
-        policy_logits = task_outputs['policy']  # Used for both softmax policy loss and sigmoid win% loss
+        # Used for both softmax policy loss and sigmoid win% loss
+        policy_logits = task_outputs['policy']
         wdl_logits = task_outputs['wdl']
-        illegality_logits = task_outputs['illegality']  # Separate head for legality prediction
+        # Separate head for legality prediction
+        illegality_logits = task_outputs['illegality']
 
         target_device = policy_logits.device
 
@@ -292,7 +294,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         move_winrate_loss: Optional[torch.Tensor] = None
         move_winrate_mae: Optional[torch.Tensor] = None
         policy_mask_bool: Optional[torch.Tensor] = None
-        
+
         if policy is not None:
             if policy.device != target_device:
                 policy = policy.to(target_device)
@@ -322,22 +324,24 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # Loss 2: Sigmoid-based win% prediction (only on legal moves)
             # This encourages the model to rank ALL moves correctly, not just pick the best one
             # Recover original win% values from normalized policy
-            max_p_win = -policy[policy_mask_bool].min()  # Best move has value 0
+            # Best move has value 0
+            max_p_win = -policy[policy_mask_bool].min()
             true_winrates = policy.clone()
             true_winrates[policy_mask_bool] = policy[policy_mask_bool] + max_p_win
-            
+
             # Compute BCE loss only on legal moves using logits (safe for autocast)
             legal_true_winrates = true_winrates[policy_mask_bool]
             legal_policy_logits = policy_logits[policy_mask_bool]
-            
+
             raw_move_winrate_loss = F.binary_cross_entropy_with_logits(
                 legal_policy_logits, legal_true_winrates, reduction='mean'
             )
             move_winrate_loss = self.move_winrate_loss_weight * raw_move_winrate_loss
-            
+
             # MAE metric for win% predictions (apply sigmoid for metric only)
             legal_pred_winrates = torch.sigmoid(legal_policy_logits)
-            move_winrate_mae = torch.abs(legal_pred_winrates - legal_true_winrates).mean()
+            move_winrate_mae = torch.abs(
+                legal_pred_winrates - legal_true_winrates).mean()
 
         wdl_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None
@@ -370,8 +374,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
             # MAE metric (same as before)
             value_mae = torch.abs(predicted_value - target_value).mean()
-
-
 
         # Masked token prediction loss (language modeling objective)
         masked_token_loss: Optional[torch.Tensor] = None
@@ -488,7 +490,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         return ChessPolicyValueOutput(
             loss=loss,
-            policy_logits=policy_logits,  # Used for both softmax policy loss and sigmoid win% loss
+            # Used for both softmax policy loss and sigmoid win% loss
+            policy_logits=policy_logits,
             wdl_logits=wdl_logits,
             illegality_logits=illegality_logits,  # SEPARATE head for legality prediction
             move_winrate_logits=policy_logits,  # Alias - sigmoid of policy_logits used for win%
