@@ -177,6 +177,12 @@ class ChessPolicyCollator:
         # Never mask: turn (64), en passant (69) - both are time-dependent
         self.maskable_positions = list(range(64)) + list(range(65, 69))
 
+        # TESTING: Track seen FENs across all workers to detect duplicates
+        self.seen_fens = {}  # fen -> count
+        self.total_batches = 0
+        self.total_examples = 0
+        self.duplicate_count = 0
+
     def _convert_3bin_to_128bin(self, wdl_3bin: torch.Tensor) -> torch.Tensor:
         """Convert 3-bin WDL [W, D, L] to 128-bin value distribution.
 
@@ -203,10 +209,12 @@ class ChessPolicyCollator:
         bin_centers_expanded = bin_centers.unsqueeze(0)  # [1, 128]
 
         # Compute Gaussian: exp(-0.5 * ((x - mean) / sigma)^2)
-        value_dist = torch.exp(-0.5 * ((bin_centers_expanded - win_prob_expanded) / sigma) ** 2)
+        value_dist = torch.exp(-0.5 * ((bin_centers_expanded -
+                               win_prob_expanded) / sigma) ** 2)
 
         # Normalize each row to sum to 1
-        value_dist = value_dist / value_dist.sum(dim=1, keepdim=True)  # [batch_size, 128]
+        value_dist = value_dist / \
+            value_dist.sum(dim=1, keepdim=True)  # [batch_size, 128]
 
         return value_dist
 
@@ -215,12 +223,37 @@ class ChessPolicyCollator:
         policy_list = []
         wdl_list = []
         legal_move_mask_list = []
+
+        # TESTING: Track duplicates across all workers
+        self.total_batches += 1
+        batch_fens = []
+
         for item in batch:
             input_ids_list.append(item["input_ids"])
             policy_list.append(item["policy"])
             wdl_list.append(item["wdl"])
             if "legal_move_mask" in item:
                 legal_move_mask_list.append(item["legal_move_mask"])
+
+            # Track FEN if present (persists across entire training run)
+            if "fen" in item:
+                fen = item["fen"]
+                batch_fens.append(fen)
+                self.total_examples += 1
+                if fen in self.seen_fens:
+                    self.seen_fens[fen] += 1
+                    self.duplicate_count += 1
+                    # Print every duplicate to see the pattern
+                    print(
+                        f"\n⚠️  DUPLICATE FEN #{self.duplicate_count} [ENTIRE TRAINING RUN]")
+                    print(
+                        f"   Batch: {self.total_batches} | Example: {self.total_examples}")
+                    print(f"   FEN: {fen}")
+                    print(f"   Times seen: {self.seen_fens[fen]}")
+                    print(
+                        f"   Duplicate rate: {self.duplicate_count}/{self.total_examples} ({100*self.duplicate_count/self.total_examples:.2f}%)\n")
+                else:
+                    self.seen_fens[fen] = 1
 
         if not input_ids_list:
             raise ValueError("Empty batch provided to ChessPolicyCollator")
@@ -274,7 +307,8 @@ class ChessPolicyCollator:
 
             # Initialize masked_positions (all False initially)
             batch_size, seq_len = input_ids.shape
-            masked_positions = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+            masked_positions = torch.zeros(
+                batch_size, seq_len, dtype=torch.bool)
 
             # For each example, randomly decide whether to apply masking (50% chance)
             for i in range(batch_size):
@@ -285,7 +319,8 @@ class ChessPolicyCollator:
                     num_to_mask = max(1, int(num_maskable * self.mask_prob))
 
                     # Randomly select positions to mask
-                    maskable_indices = torch.tensor(self.maskable_positions, dtype=torch.long)
+                    maskable_indices = torch.tensor(
+                        self.maskable_positions, dtype=torch.long)
                     perm = torch.randperm(num_maskable)[:num_to_mask]
                     positions_to_mask = maskable_indices[perm]
 

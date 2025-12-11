@@ -70,10 +70,13 @@ class ActionValueDataset(IterableDataset):
 
         # Load the dataset
         if streaming:
-            self.dataset = load_from_disk(str(self.dataset_path)).to_iterable_dataset()
+            self.dataset = load_from_disk(
+                str(self.dataset_path)).to_iterable_dataset(num_shards=8)
+            print(f"Shardses: {self.dataset.num_shards}")
+
             # Add shuffling to prevent periodic oscillations from sorted shards
-            if shuffle_buffer_size > 0:
-                self.dataset = self.dataset.shuffle(buffer_size=shuffle_buffer_size, seed=42)
+            # if shuffle_buffer_size > 0:
+            #     self.dataset = self.dataset.shuffle(buffer_size=shuffle_buffer_size, seed=42)
         else:
             self.dataset = load_from_disk(str(self.dataset_path))
 
@@ -81,10 +84,6 @@ class ActionValueDataset(IterableDataset):
 
         # Create move to index mapping for fast lookup
         self.move_to_idx = {move: idx for idx, move in enumerate(policy_index)}
-
-        # TESTING: Track seen FENs to detect duplicates
-        self.seen_fens = {}  # fen -> count
-        self.total_examples = 0
 
     @property
     def is_streaming(self) -> bool:
@@ -96,15 +95,10 @@ class ActionValueDataset(IterableDataset):
         return len(self.dataset)
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        if self.streaming:
-            worker_info = get_worker_info()
-            if worker_info is not None:
-                shard = self.dataset.shard(worker_info.num_workers, worker_info.id)
-                iterator: Iterable[Dict[str, object]] = iter(shard)
-            else:
-                iterator = iter(self.dataset)
-        else:
-            iterator = iter(self.dataset)
+        # HuggingFace IterableDataset handles worker sharding automatically
+        # when created with to_iterable_dataset(num_shards=N)
+        # DO NOT manually shard here - it causes "too many workers" errors
+        iterator: Iterable[Dict[str, object]] = iter(self.dataset)
 
         for example in iterator:
             try:
@@ -127,15 +121,6 @@ class ActionValueDataset(IterableDataset):
         """
         # 1. Tokenize FEN at runtime
         fen = example["fen"]
-
-        # TESTING: Track duplicate FENs
-        self.total_examples += 1
-        if fen in self.seen_fens:
-            self.seen_fens[fen] += 1
-            print(f"WARNING: Duplicate FEN detected! '{fen}' seen {self.seen_fens[fen]} times (total examples processed: {self.total_examples})")
-        else:
-            self.seen_fens[fen] = 1
-
         processed = process_fen(fen)
         encoding = self.tokenizer.encode(processed)
         input_ids = torch.tensor(encoding.ids, dtype=torch.long)
@@ -192,7 +177,7 @@ class ActionValueDataset(IterableDataset):
             print(f"  All skipped (not in policy_index): {skipped_moves}")
 
         # Normalize so the best move has value 0.0 (subtract max from all legal moves)
-        # This makes loss directly correspond to "lost win %" when the bot moves
+        # This makes loss directly correspond to "win% lost" vs optimal play
         # Illegal moves stay at -1
         if valid_moves:
             max_p_win = max(policy[idx] for idx in valid_moves)

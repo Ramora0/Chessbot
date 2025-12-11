@@ -15,6 +15,7 @@ from loss_weights import (
     WDL_LOSS_WEIGHT,
     ILLEGALITY_HEAD_LOSS_WEIGHT,
     MASKED_TOKEN_LOSS_WEIGHT,
+    MOVE_WINRATE_LOSS_WEIGHT,
 )
 
 
@@ -91,6 +92,7 @@ DEFAULT_POLICY_LOSS_WEIGHT = POLICY_LOSS_WEIGHT
 DEFAULT_WDL_LOSS_WEIGHT = WDL_LOSS_WEIGHT
 DEFAULT_ILLEGALITY_HEAD_LOSS_WEIGHT = ILLEGALITY_HEAD_LOSS_WEIGHT
 DEFAULT_MASKED_TOKEN_LOSS_WEIGHT = MASKED_TOKEN_LOSS_WEIGHT
+DEFAULT_MOVE_WINRATE_LOSS_WEIGHT = MOVE_WINRATE_LOSS_WEIGHT
 
 
 @dataclass
@@ -99,17 +101,19 @@ class ChessPolicyValueOutput(ModelOutput):
     policy_logits: torch.Tensor = None
     wdl_logits: torch.Tensor = None
     illegality_logits: torch.Tensor = None
+    move_winrate_logits: torch.Tensor = None
     policy_loss: Optional[torch.Tensor] = None
     wdl_loss: Optional[torch.Tensor] = None
     illegality_head_loss: Optional[torch.Tensor] = None
     masked_token_loss: Optional[torch.Tensor] = None
+    move_winrate_loss: Optional[torch.Tensor] = None
     # Metrics (not losses)
     illegality_rate: Optional[torch.Tensor] = None
     illegality_head_accuracy: Optional[torch.Tensor] = None
     masked_token_accuracy: Optional[torch.Tensor] = None
-    top1_agreement: Optional[torch.Tensor] = None
-    model_entropy: Optional[torch.Tensor] = None
+    best_move_prob: Optional[torch.Tensor] = None
     value_mae: Optional[torch.Tensor] = None
+    move_winrate_mae: Optional[torch.Tensor] = None
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
 
@@ -141,9 +145,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.task_head = MultiTaskAttentionPooling(
             hidden_size=hidden_size,
             task_output_dims={
-                'policy': self.policy_dim,
+                'policy': self.policy_dim,  # Used for both softmax policy loss and sigmoid win% loss
                 'wdl': self.num_value_bins,  # 128 bins for win probability
-                'illegality': self.policy_dim,  # Predict legality for each move
+                'illegality': self.policy_dim,  # Separate head: predict legality for each move
             }
         )
 
@@ -155,6 +159,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.illegality_head_loss_weight = float(
             DEFAULT_ILLEGALITY_HEAD_LOSS_WEIGHT)
         self.masked_token_loss_weight = float(DEFAULT_MASKED_TOKEN_LOSS_WEIGHT)
+        self.move_winrate_loss_weight = float(DEFAULT_MOVE_WINRATE_LOSS_WEIGHT)
         self.post_init()
 
     # type: ignore[override]
@@ -274,46 +279,65 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         # Multi-task attention pooling (single forward pass)
         task_outputs = self.task_head(hidden_states)
-        policy_logits = task_outputs['policy']
+        policy_logits = task_outputs['policy']  # Used for both softmax policy loss and sigmoid win% loss
         wdl_logits = task_outputs['wdl']
-        illegality_logits = task_outputs['illegality']
+        illegality_logits = task_outputs['illegality']  # Separate head for legality prediction
 
         target_device = policy_logits.device
 
+        # Policy head has TWO losses on the SAME logits:
+        # Loss 1: Softmax-based expected regret (original policy loss)
+        # Loss 2: Sigmoid-based win% prediction (encourages correct ranking of all moves)
         policy_loss: Optional[torch.Tensor] = None
+        move_winrate_loss: Optional[torch.Tensor] = None
+        move_winrate_mae: Optional[torch.Tensor] = None
         policy_mask_bool: Optional[torch.Tensor] = None
+        
         if policy is not None:
             if policy.device != target_device:
                 policy = policy.to(target_device)
 
-            # TEST MODE: Use actual legal move mask from chess board
-            # All legal moves = 0, all illegal moves = -1
-            if legal_move_mask is not None:
-                # Move to same device as policy
-                if legal_move_mask.device != target_device:
-                    legal_move_mask = legal_move_mask.to(target_device)
-                # legal_move_mask: 1.0 for legal, 0.0 for illegal
-                policy_mask_bool = (legal_move_mask > 0.5).to(dtype=torch.bool)
-                # Set all legal moves to 0, illegal to -1
-                policy = torch.where(policy_mask_bool, torch.zeros_like(policy), torch.full_like(policy, -1.0))
-            else:
-                # Fallback: infer from dataset policy values
-                policy_mask_bool = (policy > -0.99).to(dtype=torch.bool)
-                policy = torch.where(policy_mask_bool, torch.zeros_like(policy), torch.full_like(policy, -1.0))
+            # policy contains normalized win%: best move = 0, others negative, illegal = -1
+            # Identify legal moves (> -0.99 to distinguish from -1 illegal marker)
+            policy_mask_bool = (policy > -0.99).to(dtype=torch.bool)
 
-            # Cross-entropy loss against Stockfish policy distribution
-            masked_policy_logits = policy_logits
+            # Loss 1: Original policy loss (softmax-based expected regret)
+            # Illegal moves get large negative value (treated as very bad)
+            win_values = torch.where(
+                policy_mask_bool, policy, torch.full_like(policy, -1.0))
 
-            # Use Stockfish policy as target distribution
-            # Policy values are logits/scores - convert to probabilities
-            target_logits = policy.clone()
-            target_logits[~policy_mask_bool] = -1e9  # Mask illegal moves
-            target_probs = F.softmax(target_logits, dim=-1)
+            # Compute model's move probabilities (softmax over all moves)
+            # Mask illegal moves with large negative logits before softmax
+            masked_logits = policy_logits.clone()
+            masked_logits[~policy_mask_bool] = -1e9
+            model_probs = F.softmax(masked_logits, dim=-1)
 
-            # Cross-entropy: -sum(target * log(pred))
-            model_log_probs = F.log_softmax(masked_policy_logits, dim=-1)
-            raw_policy_loss = -(target_probs * model_log_probs).sum(dim=-1).mean()
+            # Expected win% lost = sum(model_prob * win_value) for each position
+            # win_value is 0 for best move, negative for others
+            # Loss = -expected_value = expected regret (positive when not picking best move)
+            expected_win_value = (model_probs * win_values).sum(dim=-1)
+            raw_policy_loss = -expected_win_value.mean()
             policy_loss = self.policy_loss_weight * raw_policy_loss
+
+            # Loss 2: Sigmoid-based win% prediction (only on legal moves)
+            # This encourages the model to rank ALL moves correctly, not just pick the best one
+            # Recover original win% values from normalized policy
+            max_p_win = -policy[policy_mask_bool].min()  # Best move has value 0
+            true_winrates = policy.clone()
+            true_winrates[policy_mask_bool] = policy[policy_mask_bool] + max_p_win
+            
+            # Compute BCE loss only on legal moves using logits (safe for autocast)
+            legal_true_winrates = true_winrates[policy_mask_bool]
+            legal_policy_logits = policy_logits[policy_mask_bool]
+            
+            raw_move_winrate_loss = F.binary_cross_entropy_with_logits(
+                legal_policy_logits, legal_true_winrates, reduction='mean'
+            )
+            move_winrate_loss = self.move_winrate_loss_weight * raw_move_winrate_loss
+            
+            # MAE metric for win% predictions (apply sigmoid for metric only)
+            legal_pred_winrates = torch.sigmoid(legal_policy_logits)
+            move_winrate_mae = torch.abs(legal_pred_winrates - legal_true_winrates).mean()
 
         wdl_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None
@@ -324,7 +348,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 wdl = wdl.to(target_device)
 
             # Compute predicted win% as weighted average over bins
-            bin_centers = torch.linspace(0, 1, self.num_value_bins, device=target_device)
+            bin_centers = torch.linspace(
+                0, 1, self.num_value_bins, device=target_device)
             wdl_probs = F.softmax(wdl_logits, dim=-1)
             predicted_value = (wdl_probs * bin_centers).sum(dim=-1)
 
@@ -339,29 +364,14 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
             # Huber loss: smooth L1 that's quadratic for small errors, linear for large
             # This is smooth AND cares about distance between bins
-            raw_wdl_loss = F.huber_loss(predicted_value, target_value, delta=0.1)
+            raw_wdl_loss = F.huber_loss(
+                predicted_value, target_value, delta=0.1)
             wdl_loss = self.wdl_loss_weight * raw_wdl_loss
 
             # MAE metric (same as before)
             value_mae = torch.abs(predicted_value - target_value).mean()
 
-        # NEW: Illegality head loss (binary cross-entropy for legality prediction)
-        illegality_head_loss: Optional[torch.Tensor] = None
-        illegality_head_accuracy: Optional[torch.Tensor] = None
-        if policy is not None and policy_mask_bool is not None:
-            # Target: 1 for legal moves, 0 for illegal moves
-            illegality_target = policy_mask_bool.float()
 
-            # Compute BCE loss with logits
-            raw_illegality_head_loss = F.binary_cross_entropy_with_logits(
-                illegality_logits, illegality_target, reduction='mean'
-            )
-            illegality_head_loss = self.illegality_head_loss_weight * raw_illegality_head_loss
-
-            # Compute % of legal moves marked as legal (recall for legal class)
-            illegality_preds = (torch.sigmoid(illegality_logits) > 0.5).float()
-            legal_mask = (illegality_target == 1)
-            illegality_head_accuracy = illegality_preds[legal_mask].mean()
 
         # Masked token prediction loss (language modeling objective)
         masked_token_loss: Optional[torch.Tensor] = None
@@ -422,34 +432,44 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                         masked_token_accuracy = (
                             masked_preds == masked_labels).float().mean()
 
+        # Illegality head loss (SEPARATE head - binary cross-entropy for legality prediction)
+        illegality_head_loss: Optional[torch.Tensor] = None
+        illegality_head_accuracy: Optional[torch.Tensor] = None
+        if policy is not None and policy_mask_bool is not None:
+            # Target: 1 for legal moves, 0 for illegal moves
+            illegality_target = policy_mask_bool.float()
+
+            # Compute BCE loss with logits on SEPARATE illegality head
+            raw_illegality_head_loss = F.binary_cross_entropy_with_logits(
+                illegality_logits, illegality_target, reduction='mean'
+            )
+            illegality_head_loss = self.illegality_head_loss_weight * raw_illegality_head_loss
+
+            # Compute % of legal moves marked as legal (recall for legal class)
+            illegality_preds = (torch.sigmoid(illegality_logits) > 0.5).float()
+            legal_mask = (illegality_target == 1)
+            if legal_mask.any():
+                illegality_head_accuracy = illegality_preds[legal_mask].mean()
+
         # Compute metrics for reporting (not used in loss)
         illegality_rate: Optional[torch.Tensor] = None
-        top1_agreement: Optional[torch.Tensor] = None
-        model_entropy: Optional[torch.Tensor] = None
+        best_move_prob: Optional[torch.Tensor] = None
 
         if policy is not None and policy_mask_bool is not None:
-            # Illegality rate: fraction of probability mass on illegal moves (from policy head)
+            # Illegality rate: fraction of probability mass on illegal moves (from policy head softmax)
             illegal_mask = (~policy_mask_bool).to(dtype=policy_logits.dtype)
             illegal_probs = F.softmax(policy_logits, dim=-1)
             summed_illegal_prob = (illegal_probs * illegal_mask).sum(dim=-1)
             illegality_rate = summed_illegal_prob.mean()
 
-            # Top-1 agreement: how often model's top move matches Stockfish's
-            # Use masked logits for fair comparison (only legal moves)
-            model_top_move = policy_logits.argmax(dim=-1)
-            stockfish_top_move = policy.argmax(dim=-1)
-            top1_agreement = (model_top_move ==
-                              stockfish_top_move).float().mean()
-
-            # Model entropy: measure of model's confidence/diversity
-            model_probs_for_entropy = F.softmax(
-                policy_logits, dim=-1)
-            model_entropy = -(model_probs_for_entropy *
-                              torch.log(model_probs_for_entropy + 1e-9)).sum(dim=-1).mean()
+            # Best move probability: average probability assigned to Stockfish's best move
+            stockfish_best_move_idx = policy.argmax(dim=-1)
+            best_move_prob = model_probs.gather(
+                1, stockfish_best_move_idx.unsqueeze(1)).squeeze(1).mean()
 
         loss_components = [
             component
-            for component in (policy_loss, wdl_loss, illegality_head_loss, masked_token_loss)
+            for component in (policy_loss, move_winrate_loss, wdl_loss, illegality_head_loss, masked_token_loss)
             if component is not None
         ]
         loss: Optional[torch.Tensor] = None
@@ -468,19 +488,21 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         return ChessPolicyValueOutput(
             loss=loss,
-            policy_logits=policy_logits,
+            policy_logits=policy_logits,  # Used for both softmax policy loss and sigmoid win% loss
             wdl_logits=wdl_logits,
-            illegality_logits=illegality_logits,
-            policy_loss=policy_loss,
+            illegality_logits=illegality_logits,  # SEPARATE head for legality prediction
+            move_winrate_logits=policy_logits,  # Alias - sigmoid of policy_logits used for win%
+            policy_loss=policy_loss,  # Original softmax-based expected regret loss
             wdl_loss=wdl_loss,
             illegality_head_loss=illegality_head_loss,
             masked_token_loss=masked_token_loss,
+            move_winrate_loss=move_winrate_loss,  # New sigmoid-based win% prediction loss
             illegality_rate=illegality_rate,
             illegality_head_accuracy=illegality_head_accuracy,
             masked_token_accuracy=masked_token_accuracy,
-            top1_agreement=top1_agreement,
-            model_entropy=model_entropy,
+            best_move_prob=best_move_prob,
             value_mae=value_mae,
+            move_winrate_mae=move_winrate_mae,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )

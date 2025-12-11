@@ -13,9 +13,9 @@ from transformers import (
     TrainingArguments,
     TrainerCallback,
 )
-from datasets import load_dataset
 
-from data import ChessPolicyCollator, ChessPolicyDatasetRuntimeTokenization
+from data import ChessPolicyCollator
+from action_value_dataset import ActionValueDataset
 from model import ChessPolicyValueModel
 from policy_index import policy_index
 from tokenizer import create_tokenizer
@@ -28,8 +28,8 @@ DROPOUT = 0.1
 # Set to 0 to disable thinking tokens (72 board tokens + thinking tokens)
 NUM_THINKING_TOKENS = 0
 MAX_SEQ_LENGTH = 256  # Must be >= 72 + NUM_THINKING_TOKENS
-DATASET_NAME = "Maxlegrec/ChessFENS"
-DATASET_SPLIT = "train"
+DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value_sharded"
+SHUFFLE_BUFFER_SIZE = 100_000
 ELO_EVAL_STEPS = 4000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
@@ -90,12 +90,13 @@ class TrackingTrainer(Trainer):
         self._last_total_loss: Optional[float] = None
         self._last_illegality_head_loss: Optional[float] = None
         self._last_masked_token_loss: Optional[float] = None
+        self._last_move_winrate_loss: Optional[float] = None
         self._last_illegality_rate: Optional[float] = None
         self._last_illegality_head_accuracy: Optional[float] = None
         self._last_masked_token_accuracy: Optional[float] = None
-        self._last_top1_agreement: Optional[float] = None
-        self._last_model_entropy: Optional[float] = None
+        self._last_best_move_prob: Optional[float] = None
         self._last_value_mae: Optional[float] = None
+        self._last_move_winrate_mae: Optional[float] = None
 
     def compute_loss(
         self,
@@ -158,6 +159,19 @@ class TrackingTrainer(Trainer):
         else:
             self._last_masked_token_loss = None
 
+        move_winrate_loss = getattr(outputs, "move_winrate_loss", None)
+        if move_winrate_loss is not None:
+            move_winrate_weight = float(
+                getattr(model, "move_winrate_loss_weight", 0.0))
+            move_winrate_value = float(move_winrate_loss.detach().item())
+            self._last_move_winrate_loss = (
+                move_winrate_value / move_winrate_weight
+                if move_winrate_weight > 0
+                else move_winrate_value
+            )
+        else:
+            self._last_move_winrate_loss = None
+
         # Extract metrics (not losses)
         illegality_rate = getattr(outputs, "illegality_rate", None)
         self._last_illegality_rate = (
@@ -178,23 +192,21 @@ class TrackingTrainer(Trainer):
                   ) if masked_token_accuracy is not None else None
         )
 
-        top1_agreement = getattr(outputs, "top1_agreement", None)
-        self._last_top1_agreement = (
-            float(top1_agreement.detach().item()
-                  ) if top1_agreement is not None else None
-        )
-
-        model_entropy = getattr(outputs, "model_entropy", None)
-        self._last_model_entropy = (
-            float(model_entropy.detach().item()
-                  ) if model_entropy is not None else None
+        best_move_prob = getattr(outputs, "best_move_prob", None)
+        self._last_best_move_prob = (
+            float(best_move_prob.detach().item()
+                  ) if best_move_prob is not None else None
         )
 
         value_mae = getattr(outputs, "value_mae", None)
         self._last_value_mae = (
-            float(value_mae.detach().item()
-                  ) if value_mae is not None else None
-        )
+            float(value_mae.detach().item())
+        ) if value_mae is not None else None
+
+        move_winrate_mae = getattr(outputs, "move_winrate_mae", None)
+        self._last_move_winrate_mae = (
+            float(move_winrate_mae.detach().item())
+        ) if move_winrate_mae is not None else None
 
         if return_outputs:
             return loss, outputs
@@ -216,6 +228,9 @@ class TrackingTrainer(Trainer):
             if self._last_masked_token_loss is not None:
                 logs.setdefault("masked_token_loss",
                                 self._last_masked_token_loss)
+            if self._last_move_winrate_loss is not None:
+                logs.setdefault("move_winrate_loss",
+                                self._last_move_winrate_loss)
 
             # Log metrics
             if self._last_illegality_rate is not None:
@@ -227,15 +242,15 @@ class TrackingTrainer(Trainer):
             if self._last_masked_token_accuracy is not None:
                 logs.setdefault("masked_token_accuracy",
                                 self._last_masked_token_accuracy)
-            if self._last_top1_agreement is not None:
-                logs.setdefault("top1_agreement",
-                                self._last_top1_agreement)
-            if self._last_model_entropy is not None:
-                logs.setdefault("model_entropy",
-                                self._last_model_entropy)
+            if self._last_best_move_prob is not None:
+                logs.setdefault("best_move_prob",
+                                self._last_best_move_prob)
             if self._last_value_mae is not None:
                 logs.setdefault("value_mae",
                                 self._last_value_mae)
+            if self._last_move_winrate_mae is not None:
+                logs.setdefault("move_winrate_mae",
+                                self._last_move_winrate_mae)
         super().log(logs, *args, **kwargs)
 
 
@@ -312,15 +327,12 @@ def train() -> None:
     pad_token_id = tokenizer.token_to_id("[PAD]")
     mask_token_id = tokenizer.token_to_id("[MASK]")
 
-    print(
-        f"Loading chess fens policy dataset from HuggingFace: {DATASET_NAME}...")
-    hf_dataset = load_dataset(
-        DATASET_NAME, split=DATASET_SPLIT, streaming=True)
-    # Add shuffling to prevent periodic oscillations from sorted shards
-    hf_dataset = hf_dataset.shuffle(buffer_size=100_000, seed=42)
-    train_dataset = ChessPolicyDatasetRuntimeTokenization(
-        hf_dataset=hf_dataset,
+    print(f"Loading action value dataset from: {DATASET_PATH}...")
+    train_dataset = ActionValueDataset(
+        dataset_path=DATASET_PATH,
         tokenizer=tokenizer,
+        streaming=True,
+        shuffle_buffer_size=SHUFFLE_BUFFER_SIZE,
     )
 
     per_device_batch_size = 1024
@@ -425,7 +437,6 @@ def train() -> None:
         dataloader_num_workers=8,
         dataloader_prefetch_factor=1,
         dataloader_pin_memory=True,
-        dataloader_persistent_workers=True,
         max_steps=schedule.max_steps,
         ignore_data_skip=True,  # Skip dataloader state restoration for streaming datasets
     )
@@ -446,6 +457,8 @@ def train() -> None:
     # Only enable token masking if MASKED_TOKEN_LOSS_WEIGHT > 0
     effective_mask_token_id = mask_token_id if MASKED_TOKEN_LOSS_WEIGHT > 0 else None
     data_collator = ChessPolicyCollator(mask_token_id=effective_mask_token_id)
+
+    print(f"Shardses: {train_dataset.dataset.num_shards}")
 
     trainer = TrackingTrainer(
         model=model,
