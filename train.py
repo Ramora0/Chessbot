@@ -98,6 +98,12 @@ class TrackingTrainer(Trainer):
         self._last_value_mae: Optional[float] = None
         self._last_move_winrate_mae: Optional[float] = None
 
+        # Cross-worker duplicate FEN tracking
+        self._seen_fens: dict[str, int] = {}  # fen -> count
+        self._total_batches: int = 0
+        self._total_examples: int = 0
+        self._duplicate_count: int = 0
+
     def compute_loss(
         self,
         model,
@@ -105,6 +111,28 @@ class TrackingTrainer(Trainer):
         return_outputs: bool = False,
         num_items_in_batch: Optional[int] = None,
     ):  # type: ignore[override]
+        # Track duplicate FENs across all workers
+        if "fens" in inputs:
+            fens = inputs.pop("fens")  # Remove from inputs before passing to model
+            self._total_batches += 1
+
+            for fen in fens:
+                self._total_examples += 1
+                if fen in self._seen_fens:
+                    self._seen_fens[fen] += 1
+                    self._duplicate_count += 1
+                    # Print every duplicate to see the pattern
+                    print(
+                        f"\n⚠️  DUPLICATE FEN #{self._duplicate_count} [ACROSS ALL WORKERS]")
+                    print(
+                        f"   Batch: {self._total_batches} | Example: {self._total_examples}")
+                    print(f"   FEN: {fen}")
+                    print(f"   Times seen: {self._seen_fens[fen]}")
+                    print(
+                        f"   Duplicate rate: {self._duplicate_count}/{self._total_examples} ({100*self._duplicate_count/self._total_examples:.2f}%)\n")
+                else:
+                    self._seen_fens[fen] = 1
+
         outputs = model(**inputs)
         loss = outputs.loss
         if loss is None:

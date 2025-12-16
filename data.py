@@ -177,11 +177,6 @@ class ChessPolicyCollator:
         # Never mask: turn (64), en passant (69) - both are time-dependent
         self.maskable_positions = list(range(64)) + list(range(65, 69))
 
-        # TESTING: Track seen FENs across all workers to detect duplicates
-        self.seen_fens = {}  # fen -> count
-        self.total_batches = 0
-        self.total_examples = 0
-        self.duplicate_count = 0
 
     def _convert_3bin_to_128bin(self, wdl_3bin: torch.Tensor) -> torch.Tensor:
         """Convert 3-bin WDL [W, D, L] to 128-bin value distribution.
@@ -223,10 +218,7 @@ class ChessPolicyCollator:
         policy_list = []
         wdl_list = []
         legal_move_mask_list = []
-
-        # TESTING: Track duplicates across all workers
-        self.total_batches += 1
-        batch_fens = []
+        fen_list = []
 
         for item in batch:
             input_ids_list.append(item["input_ids"])
@@ -235,25 +227,9 @@ class ChessPolicyCollator:
             if "legal_move_mask" in item:
                 legal_move_mask_list.append(item["legal_move_mask"])
 
-            # Track FEN if present (persists across entire training run)
+            # Collect FENs to pass to trainer for cross-worker duplicate detection
             if "fen" in item:
-                fen = item["fen"]
-                batch_fens.append(fen)
-                self.total_examples += 1
-                if fen in self.seen_fens:
-                    self.seen_fens[fen] += 1
-                    self.duplicate_count += 1
-                    # Print every duplicate to see the pattern
-                    print(
-                        f"\n⚠️  DUPLICATE FEN #{self.duplicate_count} [ENTIRE TRAINING RUN]")
-                    print(
-                        f"   Batch: {self.total_batches} | Example: {self.total_examples}")
-                    print(f"   FEN: {fen}")
-                    print(f"   Times seen: {self.seen_fens[fen]}")
-                    print(
-                        f"   Duplicate rate: {self.duplicate_count}/{self.total_examples} ({100*self.duplicate_count/self.total_examples:.2f}%)\n")
-                else:
-                    self.seen_fens[fen] = 1
+                fen_list.append(item["fen"])
 
         if not input_ids_list:
             raise ValueError("Empty batch provided to ChessPolicyCollator")
@@ -358,6 +334,10 @@ class ChessPolicyCollator:
         if original_input_ids is not None:
             result["original_input_ids"] = original_input_ids
             result["masked_positions"] = masked_positions
+
+        # Add FENs for duplicate detection in trainer (list of strings)
+        if fen_list:
+            result["fens"] = fen_list
 
         return result
 
