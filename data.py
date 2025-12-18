@@ -1,164 +1,10 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, Iterator
+from typing import Dict, Iterable
 
 import torch
-from torch.utils.data import IterableDataset, get_worker_info
-from datasets import IterableDataset as HFIterableDataset
 
 from policy_index import policy_index
-from tokenizer import process_fen
-
-
-EXPECTED_SEQ_LEN = 70
-
-
-class ChessPolicyDataset(IterableDataset):
-    """Streaming-only dataset wrapper that validates incoming examples."""
-
-    def __init__(self, hf_dataset: HFIterableDataset) -> None:
-        if not isinstance(hf_dataset, HFIterableDataset):
-            raise TypeError(
-                "ChessPolicyDataset requires a streaming Hugging Face dataset")
-
-        self.dataset = hf_dataset
-        self.policy_size = len(policy_index)
-
-    @property
-    def is_streaming(self) -> bool:
-        return True
-
-    def __len__(self) -> int:
-        raise TypeError(
-            "ChessPolicyDataset wraps streaming data and has no length")
-
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        worker_info = get_worker_info()
-        if worker_info is not None:
-            shard = self.dataset.shard(worker_info.num_workers, worker_info.id)
-            iterator: Iterable[Dict[str, object]] = iter(shard)
-        else:
-            iterator = iter(self.dataset)
-
-        for example in iterator:
-            yield self._process_example(example)
-
-    def _process_example(self, example: Dict[str, object]) -> Dict[str, torch.Tensor]:
-        policy = torch.as_tensor(example["policy"])
-        if policy.dtype != torch.float32:
-            policy = policy.to(dtype=torch.float32)
-
-        if policy.ndim != 1 or policy.shape[0] != self.policy_size:
-            raise ValueError(
-                f"policy field expected shape ({self.policy_size},), received {tuple(policy.shape)}"
-            )
-
-        input_ids = torch.as_tensor(example["input_ids"])
-        if input_ids.dtype != torch.long:
-            input_ids = input_ids.to(dtype=torch.long)
-
-        if input_ids.ndim != 1:
-            raise ValueError(
-                f"input_ids expected 1D tensor, received shape {tuple(input_ids.shape)}"
-            )
-
-        # Accept any reasonable sequence length (board state is typically 69-70 tokens)
-        seq_len = input_ids.shape[0]
-        if seq_len < 60 or seq_len > 80:
-            raise ValueError(
-                f"input_ids length {seq_len} is outside expected range [60, 80]"
-            )
-
-        wdl = torch.as_tensor(example["wdl"])
-        if wdl.dtype != torch.float32:
-            wdl = wdl.to(dtype=torch.float32)
-
-        # Accept either 3-bin (W/D/L) or 128-bin value distribution
-        if wdl.ndim != 1 or (wdl.shape[0] != 3 and wdl.shape[0] != 128):
-            raise ValueError(
-                f"wdl field expected shape (3,) or (128,), received {tuple(wdl.shape)}"
-            )
-
-        return {
-            "policy": policy,
-            "input_ids": input_ids,
-            "wdl": wdl,
-        }
-
-
-class ChessPolicyDatasetRuntimeTokenization(IterableDataset):
-    """Streaming dataset that tokenizes FENs at runtime.
-
-    This ensures the tokenizer used during training matches the one used during inference.
-    """
-
-    def __init__(self, hf_dataset: HFIterableDataset, tokenizer) -> None:
-        if not isinstance(hf_dataset, HFIterableDataset):
-            raise TypeError(
-                "ChessPolicyDatasetRuntimeTokenization requires a streaming Hugging Face dataset")
-
-        self.dataset = hf_dataset
-        self.tokenizer = tokenizer
-        self.policy_size = len(policy_index)
-
-    @property
-    def is_streaming(self) -> bool:
-        return True
-
-    def __len__(self) -> int:
-        raise TypeError(
-            "ChessPolicyDatasetRuntimeTokenization wraps streaming data and has no length")
-
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        worker_info = get_worker_info()
-        if worker_info is not None:
-            shard = self.dataset.shard(worker_info.num_workers, worker_info.id)
-            iterator: Iterable[Dict[str, object]] = iter(shard)
-        else:
-            iterator = iter(self.dataset)
-
-        for example in iterator:
-            yield self._process_example(example)
-
-    def _process_example(self, example: Dict[str, object]) -> Dict[str, torch.Tensor]:
-        # Extract policy
-        policy = torch.as_tensor(example["policy"])
-        if policy.dtype != torch.float32:
-            policy = policy.to(dtype=torch.float32)
-
-        if policy.ndim != 1 or policy.shape[0] != self.policy_size:
-            raise ValueError(
-                f"policy field expected shape ({self.policy_size},), received {tuple(policy.shape)}"
-            )
-
-        # Tokenize FEN at runtime
-        fen = example["fen"]
-        processed = process_fen(fen)
-        encoding = self.tokenizer.encode(processed)
-        input_ids = torch.tensor(encoding.ids, dtype=torch.long)
-
-        # Accept any reasonable sequence length (board state is typically 69-70 tokens)
-        seq_len = input_ids.shape[0]
-        if seq_len < 60 or seq_len > 80:
-            raise ValueError(
-                f"Tokenized FEN has length {seq_len}, outside expected range [60, 80]. FEN: {fen}"
-            )
-
-        # Extract WDL
-        wdl = torch.as_tensor(example["wdl"])
-        if wdl.dtype != torch.float32:
-            wdl = wdl.to(dtype=torch.float32)
-
-        if wdl.ndim != 1 or wdl.shape[0] != 3:
-            raise ValueError(
-                f"wdl field expected shape (3,), received {tuple(wdl.shape)}"
-            )
-
-        return {
-            "policy": policy,
-            "input_ids": input_ids,
-            "wdl": wdl,
-        }
 
 
 class ChessPolicyCollator:
@@ -218,18 +64,29 @@ class ChessPolicyCollator:
         policy_list = []
         wdl_list = []
         legal_move_mask_list = []
-        fen_list = []
 
         for item in batch:
-            input_ids_list.append(item["input_ids"])
-            policy_list.append(item["policy"])
-            wdl_list.append(item["wdl"])
-            if "legal_move_mask" in item:
-                legal_move_mask_list.append(item["legal_move_mask"])
+            # Convert lists to tensors (HF datasets return lists)
+            input_ids = item["input_ids"]
+            if not isinstance(input_ids, torch.Tensor):
+                input_ids = torch.tensor(input_ids, dtype=torch.long)
+            input_ids_list.append(input_ids)
 
-            # Collect FENs to pass to trainer for cross-worker duplicate detection
-            if "fen" in item:
-                fen_list.append(item["fen"])
+            policy = item["policy"]
+            if not isinstance(policy, torch.Tensor):
+                policy = torch.tensor(policy, dtype=torch.float32)
+            policy_list.append(policy)
+
+            wdl = item["wdl"]
+            if not isinstance(wdl, torch.Tensor):
+                wdl = torch.tensor(wdl, dtype=torch.float32)
+            wdl_list.append(wdl)
+
+            if "legal_move_mask" in item:
+                legal_move_mask = item["legal_move_mask"]
+                if not isinstance(legal_move_mask, torch.Tensor):
+                    legal_move_mask = torch.tensor(legal_move_mask, dtype=torch.float32)
+                legal_move_mask_list.append(legal_move_mask)
 
         if not input_ids_list:
             raise ValueError("Empty batch provided to ChessPolicyCollator")
@@ -314,7 +171,10 @@ class ChessPolicyCollator:
         true_value_list = []
         for item in batch:
             if "true_value" in item:
-                true_value_list.append(item["true_value"])
+                true_val = item["true_value"]
+                if not isinstance(true_val, torch.Tensor):
+                    true_val = torch.tensor(true_val, dtype=torch.float32)
+                true_value_list.append(true_val)
 
         result = {
             "input_ids": input_ids,
@@ -335,30 +195,4 @@ class ChessPolicyCollator:
             result["original_input_ids"] = original_input_ids
             result["masked_positions"] = masked_positions
 
-        # Add FENs for duplicate detection in trainer (list of strings)
-        if fen_list:
-            result["fens"] = fen_list
-
         return result
-
-
-def create_dataloader(
-    hf_dataset: HFIterableDataset,
-    batch_size: int = 32,
-    shuffle: bool = True,
-    num_workers: int = 0,
-) -> torch.utils.data.DataLoader:
-    dataset = ChessPolicyDataset(hf_dataset)
-    collator = ChessPolicyCollator()
-
-    if shuffle:
-        raise ValueError(
-            "Shuffling must be applied to the source dataset before wrapping in ChessPolicyDataset"
-        )
-
-    return torch.utils.data.DataLoader(
-        dataset=dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        collate_fn=collator,
-    )

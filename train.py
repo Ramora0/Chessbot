@@ -15,7 +15,7 @@ from transformers import (
 )
 
 from data import ChessPolicyCollator
-from action_value_dataset import ActionValueDataset
+from action_value_dataset import create_action_value_dataset
 from model import ChessPolicyValueModel
 from policy_index import policy_index
 from tokenizer import create_tokenizer
@@ -98,12 +98,6 @@ class TrackingTrainer(Trainer):
         self._last_value_mae: Optional[float] = None
         self._last_move_winrate_mae: Optional[float] = None
 
-        # Cross-worker duplicate FEN tracking
-        self._seen_fens: dict[str, int] = {}  # fen -> count
-        self._total_batches: int = 0
-        self._total_examples: int = 0
-        self._duplicate_count: int = 0
-
     def compute_loss(
         self,
         model,
@@ -111,28 +105,6 @@ class TrackingTrainer(Trainer):
         return_outputs: bool = False,
         num_items_in_batch: Optional[int] = None,
     ):  # type: ignore[override]
-        # Track duplicate FENs across all workers
-        if "fens" in inputs:
-            fens = inputs.pop("fens")  # Remove from inputs before passing to model
-            self._total_batches += 1
-
-            for fen in fens:
-                self._total_examples += 1
-                if fen in self._seen_fens:
-                    self._seen_fens[fen] += 1
-                    self._duplicate_count += 1
-                    # Print every duplicate to see the pattern
-                    print(
-                        f"\n⚠️  DUPLICATE FEN #{self._duplicate_count} [ACROSS ALL WORKERS]")
-                    print(
-                        f"   Batch: {self._total_batches} | Example: {self._total_examples}")
-                    print(f"   FEN: {fen}")
-                    print(f"   Times seen: {self._seen_fens[fen]}")
-                    print(
-                        f"   Duplicate rate: {self._duplicate_count}/{self._total_examples} ({100*self._duplicate_count/self._total_examples:.2f}%)\n")
-                else:
-                    self._seen_fens[fen] = 1
-
         outputs = model(**inputs)
         loss = outputs.loss
         if loss is None:
@@ -356,11 +328,11 @@ def train() -> None:
     mask_token_id = tokenizer.token_to_id("[MASK]")
 
     print(f"Loading action value dataset from: {DATASET_PATH}...")
-    train_dataset = ActionValueDataset(
+    train_dataset = create_action_value_dataset(
         dataset_path=DATASET_PATH,
         tokenizer=tokenizer,
-        streaming=True,
         shuffle_buffer_size=SHUFFLE_BUFFER_SIZE,
+        seed=42,
     )
 
     per_device_batch_size = 1024
@@ -485,8 +457,6 @@ def train() -> None:
     # Only enable token masking if MASKED_TOKEN_LOSS_WEIGHT > 0
     effective_mask_token_id = mask_token_id if MASKED_TOKEN_LOSS_WEIGHT > 0 else None
     data_collator = ChessPolicyCollator(mask_token_id=effective_mask_token_id)
-
-    print(f"Shardses: {train_dataset.dataset.num_shards}")
 
     trainer = TrackingTrainer(
         model=model,

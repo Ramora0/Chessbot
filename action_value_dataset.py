@@ -1,6 +1,9 @@
 """
 Dataset handler for the action-value dataset created by create_dataset.py.
 
+Uses HuggingFace's native IterableDataset pipeline instead of wrapping in
+PyTorch IterableDataset, which avoids worker sharding conflicts.
+
 This dataset format stores:
 - fen: FEN string
 - moves: list of UCI move strings
@@ -14,14 +17,12 @@ This handler converts to the format expected by the model:
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, Iterator
 from pathlib import Path
+from functools import partial
 
-import torch
 import numpy as np
 import chess
-from torch.utils.data import IterableDataset, get_worker_info
-from datasets import load_from_disk, IterableDataset as HFIterableDataset
+from datasets import load_dataset, IterableDataset as HFIterableDataset
 
 from policy_index import policy_index
 from tokenizer import process_fen
@@ -31,9 +32,102 @@ EXPECTED_SEQ_LEN = 70
 NUM_VALUE_BINS = 128
 
 
-class ActionValueDataset(IterableDataset):
+def create_action_value_dataset(
+    dataset_path: str | Path,
+    tokenizer,
+    shuffle_buffer_size: int = 100_000,
+    seed: int = 42,
+) -> HFIterableDataset:
     """
-    Loads the action-value dataset and converts it to model format at runtime.
+    Load and prepare the action-value dataset for training.
+
+    Returns an HF IterableDataset that can be passed directly to Trainer.
+    All transformations are applied lazily via .map().
+
+    NOTE: Loads dataset in streaming mode (like MaxLeGrec/ChessFENS).
+    Sharding is determined automatically by the number of data files on disk.
+
+    Args:
+        dataset_path: Path to the HuggingFace dataset directory
+        tokenizer: Tokenizer for encoding FENs
+        shuffle_buffer_size: Size of shuffle buffer (0 to disable)
+        seed: Random seed for shuffling
+
+    Returns:
+        HF IterableDataset ready for training
+    """
+    # Build lookup table once (passed to map function)
+    move_to_idx = {move: idx for idx, move in enumerate(policy_index)}
+    policy_size = len(policy_index)
+
+    print(f"Loading dataset from {dataset_path} in streaming mode...")
+
+    # Load as IterableDataset directly from local path
+    # This matches how MaxLeGrec/ChessFENS is loaded (streaming from the start)
+    dataset_path_str = str(dataset_path)
+
+    # Try to detect the format and load appropriately
+    from pathlib import Path
+    dataset_dir = Path(dataset_path_str)
+
+    # Check what files exist to determine format
+    if (dataset_dir / "dataset_info.json").exists():
+        # This is a HF dataset saved with save_to_disk
+        # For streaming, we need to use load_dataset with the data files
+        import glob
+        arrow_files = glob.glob(str(dataset_dir / "**" / "*.arrow"), recursive=True)
+        parquet_files = glob.glob(str(dataset_dir / "**" / "*.parquet"), recursive=True)
+
+        if arrow_files:
+            print(f"Found {len(arrow_files)} arrow files")
+            dataset = load_dataset(
+                "arrow",
+                data_files=arrow_files,
+                split="train",
+                streaming=True,
+            )
+        elif parquet_files:
+            print(f"Found {len(parquet_files)} parquet files")
+            dataset = load_dataset(
+                "parquet",
+                data_files=parquet_files,
+                split="train",
+                streaming=True,
+            )
+        else:
+            raise ValueError(f"No arrow or parquet files found in {dataset_path}")
+    else:
+        raise ValueError(f"Dataset directory {dataset_path} doesn't look like a HF dataset")
+
+    print(f"Loaded streaming dataset: {type(dataset).__name__}")
+
+    # Shuffle BEFORE worker distribution
+    # This ensures each worker gets shuffled data
+    if shuffle_buffer_size > 0:
+        print(f"Adding shuffle with buffer size {shuffle_buffer_size}")
+        dataset = dataset.shuffle(buffer_size=shuffle_buffer_size, seed=seed)
+
+    # Apply transformation lazily - HF handles worker sharding correctly
+    transform_fn = partial(
+        _transform_example,
+        tokenizer=tokenizer,
+        move_to_idx=move_to_idx,
+        policy_size=policy_size,
+    )
+    dataset = dataset.map(transform_fn)
+
+    return dataset
+
+def _transform_example(
+    example: dict,
+    tokenizer,
+    move_to_idx: dict[str, int],
+    policy_size: int,
+) -> dict:
+    """
+    Transform a raw example to model input format.
+
+    This is a pure function called by HF's .map() - no state, no side effects.
 
     Input format (from create_dataset.py):
         - fen: str
@@ -41,186 +135,79 @@ class ActionValueDataset(IterableDataset):
         - p_win: list[float32] (win probabilities)
 
     Output format (for model):
-        - input_ids: tokenized FEN
+        - input_ids: tokenized FEN (list of ints)
         - policy: value vector over policy_index
             * Illegal moves: -1
             * Legal moves: p_win - max_p_win (best move = 0, others negative)
             * Loss directly measures regret (lost win % vs optimal)
         - wdl: smooth distribution over 128 bins (win% from 0.0 to 1.0)
         - true_value: scalar win% of best move (for metrics)
+        - legal_move_mask: binary mask for legal moves
     """
+    fen = example["fen"]
 
-    def __init__(
-        self,
-        dataset_path: str | Path,
-        tokenizer,
-        streaming: bool = True,
-        shuffle_buffer_size: int = 0,
-    ) -> None:
-        """
-        Args:
-            dataset_path: Path to the HuggingFace dataset directory
-            tokenizer: Tokenizer for encoding FENs
-            streaming: Whether to stream the dataset (recommended for large datasets)
-            shuffle_buffer_size: Size of the shuffle buffer (only used for streaming datasets)
-        """
-        self.dataset_path = Path(dataset_path)
-        self.tokenizer = tokenizer
-        self.streaming = streaming
+    # 1. Tokenize FEN at runtime
+    processed = process_fen(fen)
+    encoding = tokenizer.encode(processed)
+    input_ids = encoding.ids  # Keep as list, convert to tensor in collator
 
-        # Load the dataset
-        if streaming:
-            self.dataset = load_from_disk(
-                str(self.dataset_path)).to_iterable_dataset(num_shards=8)
-            print(f"Shardses: {self.dataset.num_shards}")
+    if len(input_ids) != EXPECTED_SEQ_LEN:
+        raise ValueError(
+            f"Tokenized FEN has length {len(input_ids)}, expected {EXPECTED_SEQ_LEN}. FEN: {fen}"
+        )
 
-            # Add shuffling to prevent periodic oscillations from sorted shards
-            # if shuffle_buffer_size > 0:
-            #     self.dataset = self.dataset.shuffle(buffer_size=shuffle_buffer_size, seed=42)
-        else:
-            self.dataset = load_from_disk(str(self.dataset_path))
+    # 2. Convert (move, p_win) pairs to policy value vector
+    moves = example["moves"]
+    p_wins = example["p_win"]
 
-        self.policy_size = len(policy_index)
+    if len(moves) != len(p_wins):
+        raise ValueError(
+            f"Mismatch: {len(moves)} moves but {len(p_wins)} probabilities"
+        )
 
-        # Create move to index mapping for fast lookup
-        self.move_to_idx = {move: idx for idx, move in enumerate(policy_index)}
+    # Initialize policy with -1 (marking all moves as illegal)
+    policy = np.full(policy_size, -1.0, dtype=np.float32)
 
-    @property
-    def is_streaming(self) -> bool:
-        return self.streaming
+    # Fill in p_win values for each legal move
+    valid_indices = []
+    for move, p_win in zip(moves, p_wins):
+        if move in move_to_idx:
+            idx = move_to_idx[move]
+            policy[idx] = p_win
+            valid_indices.append(idx)
+        # Skip moves not in policy_index (e.g., promotions to rook/bishop)
 
-    def __len__(self) -> int:
-        if self.streaming:
-            raise TypeError("Streaming dataset has no length")
-        return len(self.dataset)
+    # Normalize so the best move has value 0.0 (subtract max from all legal moves)
+    # This makes loss directly correspond to "win% lost" vs optimal play
+    # Illegal moves stay at -1
+    if valid_indices:
+        max_p_win = max(policy[idx] for idx in valid_indices)
+        for idx in valid_indices:
+            policy[idx] -= max_p_win
 
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        # HuggingFace IterableDataset handles worker sharding automatically
-        # when created with to_iterable_dataset(num_shards=N)
-        # DO NOT manually shard here - it causes "too many workers" errors
-        iterator: Iterable[Dict[str, object]] = iter(self.dataset)
+    # 3. Create smooth target distribution over 128 bins for win%
+    # Use the maximum p_win (best move's win probability)
+    best_win_prob = max(p_wins) if p_wins else 0.5
 
-        for example in iterator:
-            try:
-                yield self._process_example(example)
-            except (ValueError, KeyError) as e:
-                # Skip malformed examples
-                print(f"Warning: Skipping example due to error: {e}")
-                continue
+    # Create smooth Gaussian-like distribution centered on best_win_prob
+    # Bins represent win% from 0.0 to 1.0
+    bin_centers = np.linspace(0, 1, NUM_VALUE_BINS, dtype=np.float32)
+    sigma = 0.05  # Smoothing factor (5% std)
+    value_dist = np.exp(-0.5 * ((bin_centers - best_win_prob) / sigma) ** 2)
+    value_dist = value_dist / value_dist.sum()  # Normalize to sum to 1
 
-    def _process_example(self, example: Dict[str, object]) -> Dict[str, torch.Tensor]:
-        """
-        Convert raw example to model input format.
+    # 4. Compute legal move mask from actual chess board
+    board = chess.Board(fen)
+    legal_move_mask = np.zeros(policy_size, dtype=np.float32)
+    for move in board.legal_moves:
+        move_uci = move.uci()
+        if move_uci in move_to_idx:
+            legal_move_mask[move_to_idx[move_uci]] = 1.0
 
-        1. Tokenize FEN
-        2. Convert (move, p_win) pairs to policy value vector
-           - Illegal moves: -1
-           - Legal moves: p_win - max_p_win (so best move = 0)
-           - Loss directly measures "lost win %" vs optimal play
-        3. Convert p_win to WDL format
-        """
-        # 1. Tokenize FEN at runtime
-        fen = example["fen"]
-        processed = process_fen(fen)
-        encoding = self.tokenizer.encode(processed)
-        input_ids = torch.tensor(encoding.ids, dtype=torch.long)
-
-        if input_ids.shape[0] != EXPECTED_SEQ_LEN:
-            raise ValueError(
-                f"Tokenized FEN has length {input_ids.shape[0]}, expected {EXPECTED_SEQ_LEN}. FEN: {fen}"
-            )
-
-        # 2. Convert (move, p_win) pairs to policy value vector
-        moves = example["moves"]
-        p_wins = example["p_win"]
-
-        if len(moves) != len(p_wins):
-            raise ValueError(
-                f"Mismatch: {len(moves)} moves but {len(p_wins)} probabilities"
-            )
-
-        # Validate: Check that all legal moves in policy_index have win% values
-        # board = chess.Board(fen)
-        # legal_moves_uci = {move.uci() for move in board.legal_moves}
-        # legal_moves_in_policy = {move for move in legal_moves_uci if move in self.move_to_idx}
-        # moves_set = set(moves)
-
-        # missing_moves = legal_moves_in_policy - moves_set
-        # if missing_moves:
-        #     raise ValueError(
-        #         f"Dataset missing win% for legal moves!\n"
-        #         f"  FEN: {fen}\n"
-        #         f"  Legal moves (in policy_index): {sorted(legal_moves_in_policy)}\n"
-        #         f"  Moves in dataset: {sorted(moves_set)}\n"
-        #         f"  Missing moves: {sorted(missing_moves)}"
-        #     )
-
-        # Initialize policy with -1 (marking all moves as illegal)
-        policy = np.full(self.policy_size, -1.0, dtype=np.float32)
-
-        # Fill in p_win values for each legal move
-        valid_moves = []
-        skipped_moves = []
-        for move, p_win in zip(moves, p_wins):
-            if move in self.move_to_idx:
-                idx = self.move_to_idx[move]
-                policy[idx] = p_win
-                valid_moves.append(idx)
-            else:
-                skipped_moves.append(move)
-                # Skip moves not in policy_index (e.g., promotions to rook/bishop)
-
-        # Debug: warn if no valid moves found
-        if not valid_moves:
-            print(f"Warning: No valid moves found for FEN {fen}")
-            print(f"  Dataset provided {len(moves)} moves: {moves}")
-            print(f"  All skipped (not in policy_index): {skipped_moves}")
-
-        # Normalize so the best move has value 0.0 (subtract max from all legal moves)
-        # This makes loss directly correspond to "win% lost" vs optimal play
-        # Illegal moves stay at -1
-        if valid_moves:
-            max_p_win = max(policy[idx] for idx in valid_moves)
-            for idx in valid_moves:
-                policy[idx] = policy[idx] - max_p_win
-
-        policy = torch.tensor(policy, dtype=torch.float32)
-
-        # 3. Create smooth target distribution over 128 bins for win%
-        # Use the maximum p_win (best move's win probability)
-        if len(p_wins) > 0:
-            max_p_win = max(p_wins)
-        else:
-            max_p_win = 0.5  # Default to 50% if no moves
-
-        # Create smooth Gaussian-like distribution centered on max_p_win
-        # Bins represent win% from 0.0 to 1.0
-        bin_centers = np.linspace(0, 1, NUM_VALUE_BINS, dtype=np.float32)
-
-        # Gaussian distribution with small std to create smooth target
-        sigma = 0.05  # Smoothing factor (5% std)
-        value_dist = np.exp(-0.5 * ((bin_centers - max_p_win) / sigma) ** 2)
-        value_dist = value_dist / value_dist.sum()  # Normalize to sum to 1
-
-        wdl = torch.tensor(value_dist, dtype=torch.float32)
-
-        # Also pass the true scalar value for metric computation
-        true_value = torch.tensor(max_p_win, dtype=torch.float32)
-
-        # TESTING: Compute legal move mask from actual chess board
-        board = chess.Board(fen)
-        legal_move_mask = np.zeros(self.policy_size, dtype=np.float32)
-        for move in board.legal_moves:
-            move_uci = move.uci()
-            if move_uci in self.move_to_idx:
-                legal_move_mask[self.move_to_idx[move_uci]] = 1.0
-        legal_move_mask = torch.tensor(legal_move_mask, dtype=torch.float32)
-
-        return {
-            "input_ids": input_ids,
-            "policy": policy,
-            "wdl": wdl,
-            "true_value": true_value,
-            "legal_move_mask": legal_move_mask,
-            "fen": fen,  # TESTING: Include FEN for debugging
-        }
+    return {
+        "input_ids": input_ids,  # List of token IDs from tokenizer
+        "policy": policy.tolist(),  # Lists work better with HF serialization
+        "wdl": value_dist.tolist(),
+        "true_value": float(best_win_prob),
+        "legal_move_mask": legal_move_mask.tolist(),
+    }
