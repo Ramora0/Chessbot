@@ -23,42 +23,6 @@ class ChessPolicyCollator:
         # Never mask: turn (64), en passant (69) - both are time-dependent
         self.maskable_positions = list(range(64)) + list(range(65, 69))
 
-
-    def _convert_3bin_to_128bin(self, wdl_3bin: torch.Tensor) -> torch.Tensor:
-        """Convert 3-bin WDL [W, D, L] to 128-bin value distribution.
-
-        Args:
-            wdl_3bin: [batch_size, 3] tensor with [win, draw, loss] probabilities
-
-        Returns:
-            [batch_size, 128] tensor with smooth distribution over win probability bins
-        """
-        device = wdl_3bin.device
-
-        # Compute expected win probability: W + 0.5*D
-        # (win counts as 1.0, draw as 0.5, loss as 0.0)
-        win_prob = wdl_3bin[:, 0] + 0.5 * wdl_3bin[:, 1]  # [batch_size]
-
-        # Create 128-bin smooth distribution centered on win_prob
-        bin_centers = torch.linspace(0, 1, 128, device=device)  # [128]
-
-        # Gaussian distribution with small std to create smooth target
-        sigma = 0.05  # Smoothing factor (5% std)
-
-        # Expand dimensions for broadcasting: [batch_size, 1] and [1, 128]
-        win_prob_expanded = win_prob.unsqueeze(1)  # [batch_size, 1]
-        bin_centers_expanded = bin_centers.unsqueeze(0)  # [1, 128]
-
-        # Compute Gaussian: exp(-0.5 * ((x - mean) / sigma)^2)
-        value_dist = torch.exp(-0.5 * ((bin_centers_expanded -
-                               win_prob_expanded) / sigma) ** 2)
-
-        # Normalize each row to sum to 1
-        value_dist = value_dist / \
-            value_dist.sum(dim=1, keepdim=True)  # [batch_size, 128]
-
-        return value_dist
-
     def __call__(self, batch: Iterable[Dict[str, object]]) -> Dict[str, torch.Tensor]:
         input_ids_list = []
         policy_list = []
@@ -119,53 +83,26 @@ class ChessPolicyCollator:
         if wdl_values.dtype != torch.float32:
             wdl_values = wdl_values.to(dtype=torch.float32)
 
-        # Accept either 3-bin (W/D/L) or 128-bin value distribution
+        # Expect 128-bin value distribution
         wdl_width = wdl_values.shape[1]
-        if wdl_width != 3 and wdl_width != 128:
+        if wdl_width != 128:
             raise ValueError(
-                f"wdl tensor expected width 3 or 128, received {wdl_width}"
+                f"wdl tensor expected width 128, received {wdl_width}"
             )
 
-        # Convert 3-bin WDL to 128-bin format if needed
-        if wdl_width == 3:
-            wdl_values = self._convert_3bin_to_128bin(wdl_values)
-
-        # Apply masked token prediction if mask_token_id is provided
+        # Apply token prediction loss on all examples (no actual masking)
+        # This helps the model retain token information for downstream LLM use
         original_input_ids = None
         masked_positions = None
 
         if self.mask_token_id is not None:
-            # Store original input_ids before masking
-            original_input_ids = input_ids.clone()
-
-            # Initialize masked_positions (all False initially)
             batch_size, seq_len = input_ids.shape
-            masked_positions = torch.zeros(
-                batch_size, seq_len, dtype=torch.bool)
+            original_input_ids = input_ids.clone()
+            masked_positions = torch.zeros(batch_size, seq_len, dtype=torch.bool)
 
-            # For each example, randomly decide whether to apply masking (50% chance)
-            for i in range(batch_size):
-                if torch.rand(1).item() < 0.5:
-                    # Apply masking to this example
-                    # Calculate number of tokens to mask (15% of maskable positions)
-                    num_maskable = len(self.maskable_positions)
-                    num_to_mask = max(1, int(num_maskable * self.mask_prob))
-
-                    # Randomly select positions to mask
-                    maskable_indices = torch.tensor(
-                        self.maskable_positions, dtype=torch.long)
-                    perm = torch.randperm(num_maskable)[:num_to_mask]
-                    positions_to_mask = maskable_indices[perm]
-
-                    # Mark these positions as masked
-                    masked_positions[i, positions_to_mask] = True
-
-                    # For each masked position, decide whether to replace with [MASK] (90%) or keep (10%)
-                    for pos in positions_to_mask:
-                        if torch.rand(1).item() < 0.9:
-                            # Replace with [MASK] token
-                            input_ids[i, pos] = self.mask_token_id
-                        # else: keep original token (10% of the time)
+            # Enable token prediction loss on maskable positions for all examples
+            maskable_indices = torch.tensor(self.maskable_positions, dtype=torch.long)
+            masked_positions[:, maskable_indices] = True
 
         # Handle true_value if present (for value head metrics)
         true_value_list = []

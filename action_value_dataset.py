@@ -64,40 +64,21 @@ def create_action_value_dataset(
 
     # Load as IterableDataset directly from local path
     # This matches how MaxLeGrec/ChessFENS is loaded (streaming from the start)
-    dataset_path_str = str(dataset_path)
+    import glob
+    dataset_dir = Path(dataset_path)
 
-    # Try to detect the format and load appropriately
-    from pathlib import Path
-    dataset_dir = Path(dataset_path_str)
+    # Load arrow files directly
+    arrow_files = glob.glob(str(dataset_dir / "**" / "*.arrow"), recursive=True)
+    if not arrow_files:
+        raise ValueError(f"No arrow files found in {dataset_path}")
 
-    # Check what files exist to determine format
-    if (dataset_dir / "dataset_info.json").exists():
-        # This is a HF dataset saved with save_to_disk
-        # For streaming, we need to use load_dataset with the data files
-        import glob
-        arrow_files = glob.glob(str(dataset_dir / "**" / "*.arrow"), recursive=True)
-        parquet_files = glob.glob(str(dataset_dir / "**" / "*.parquet"), recursive=True)
-
-        if arrow_files:
-            print(f"Found {len(arrow_files)} arrow files")
-            dataset = load_dataset(
-                "arrow",
-                data_files=arrow_files,
-                split="train",
-                streaming=True,
-            )
-        elif parquet_files:
-            print(f"Found {len(parquet_files)} parquet files")
-            dataset = load_dataset(
-                "parquet",
-                data_files=parquet_files,
-                split="train",
-                streaming=True,
-            )
-        else:
-            raise ValueError(f"No arrow or parquet files found in {dataset_path}")
-    else:
-        raise ValueError(f"Dataset directory {dataset_path} doesn't look like a HF dataset")
+    print(f"Found {len(arrow_files)} arrow files")
+    dataset = load_dataset(
+        "arrow",
+        data_files=arrow_files,
+        split="train",
+        streaming=True,
+    )
 
     print(f"Loaded streaming dataset: {type(dataset).__name__}")
 
@@ -106,6 +87,8 @@ def create_action_value_dataset(
     if shuffle_buffer_size > 0:
         print(f"Adding shuffle with buffer size {shuffle_buffer_size}")
         dataset = dataset.shuffle(buffer_size=shuffle_buffer_size, seed=seed)
+    else:
+        print("Shuffling disabled (shuffle_buffer_size=0)")
 
     # Apply transformation lazily - HF handles worker sharding correctly
     transform_fn = partial(
