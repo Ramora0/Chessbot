@@ -8,25 +8,28 @@ from pathlib import Path
 from typing import Optional
 
 from transformers import (
-    GPT2Config,
+    LlamaConfig,
     Trainer,
     TrainingArguments,
     TrainerCallback,
 )
-from datasets import load_from_disk, load_dataset
-from datasets import IterableDataset as HFIterableDataset
 
-from data import ChessPolicyCollator, ChessPolicyDataset
-from model import ChessGPT2PolicyValue
+from data import ChessPolicyCollator
+from action_value_dataset import create_action_value_dataset
+from model import ChessPolicyValueModel
 from policy_index import policy_index
 from tokenizer import create_tokenizer
-from evaluation import evaluate_model_elo, DEFAULT_EVAL_DATASET_DIR
+from evaluation_puzzle import evaluate_model_elo, DEFAULT_EVAL_CSV_PATH
+from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 
-OUTPUT_DIR = "outputs"
+OUTPUT_DIR = "new"
 DROPOUT = 0.1
-MAX_SEQ_LENGTH = 72
-PROCESSED_DATASET_DIR = "/fs/scratch/PAS3150/lees_stuff/processed_chessfens"
+# Set to 0 to disable thinking tokens (72 board tokens + thinking tokens)
+NUM_THINKING_TOKENS = 0
+MAX_SEQ_LENGTH = 256  # Must be >= 72 + NUM_THINKING_TOKENS
+DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value"
+SHUFFLE_BUFFER_SIZE = 100_000
 ELO_EVAL_STEPS = 4000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
@@ -37,6 +40,11 @@ BASE_SAVE_STEPS = 10_000
 BASE_LOGGING_STEPS = 200
 BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
 
+# Set to a checkpoint path to resume training (e.g., "./outputs/checkpoint-45000")
+# Set to None to start from scratch
+# RESUME_FROM_CHECKPOINT = "./outputs/checkpoint-90000"
+RESUME_FROM_CHECKPOINT = None
+
 
 @dataclass
 class TrainingSchedule:
@@ -45,6 +53,7 @@ class TrainingSchedule:
     save_steps: int
     logging_steps: int
     elo_eval_steps: int
+    warmup_steps: int
 
 
 def build_training_schedule(batch_size: int) -> TrainingSchedule:
@@ -59,6 +68,7 @@ def build_training_schedule(batch_size: int) -> TrainingSchedule:
     save_steps = max(1, int(BASE_SAVE_STEPS * inv_scale))
     logging_steps = max(1, int(BASE_LOGGING_STEPS * inv_scale))
     elo_eval_steps = max(1, int(BASE_ELO_EVAL_STEPS * inv_scale))
+    warmup_steps = max(1, int(max_steps * 0.02))  # 1% of total steps
 
     return TrainingSchedule(
         learning_rate=learning_rate,
@@ -66,6 +76,7 @@ def build_training_schedule(batch_size: int) -> TrainingSchedule:
         save_steps=save_steps,
         logging_steps=logging_steps,
         elo_eval_steps=elo_eval_steps,
+        warmup_steps=warmup_steps,
     )
 
 
@@ -77,7 +88,15 @@ class TrackingTrainer(Trainer):
         self._last_policy_loss: Optional[float] = None
         self._last_wdl_loss: Optional[float] = None
         self._last_total_loss: Optional[float] = None
-        self._last_illegality_loss: Optional[float] = None
+        self._last_illegality_head_loss: Optional[float] = None
+        self._last_masked_token_loss: Optional[float] = None
+        self._last_move_winrate_loss: Optional[float] = None
+        self._last_illegality_rate: Optional[float] = None
+        self._last_illegality_head_accuracy: Optional[float] = None
+        self._last_masked_token_accuracy: Optional[float] = None
+        self._last_best_move_prob: Optional[float] = None
+        self._last_value_mae: Optional[float] = None
+        self._last_move_winrate_mae: Optional[float] = None
 
     def compute_loss(
         self,
@@ -114,18 +133,80 @@ class TrackingTrainer(Trainer):
         else:
             self._last_wdl_loss = None
 
-        illegality_loss = getattr(outputs, "illegality_loss", None)
-        if illegality_loss is not None:
-            illegality_weight = float(
-                getattr(model, "illegality_loss_weight", 0.0))
-            illegality_value = float(illegality_loss.detach().item())
-            self._last_illegality_loss = (
-                illegality_value / illegality_weight
-                if illegality_weight > 0
-                else illegality_value
+        illegality_head_loss = getattr(outputs, "illegality_head_loss", None)
+        if illegality_head_loss is not None:
+            illegality_head_weight = float(
+                getattr(model, "illegality_head_loss_weight", 0.0))
+            illegality_head_value = float(illegality_head_loss.detach().item())
+            self._last_illegality_head_loss = (
+                illegality_head_value / illegality_head_weight
+                if illegality_head_weight > 0
+                else illegality_head_value
             )
         else:
-            self._last_illegality_loss = None
+            self._last_illegality_head_loss = None
+
+        masked_token_loss = getattr(outputs, "masked_token_loss", None)
+        if masked_token_loss is not None:
+            masked_token_weight = float(
+                getattr(model, "masked_token_loss_weight", 0.0))
+            masked_token_value = float(masked_token_loss.detach().item())
+            self._last_masked_token_loss = (
+                masked_token_value / masked_token_weight
+                if masked_token_weight > 0
+                else masked_token_value
+            )
+        else:
+            self._last_masked_token_loss = None
+
+        move_winrate_loss = getattr(outputs, "move_winrate_loss", None)
+        if move_winrate_loss is not None:
+            move_winrate_weight = float(
+                getattr(model, "move_winrate_loss_weight", 0.0))
+            move_winrate_value = float(move_winrate_loss.detach().item())
+            self._last_move_winrate_loss = (
+                move_winrate_value / move_winrate_weight
+                if move_winrate_weight > 0
+                else move_winrate_value
+            )
+        else:
+            self._last_move_winrate_loss = None
+
+        # Extract metrics (not losses)
+        illegality_rate = getattr(outputs, "illegality_rate", None)
+        self._last_illegality_rate = (
+            float(illegality_rate.detach().item()
+                  ) if illegality_rate is not None else None
+        )
+
+        illegality_head_accuracy = getattr(
+            outputs, "illegality_head_accuracy", None)
+        self._last_illegality_head_accuracy = (
+            float(illegality_head_accuracy.detach().item()
+                  ) if illegality_head_accuracy is not None else None
+        )
+
+        masked_token_accuracy = getattr(outputs, "masked_token_accuracy", None)
+        self._last_masked_token_accuracy = (
+            float(masked_token_accuracy.detach().item()
+                  ) if masked_token_accuracy is not None else None
+        )
+
+        best_move_prob = getattr(outputs, "best_move_prob", None)
+        self._last_best_move_prob = (
+            float(best_move_prob.detach().item()
+                  ) if best_move_prob is not None else None
+        )
+
+        value_mae = getattr(outputs, "value_mae", None)
+        self._last_value_mae = (
+            float(value_mae.detach().item())
+        ) if value_mae is not None else None
+
+        move_winrate_mae = getattr(outputs, "move_winrate_mae", None)
+        self._last_move_winrate_mae = (
+            float(move_winrate_mae.detach().item())
+        ) if move_winrate_mae is not None else None
 
         if return_outputs:
             return loss, outputs
@@ -134,14 +215,42 @@ class TrackingTrainer(Trainer):
     def log(self, logs, *args, **kwargs):  # type: ignore[override]
         logs = dict(logs)
         if "loss" in logs:
+            # Log losses
             if self._last_total_loss is not None:
                 logs.setdefault("total_loss", self._last_total_loss)
             if self._last_policy_loss is not None:
                 logs.setdefault("policy_loss", self._last_policy_loss)
             if self._last_wdl_loss is not None:
                 logs.setdefault("wdl_loss", self._last_wdl_loss)
-            if self._last_illegality_loss is not None:
-                logs.setdefault("illegality_loss", self._last_illegality_loss)
+            if self._last_illegality_head_loss is not None:
+                logs.setdefault("illegality_head_loss",
+                                self._last_illegality_head_loss)
+            if self._last_masked_token_loss is not None:
+                logs.setdefault("masked_token_loss",
+                                self._last_masked_token_loss)
+            if self._last_move_winrate_loss is not None:
+                logs.setdefault("move_winrate_loss",
+                                self._last_move_winrate_loss)
+
+            # Log metrics
+            if self._last_illegality_rate is not None:
+                logs.setdefault("illegality_rate",
+                                self._last_illegality_rate)
+            if self._last_illegality_head_accuracy is not None:
+                logs.setdefault("illegality_head_accuracy",
+                                self._last_illegality_head_accuracy)
+            if self._last_masked_token_accuracy is not None:
+                logs.setdefault("masked_token_accuracy",
+                                self._last_masked_token_accuracy)
+            if self._last_best_move_prob is not None:
+                logs.setdefault("best_move_prob",
+                                self._last_best_move_prob)
+            if self._last_value_mae is not None:
+                logs.setdefault("value_mae",
+                                self._last_value_mae)
+            if self._last_move_winrate_mae is not None:
+                logs.setdefault("move_winrate_mae",
+                                self._last_move_winrate_mae)
         super().log(logs, *args, **kwargs)
 
 
@@ -150,12 +259,16 @@ class EloEvaluationCallback(TrainerCallback):
         self,
         eval_dataset,
         frequency: int,
+        tokenizer,
         batch_size: int = EVAL_BATCH_SIZE,
+        csv_path=None,
     ) -> None:
         super().__init__()
         self.eval_dataset = eval_dataset
         self.frequency = max(0, int(frequency))
+        self.tokenizer = tokenizer
         self.batch_size = batch_size
+        self.csv_path = csv_path
         self.trainer: Optional[Trainer] = None
         self._last_step_logged: int = -1
 
@@ -184,6 +297,8 @@ class EloEvaluationCallback(TrainerCallback):
             model=model,
             batch_size=self.batch_size,
             dataset=self.eval_dataset,
+            tokenizer=self.tokenizer,
+            csv_path=self.csv_path,
         )
         if was_training:
             model.train()
@@ -210,46 +325,14 @@ def train() -> None:
     tokenizer = create_tokenizer()
     vocab_size = len(tokenizer.get_vocab())
     pad_token_id = tokenizer.token_to_id("[PAD]")
-    act_token_id = tokenizer.token_to_id("<ACT>")
-    if act_token_id is None:
-        raise ValueError("Tokenizer is missing the <ACT> token")
-    think_token_id = tokenizer.token_to_id("<THINK>")
-    if think_token_id is None:
-        raise ValueError("Tokenizer is missing the <THINK> token")
-    print(
-        f"Tokenizer created - vocab size: {vocab_size}, pad token id: {pad_token_id}")
+    mask_token_id = tokenizer.token_to_id("[MASK]")
 
-    processed_path = Path(PROCESSED_DATASET_DIR)
-    if not processed_path.exists():
-        raise FileNotFoundError(
-            f"Processed dataset not found at '{processed_path}'. "
-            "Run process.py first to generate it."
-        )
-
-    print(f"Loading preprocessed dataset from '{processed_path}'...")
-
-    # hf_dataset = load_from_disk(str(processed_path))
-    data_files = sorted(str(path)
-                        for path in processed_path.glob("data-*.arrow"))
-
-    hf_dataset = load_dataset(
-        "arrow",
-        data_files=data_files,
-        split="train",
-        streaming=True,
-    )
-
-    # optional: approximate shuffle with a buffer
-    hf_dataset = hf_dataset.shuffle(buffer_size=100_000)
-
-    if not isinstance(hf_dataset, HFIterableDataset):
-        raise TypeError(
-            "Expected streaming dataset when loading training data")
-
-    train_dataset = ChessPolicyDataset(
-        hf_dataset,
-        act_token_id=act_token_id,
-        think_token_id=think_token_id,
+    print(f"Loading action value dataset from: {DATASET_PATH}...")
+    train_dataset = create_action_value_dataset(
+        dataset_path=DATASET_PATH,
+        tokenizer=tokenizer,
+        shuffle_buffer_size=SHUFFLE_BUFFER_SIZE,
+        seed=42,
     )
 
     per_device_batch_size = 1024
@@ -261,43 +344,68 @@ def train() -> None:
         "Training schedule:",
         f"batch_size={per_device_batch_size}",
         f"learning_rate={schedule.learning_rate}",
+        f"warmup_steps={schedule.warmup_steps}",
         f"save_steps={schedule.save_steps}",
         f"logging_steps={schedule.logging_steps}",
         f"elo_eval_steps={schedule.elo_eval_steps}",
     )
     eval_dataset = None
-    eval_path = Path(DEFAULT_EVAL_DATASET_DIR)
-    if eval_path.exists():
+    csv_path = DEFAULT_EVAL_CSV_PATH
+    if csv_path.exists():
         print(
-            f"Loading evaluation dataset from '{eval_path}' once for Elo tracking...")
-        eval_dataset = load_from_disk(str(eval_path))
+            f"Loading evaluation puzzles from '{csv_path}'...")
+        eval_dataset = None  # Will load from CSV
     else:
         print(
-            f"Evaluation dataset not found at '{eval_path}'. "
+            f"CSV file not found at '{csv_path}'. "
             "Elo evaluations during training will be skipped."
         )
 
-    print("Creating model configuration...")
-    config = GPT2Config(
-        vocab_size=vocab_size,
-        n_positions=MAX_SEQ_LENGTH,
-        n_ctx=MAX_SEQ_LENGTH,
-        n_embd=768,
-        n_layer=18,
-        n_head=12,
-        resid_pdrop=DROPOUT,
-        embd_pdrop=DROPOUT,
-        attn_pdrop=DROPOUT,
-        pad_token_id=pad_token_id,
-    )
-    config.policy_dim = len(policy_index)
-    print(f"Model config created - policy dimension: {config.policy_dim}")
+    # Load model from checkpoint or create new
+    if RESUME_FROM_CHECKPOINT:
+        print(f"Loading model from checkpoint: {RESUME_FROM_CHECKPOINT}")
+        model = ChessPolicyValueModel.from_pretrained_compiled(
+            RESUME_FROM_CHECKPOINT)
+        model.config.use_cache = False
+        print(
+            f"Model loaded from checkpoint with {sum(p.numel() for p in model.parameters()):,} parameters")
+    else:
+        print("Creating model configuration...")
+        config = LlamaConfig(
+            vocab_size=vocab_size,
+            max_position_embeddings=MAX_SEQ_LENGTH,
+            hidden_size=768,
+            intermediate_size=768,
+            num_hidden_layers=20,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            attention_dropout=DROPOUT,
+            hidden_dropout=DROPOUT,
+            pad_token_id=pad_token_id,
+        )
+        config.policy_dim = len(policy_index)
+        config.num_thinking_tokens = NUM_THINKING_TOKENS
 
-    print("Initializing ChessGPT2 model...")
-    model = ChessGPT2PolicyValue(config)
-    model.config.use_cache = False
-    print(
-        f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
+        # Sanity check: ensure MAX_SEQ_LENGTH is large enough
+        min_seq_length = 72 + NUM_THINKING_TOKENS
+        if MAX_SEQ_LENGTH < min_seq_length:
+            raise ValueError(
+                f"MAX_SEQ_LENGTH ({MAX_SEQ_LENGTH}) is too small for "
+                f"72 board tokens + {NUM_THINKING_TOKENS} thinking tokens = {min_seq_length} tokens"
+            )
+
+        print(f"Model config created - policy dimension: {config.policy_dim}")
+        if NUM_THINKING_TOKENS > 0:
+            print(
+                f"✓ Thinking tokens enabled: {NUM_THINKING_TOKENS} tokens (total sequence length: {72 + NUM_THINKING_TOKENS})")
+        else:
+            print("✓ Thinking tokens disabled (sequence length: 72)")
+
+        print("Initializing Chess LLaMA model...")
+        model = ChessPolicyValueModel(config)
+        model.config.use_cache = False
+        print(
+            f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
 
     if hasattr(torch, "compile"):
         try:
@@ -313,6 +421,7 @@ def train() -> None:
 
         per_device_train_batch_size=per_device_batch_size,
         learning_rate=schedule.learning_rate,
+        warmup_steps=schedule.warmup_steps,
         weight_decay=0,
         max_grad_norm=1.0,
         bf16=True,
@@ -322,28 +431,37 @@ def train() -> None:
         logging_strategy="steps",
         logging_steps=schedule.logging_steps,
         report_to=["wandb"],
-        run_name="chessformer-gpt2-policy",
+        run_name="testz",
         remove_unused_columns=False,
 
-        dataloader_num_workers=8,
-        dataloader_prefetch_factor=1,
-        dataloader_pin_memory=True,
-        dataloader_persistent_workers=True,
+        # dataloader_num_workers=8,
+        # dataloader_prefetch_factor=1,
+        # dataloader_pin_memory=True,
+
+        # dataloader_num_workers=2,
+        # dataloader_prefetch_factor=1,
+        # dataloader_pin_memory=False,
+
         max_steps=schedule.max_steps,
+        ignore_data_skip=True,  # Skip dataloader state restoration for streaming datasets
     )
     print(
-        f"Training config: {training_args.num_train_epochs} epochs, batch size {training_args.per_device_train_batch_size}, "
-        f"lr {training_args.learning_rate}")
+        f"Training config: {training_args.num_train_epochs} epochs, "
+        f"batch_size={training_args.per_device_train_batch_size}, "
+        f"lr={training_args.learning_rate}")
     print(
         "Effective schedule:",
         f"max_steps={training_args.max_steps}",
+        f"warmup_steps={training_args.warmup_steps}",
         f"save_steps={training_args.save_steps}",
         f"logging_steps={training_args.logging_steps}",
         f"elo_eval_steps={schedule.elo_eval_steps}",
     )
 
     print("Creating trainer...")
-    data_collator = ChessPolicyCollator()
+    # Only enable token masking if MASKED_TOKEN_LOSS_WEIGHT > 0
+    effective_mask_token_id = mask_token_id if MASKED_TOKEN_LOSS_WEIGHT > 0 else None
+    data_collator = ChessPolicyCollator(mask_token_id=effective_mask_token_id)
 
     trainer = TrackingTrainer(
         model=model,
@@ -352,7 +470,7 @@ def train() -> None:
         data_collator=data_collator,
     )
 
-    if eval_dataset is not None and schedule.elo_eval_steps > 0:
+    if csv_path.exists() and schedule.elo_eval_steps > 0:
         print(
             f"Registering Elo evaluation callback every {schedule.elo_eval_steps} steps "
             f"(batch size {EVAL_BATCH_SIZE})"
@@ -361,12 +479,18 @@ def train() -> None:
             eval_dataset=eval_dataset,
             frequency=schedule.elo_eval_steps,
             batch_size=EVAL_BATCH_SIZE,
+            tokenizer=tokenizer,
+            csv_path=csv_path,
         )
         elo_callback.attach_trainer(trainer)
         trainer.add_callback(elo_callback)
 
     print("Starting training...")
-    trainer.train()
+    if RESUME_FROM_CHECKPOINT:
+        print(f"Resuming from checkpoint: {RESUME_FROM_CHECKPOINT}")
+        trainer.train(resume_from_checkpoint=RESUME_FROM_CHECKPOINT)
+    else:
+        trainer.train()
     # trainer.save_model(OUTPUT_DIR)
     # trainer.save_state()
     print(f"Training complete. Final model saved to {OUTPUT_DIR}")

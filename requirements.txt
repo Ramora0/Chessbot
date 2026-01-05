@@ -1,0 +1,10 @@
+chess
+matplotlib
+numpy
+pygame
+torch
+datasets
+tokenizers
+tqdm
+transformers[torch]
+wandb

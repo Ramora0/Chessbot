@@ -24,7 +24,7 @@ BATCH_SIZE = 2_048
 POLICY_MOVES: List[str] = policy_index
 POLICY_SIZE = len(POLICY_MOVES)
 MOVE_TO_INDEX = {move: idx for idx, move in enumerate(POLICY_MOVES)}
-EXPECTED_SEQ_LEN = 72
+EXPECTED_SEQ_LEN = 70
 
 
 def chunked(iterable: List[dict], size: int) -> Iterable[List[dict]]:
@@ -125,12 +125,6 @@ def main() -> None:
 
     print("Loading tokenizer...")
     tokenizer = create_tokenizer()
-    act_token_id = tokenizer.token_to_id("<ACT>")
-    if act_token_id is None:
-        raise ValueError("Tokenizer does not contain the <ACT> token")
-    think_token_id = tokenizer.token_to_id("<THINK>")
-    if think_token_id is None:
-        raise ValueError("Tokenizer does not contain the <THINK> token")
 
     processed_records: List[dict] = []
     for chunk in chunked(raw_examples, BATCH_SIZE):
@@ -141,12 +135,6 @@ def main() -> None:
         for item, encoding in zip(chunk, encodings):
             item.pop("fen", None)
             ids = list(encoding.ids)
-            if not ids:
-                raise ValueError("Empty tokenized sequence encountered during evaluation preprocessing")
-
-            while ids and ids[-1] in (act_token_id, think_token_id):
-                ids.pop()
-            ids.extend((think_token_id, act_token_id))
             if len(ids) != EXPECTED_SEQ_LEN:
                 raise ValueError(
                     f"Processed sequence length {len(ids)} does not match expected {EXPECTED_SEQ_LEN}"

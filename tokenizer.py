@@ -30,8 +30,6 @@ _CASTLING_TOKENS = {c: f"{c}-c" for c in _CASTLING_ORDER}
 _CASTLING_EMPTY = "e-c"
 _EN_PASSANT_EMPTY = "e-ep"
 _EN_PASSANT_SUFFIX = "-ep"
-_THINK_TOKEN = "<THINK>"
-_ACT_TOKEN = "<ACT>"
 
 
 def process_fen(fen: str) -> str:
@@ -46,7 +44,7 @@ def process_fen(fen: str) -> str:
         row_tokens = []
         for c in row:
             if c.isdigit():
-                row_tokens.extend(['e-p'] * int(c))
+                row_tokens.extend(_DIGIT_TOKENS[c])
             else:
                 row_tokens.append(f'{c}-p')
         spaced_line = ' '.join(row_tokens)
@@ -74,7 +72,7 @@ def process_fen(fen: str) -> str:
     # Sixth part (fullmove): add -fm
     # fullmove = parts[5] + '-fm'
 
-    return f"{board_result} {turn} {castling} {en_passant} {_THINK_TOKEN} {_ACT_TOKEN}"
+    return f"{board_result} {turn} {castling} {en_passant}"
 
 
 def process_fen_batch(fens: Iterable[str]) -> List[str]:
@@ -117,7 +115,7 @@ def process_fen_batch(fens: Iterable[str]) -> List[str]:
         )
 
         append_result(
-            f"{board_str} {turn_token} {castling_str} {en_passant_token} {_THINK_TOKEN} {_ACT_TOKEN}"
+            f"{board_str} {turn_token} {castling_str} {en_passant_token}"
         )
 
     return results
@@ -157,9 +155,6 @@ def create_vocabulary():
     # for i in range(1, 401):
     #     vocab.add(f"{i}-fm")
 
-    vocab.add(_THINK_TOKEN)
-    vocab.add(_ACT_TOKEN)
-
     return sorted(vocab)
 
 
@@ -169,7 +164,7 @@ def create_tokenizer():
     vocab_dict = {token: i for i, token in enumerate(vocab_list)}
 
     # Add essential special tokens only
-    special_tokens = ["[PAD]", "[UNK]"]
+    special_tokens = ["[PAD]", "[UNK]", "[MASK]"]
     for token in special_tokens:
         vocab_dict[token] = len(vocab_dict)
 
