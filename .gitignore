@@ -2,3 +2,4 @@ data/puzzles.csv
 .venv/
 eval/
 __pycache__/
+.claude/
