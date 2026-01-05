@@ -1,59 +1,114 @@
+#!/usr/bin/env python
 """
-Test script to debug the policy loss computation.
+Check for duplicate FENs in the action value dataset.
 """
 
+from pathlib import Path
+from collections import Counter
 from datasets import load_from_disk
-from action_value_dataset import ActionValueDataset
-from tokenizer import create_tokenizer
+from tqdm.auto import tqdm
 
+# Which dataset to check
 DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value"
+# DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value_sharded"
+# DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value_1shard"
 
-# First, look at raw dataset
-print("=" * 60)
-print("RAW DATASET (before ActionValueDataset processing)")
-print("=" * 60)
-raw_dataset = load_from_disk(DATASET_PATH).to_iterable_dataset()
-example = next(iter(raw_dataset))
+# How many examples to check (set to None to check all)
+MAX_EXAMPLES = None  # Change to e.g., 100_000 for faster testing
 
-fen = example["fen"]
-moves = example["moves"]
-p_wins = example["p_win"]
 
-print(f"FEN: {fen}")
-print(f"\nRaw win% values (sorted):")
-move_wins = sorted(zip(moves, p_wins), key=lambda x: x[1], reverse=True)
-for move, win_pct in move_wins[:10]:
-    print(f"  {move:6s}: {win_pct*100:6.2f}%")
-if len(move_wins) > 10:
-    print(f"  ... and {len(move_wins) - 10} more moves")
+def check_duplicates(dataset_path: str, max_examples: int = None):
+    """
+    Check for duplicate FENs in the dataset.
 
-# Now look at processed dataset
-print("\n" + "=" * 60)
-print("PROCESSED (after ActionValueDataset)")
-print("=" * 60)
+    Args:
+        dataset_path: Path to the HF dataset directory
+        max_examples: Maximum number of examples to check (None = all)
+    """
+    print(f"Loading dataset from: {dataset_path}")
 
-tokenizer = create_tokenizer()
-processed_dataset = ActionValueDataset(
-    dataset_path=DATASET_PATH,
-    tokenizer=tokenizer,
-    streaming=True,
-    shuffle_buffer_size=0,
-)
+    # Load dataset (non-streaming to get length)
+    try:
+        dataset = load_from_disk(dataset_path)
+        total_examples = len(dataset)
+        print(f"Dataset size: {total_examples:,} examples")
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        print("Trying streaming mode...")
+        from datasets import load_dataset
+        import glob
+        dataset_dir = Path(dataset_path)
+        arrow_files = glob.glob(str(dataset_dir / "**" / "*.arrow"), recursive=True)
+        if not arrow_files:
+            raise ValueError(f"No arrow files found in {dataset_path}")
+        dataset = load_dataset("arrow", data_files=arrow_files, split="train", streaming=True)
+        total_examples = None
+        print("Using streaming mode (size unknown)")
 
-processed = next(iter(processed_dataset))
-policy = processed["policy"]
+    # Track FENs
+    fen_counter = Counter()
+    examples_checked = 0
+    duplicates_found = 0
 
-print(f"Policy tensor shape: {policy.shape}")
-print(f"Policy min: {policy.min().item():.4f}")
-print(f"Policy max: {policy.max().item():.4f}")
+    # Determine how many to check
+    check_limit = max_examples if max_examples is not None else total_examples
 
-# Show legal moves (policy >= -0.99, since -1 is illegal)
-legal_mask = policy > -0.99
-legal_values = policy[legal_mask]
-print(f"\nLegal moves count: {legal_mask.sum().item()}")
-print(f"Legal move values - min: {legal_values.min().item():.4f}, max: {legal_values.max().item():.4f}")
+    print(f"Checking for duplicates (limit: {check_limit or 'all'})...")
+    print("(Will print immediately when duplicates are found)\n")
 
-# The problem: after normalization, best move = 0, others are negative
-# So when model.py checks (policy >= 0), only the best move is "legal"!
-print(f"\nMoves with policy >= 0: {(policy >= 0).sum().item()}")
-print(f"Moves with policy > -0.99: {(policy > -0.99).sum().item()}")
+    # Iterate through dataset
+    pbar = tqdm(total=check_limit, desc="Checking FENs", unit="examples")
+
+    for example in dataset:
+        fen = example["fen"]
+        fen_counter[fen] += 1
+
+        # Print immediately when a duplicate is found
+        if fen_counter[fen] == 2:
+            duplicates_found += 1
+            pbar.write(f"DUPLICATE #{duplicates_found}: {fen} (first seen at some earlier position)")
+        elif fen_counter[fen] > 2:
+            pbar.write(f"  Additional occurrence of: {fen} (now seen {fen_counter[fen]} times)")
+
+        examples_checked += 1
+        pbar.update(1)
+
+        if max_examples is not None and examples_checked >= max_examples:
+            break
+
+    pbar.close()
+
+    if duplicates_found == 0:
+        print("\n✓ No duplicates found!")
+
+    # Analyze results
+    print(f"\n{'='*60}")
+    print(f"RESULTS")
+    print(f"{'='*60}")
+    print(f"Total examples checked: {examples_checked:,}")
+    print(f"Unique FENs: {len(fen_counter):,}")
+    print(f"Duplicate FENs: {sum(1 for count in fen_counter.values() if count > 1):,}")
+
+    # Find most duplicated FENs
+    most_common = fen_counter.most_common(10)
+    print(f"\nTop 10 most frequent FENs:")
+    for fen, count in most_common:
+        if count > 1:
+            print(f"  {count:4d}x: {fen}")
+
+    # Distribution of duplicates
+    duplicate_counts = Counter(count for count in fen_counter.values() if count > 1)
+    if duplicate_counts:
+        print(f"\nDuplicate distribution:")
+        for count, freq in sorted(duplicate_counts.items()):
+            print(f"  {freq:,} FENs appear {count} times")
+
+    # Calculate duplicate percentage
+    total_duplicates = sum(count - 1 for count in fen_counter.values() if count > 1)
+    duplicate_percentage = (total_duplicates / examples_checked) * 100
+    print(f"\nDuplicate percentage: {duplicate_percentage:.2f}%")
+    print(f"(i.e., {total_duplicates:,} / {examples_checked:,} examples are duplicates)")
+
+
+if __name__ == "__main__":
+    check_duplicates(DATASET_PATH, max_examples=MAX_EXAMPLES)

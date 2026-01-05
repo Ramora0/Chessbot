@@ -22,7 +22,7 @@ from functools import partial
 
 import numpy as np
 import chess
-from datasets import load_dataset, IterableDataset as HFIterableDataset
+from datasets import load_from_disk, IterableDataset as HFIterableDataset
 
 from policy_index import policy_index
 from tokenizer import process_fen
@@ -62,23 +62,9 @@ def create_action_value_dataset(
 
     print(f"Loading dataset from {dataset_path} in streaming mode...")
 
-    # Load as IterableDataset directly from local path
-    # This matches how MaxLeGrec/ChessFENS is loaded (streaming from the start)
-    import glob
-    dataset_dir = Path(dataset_path)
-
-    # Load arrow files directly
-    arrow_files = glob.glob(str(dataset_dir / "**" / "*.arrow"), recursive=True)
-    if not arrow_files:
-        raise ValueError(f"No arrow files found in {dataset_path}")
-
-    print(f"Found {len(arrow_files)} arrow files")
-    dataset = load_dataset(
-        "arrow",
-        data_files=arrow_files,
-        split="train",
-        streaming=True,
-    )
+    # Load dataset and convert to streaming mode
+    dataset = load_from_disk(dataset_path)
+    dataset = dataset.to_iterable_dataset()
 
     print(f"Loaded streaming dataset: {type(dataset).__name__}")
 
@@ -87,8 +73,6 @@ def create_action_value_dataset(
     if shuffle_buffer_size > 0:
         print(f"Adding shuffle with buffer size {shuffle_buffer_size}")
         dataset = dataset.shuffle(buffer_size=shuffle_buffer_size, seed=seed)
-    else:
-        print("Shuffling disabled (shuffle_buffer_size=0)")
 
     # Apply transformation lazily - HF handles worker sharding correctly
     transform_fn = partial(
@@ -100,6 +84,7 @@ def create_action_value_dataset(
     dataset = dataset.map(transform_fn)
 
     return dataset
+
 
 def _transform_example(
     example: dict,

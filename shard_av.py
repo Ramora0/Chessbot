@@ -5,8 +5,8 @@ Shard the action_value dataset for multi-worker data loading.
 from datasets import load_from_disk
 
 DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value"
-OUTPUT_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value_sharded"
-NUM_SHARDS = 8
+OUTPUT_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value_1shard"
+NUM_SHARDS = 1  # Single shard to eliminate boundary effects
 
 print(f"Loading dataset from '{DATASET_PATH}'...")
 dataset = load_from_disk(DATASET_PATH)

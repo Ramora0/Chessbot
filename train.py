@@ -28,8 +28,8 @@ DROPOUT = 0.1
 # Set to 0 to disable thinking tokens (72 board tokens + thinking tokens)
 NUM_THINKING_TOKENS = 0
 MAX_SEQ_LENGTH = 256  # Must be >= 72 + NUM_THINKING_TOKENS
-DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value_sharded"
-SHUFFLE_BUFFER_SIZE = 0  # Set to 0 to disable shuffling for debugging
+DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value"
+SHUFFLE_BUFFER_SIZE = 100_000
 ELO_EVAL_STEPS = 4000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
@@ -434,9 +434,14 @@ def train() -> None:
         run_name="testz",
         remove_unused_columns=False,
 
-        dataloader_num_workers=0,  # Single-process for debugging
-        dataloader_prefetch_factor=None,  # Not used with num_workers=0
-        dataloader_pin_memory=True,
+        # dataloader_num_workers=8,
+        # dataloader_prefetch_factor=1,
+        # dataloader_pin_memory=True,
+
+        # dataloader_num_workers=2,
+        # dataloader_prefetch_factor=1,
+        # dataloader_pin_memory=False,
+
         max_steps=schedule.max_steps,
         ignore_data_skip=True,  # Skip dataloader state restoration for streaming datasets
     )
