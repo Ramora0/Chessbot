@@ -23,7 +23,7 @@ from evaluation_puzzle import evaluate_model_elo, DEFAULT_EVAL_CSV_PATH
 from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 
-OUTPUT_DIR = "new"
+OUTPUT_DIR = "test"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 256  # Board tokens: 72
 DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value"
@@ -378,9 +378,9 @@ def train() -> None:
         config = LlamaConfig(
             vocab_size=vocab_size,
             max_position_embeddings=MAX_SEQ_LENGTH,
-            hidden_size=1024,
-            intermediate_size=1024,
-            num_hidden_layers=36,
+            hidden_size=768,
+            intermediate_size=768,
+            num_hidden_layers=20,
             num_attention_heads=8,
             num_key_value_heads=8,
             attention_dropout=DROPOUT,
