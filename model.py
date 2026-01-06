@@ -130,15 +130,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self._disable_causal_mask()
         hidden_size = config.hidden_size
 
-        # Thinking tokens - learnable embeddings for additional compute
-        # Set to 0 to disable thinking tokens
-        self.num_thinking_tokens = getattr(config, 'num_thinking_tokens', 64)
-        if self.num_thinking_tokens > 0:
-            self.thinking_tokens = nn.Parameter(
-                torch.randn(1, self.num_thinking_tokens, hidden_size) * 0.02
-            )
-            self._thinking_tokens_logged = False  # For one-time logging
-
         # Multi-task attention pooling (shared K/V, task-specific queries)
         # WDL head now predicts win% in 128 bins (0.0 to 1.0)
         self.num_value_bins = 128
@@ -249,30 +240,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         input_embeds = self.transformer.embed_tokens(input_ids)
         original_seq_len = input_embeds.size(1)
 
-        # Append thinking tokens BEFORE transformer processing (if enabled)
-        if self.num_thinking_tokens > 0:
-            thinking_tokens = self.thinking_tokens.expand(batch_size, -1, -1)
-            input_embeds = torch.cat([input_embeds, thinking_tokens], dim=1)
-
-            # Sanity check: verify thinking tokens were added
-            expected_seq_len = original_seq_len + self.num_thinking_tokens
-            actual_seq_len = input_embeds.size(1)
-            if actual_seq_len != expected_seq_len:
-                raise RuntimeError(
-                    f"Thinking tokens concatenation failed! "
-                    f"Expected seq_len={expected_seq_len} (board={original_seq_len} + thinking={self.num_thinking_tokens}), "
-                    f"but got {actual_seq_len}. Shape: {input_embeds.shape}"
-                )
-
-            # One-time log to confirm thinking tokens are active
-            if not self._thinking_tokens_logged and self.training:
-                print(
-                    f"✓ Thinking tokens active: {original_seq_len} board tokens + {self.num_thinking_tokens} thinking tokens = {actual_seq_len} total")
-                print(
-                    f"✓ All {actual_seq_len} tokens will be processed through transformer's {len(self.transformer.layers)} layers")
-                self._thinking_tokens_logged = True
-
-        # Process ALL tokens (board + thinking) through transformer
+        # Process all tokens through transformer
         transformer_outputs = self.transformer(
             inputs_embeds=input_embeds, **kwargs)
         hidden_states = transformer_outputs.last_hidden_state
@@ -381,10 +349,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         if masked_positions is not None and original_input_ids is not None:
             # Only compute loss on positions that were masked
             if masked_positions.any():
-                # Get logits only for board tokens (not thinking tokens)
-                # hidden_states[:, :original_input_ids.size(1)] extracts first 72 tokens
-                board_hidden = hidden_states[:, :original_input_ids.size(1), :]
-                lm_logits = self.lm_head(board_hidden)
+                # Get logits for all input tokens
+                lm_logits = self.lm_head(hidden_states)
 
                 # Move tensors to same device if needed
                 if original_input_ids.device != target_device:

@@ -25,7 +25,6 @@ This project implements a **searchless chess policy network** inspired by Google
 - Custom tokenization scheme for chess positions (FEN notation)
 - Multi-task attention pooling with shared K/V projections
 - Separate prediction heads for policy (1858 moves), WDL (3-way), and move evaluation
-- Configurable "thinking tokens" for extended computation
 
 **Training Infrastructure:**
 
@@ -222,7 +221,6 @@ RESUME_FROM_CHECKPOINT = None  # or "./outputs/checkpoint-10000"
 
 # Training hyperparameters (optional - defaults are good)
 DROPOUT = 0.1
-NUM_THINKING_TOKENS = 0
 MAX_SEQ_LENGTH = 256
 ```
 
@@ -288,7 +286,7 @@ python train.py
 
 - **Base Model**: LLaMA-style decoder-only transformer
 - **Default Configuration**: 768 hidden dimensions, 20 layers, 8 attention heads
-- **Context Length**: 256 tokens (72 for board + optional thinking tokens)
+- **Context Length**: 256 tokens (72 for board representation)
 - **Vocabulary**: Custom chess tokenizer for FEN positions
 
 ### Multi-Task Prediction Heads

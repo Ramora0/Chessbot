@@ -25,11 +25,9 @@ from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 OUTPUT_DIR = "new"
 DROPOUT = 0.1
-# Set to 0 to disable thinking tokens (72 board tokens + thinking tokens)
-NUM_THINKING_TOKENS = 0
-MAX_SEQ_LENGTH = 256  # Must be >= 72 + NUM_THINKING_TOKENS
+MAX_SEQ_LENGTH = 256  # Board tokens: 72
 DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value"
-SHUFFLE_BUFFER_SIZE = 100_000
+SHUFFLE_DATASET = True
 ELO_EVAL_STEPS = 4000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
@@ -44,6 +42,13 @@ BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
 # Set to None to start from scratch
 # RESUME_FROM_CHECKPOINT = "./outputs/checkpoint-90000"
 RESUME_FROM_CHECKPOINT = None
+
+
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
+
+torch.set_float32_matmul_precision("high")
 
 
 @dataclass
@@ -331,15 +336,14 @@ def train() -> None:
     train_dataset = create_action_value_dataset(
         dataset_path=DATASET_PATH,
         tokenizer=tokenizer,
-        shuffle_buffer_size=SHUFFLE_BUFFER_SIZE,
+        shuffle=SHUFFLE_DATASET,
         seed=42,
     )
 
     per_device_batch_size = 1024
     schedule = build_training_schedule(per_device_batch_size)
 
-    print(
-        f"Streaming dataset detected. Training will run for {schedule.max_steps} steps.")
+    print(f"Training will run for {schedule.max_steps} steps")
     print(
         "Training schedule:",
         f"batch_size={per_device_batch_size}",
@@ -374,9 +378,9 @@ def train() -> None:
         config = LlamaConfig(
             vocab_size=vocab_size,
             max_position_embeddings=MAX_SEQ_LENGTH,
-            hidden_size=768,
-            intermediate_size=768,
-            num_hidden_layers=20,
+            hidden_size=1024,
+            intermediate_size=1024,
+            num_hidden_layers=36,
             num_attention_heads=8,
             num_key_value_heads=8,
             attention_dropout=DROPOUT,
@@ -384,22 +388,8 @@ def train() -> None:
             pad_token_id=pad_token_id,
         )
         config.policy_dim = len(policy_index)
-        config.num_thinking_tokens = NUM_THINKING_TOKENS
-
-        # Sanity check: ensure MAX_SEQ_LENGTH is large enough
-        min_seq_length = 72 + NUM_THINKING_TOKENS
-        if MAX_SEQ_LENGTH < min_seq_length:
-            raise ValueError(
-                f"MAX_SEQ_LENGTH ({MAX_SEQ_LENGTH}) is too small for "
-                f"72 board tokens + {NUM_THINKING_TOKENS} thinking tokens = {min_seq_length} tokens"
-            )
 
         print(f"Model config created - policy dimension: {config.policy_dim}")
-        if NUM_THINKING_TOKENS > 0:
-            print(
-                f"✓ Thinking tokens enabled: {NUM_THINKING_TOKENS} tokens (total sequence length: {72 + NUM_THINKING_TOKENS})")
-        else:
-            print("✓ Thinking tokens disabled (sequence length: 72)")
 
         print("Initializing Chess LLaMA model...")
         model = ChessPolicyValueModel(config)
@@ -417,7 +407,7 @@ def train() -> None:
     print("Setting up training arguments...")
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        # num_train_epochs=1,
+        num_train_epochs=1,
 
         per_device_train_batch_size=per_device_batch_size,
         learning_rate=schedule.learning_rate,
@@ -434,16 +424,16 @@ def train() -> None:
         run_name="testz",
         remove_unused_columns=False,
 
-        # dataloader_num_workers=8,
-        # dataloader_prefetch_factor=1,
-        # dataloader_pin_memory=True,
+        dataloader_num_workers=10,
+        dataloader_prefetch_factor=2,
+        dataloader_pin_memory=True,
 
         # dataloader_num_workers=2,
         # dataloader_prefetch_factor=1,
         # dataloader_pin_memory=False,
 
-        max_steps=schedule.max_steps,
-        ignore_data_skip=True,  # Skip dataloader state restoration for streaming datasets
+        # max_steps=schedule.max_steps,
+        # ignore_data_skip=False,  # Allow dataloader state restoration when resuming
     )
     print(
         f"Training config: {training_args.num_train_epochs} epochs, "
