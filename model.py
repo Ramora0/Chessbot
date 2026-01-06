@@ -289,27 +289,34 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             raw_policy_loss = -expected_win_value.mean()
             policy_loss = self.policy_loss_weight * raw_policy_loss
 
-            # Loss 2: Sigmoid-based win% prediction (only on legal moves)
+            # Loss 2: Sigmoid-based absolute win% prediction for each move
             # This encourages the model to rank ALL moves correctly, not just pick the best one
-            # Recover original win% values from normalized policy
-            # Best move has value 0
-            max_p_win = -policy[policy_mask_bool].min()
-            true_winrates = policy.clone()
-            true_winrates[policy_mask_bool] = policy[policy_mask_bool] + max_p_win
+            # Convert relative values to absolute win% using position value
+            # policy: best move = 0, others = negative (win% lost vs best)
+            # true_value: position's absolute win% after best move is played
 
-            # Compute BCE loss only on legal moves using logits (safe for autocast)
-            legal_true_winrates = true_winrates[policy_mask_bool]
-            legal_policy_logits = policy_logits[policy_mask_bool]
+            if true_value is not None:
+                if true_value.device != target_device:
+                    true_value = true_value.to(target_device)
 
-            raw_move_winrate_loss = F.binary_cross_entropy_with_logits(
-                legal_policy_logits, legal_true_winrates, reduction='mean'
-            )
-            move_winrate_loss = self.move_winrate_loss_weight * raw_move_winrate_loss
+                # Convert relative to absolute: absolute_win%[move] = true_value + policy[move]
+                # Best move (policy=0): gets true_value
+                # Worse moves (policy<0): get true_value - loss
+                absolute_winrates = true_value.unsqueeze(1) + policy  # [batch, 1858]
 
-            # MAE metric for win% predictions (apply sigmoid for metric only)
-            legal_pred_winrates = torch.sigmoid(legal_policy_logits)
-            move_winrate_mae = torch.abs(
-                legal_pred_winrates - legal_true_winrates).mean()
+                # Compute BCE loss only on legal moves using logits (safe for autocast)
+                legal_absolute_winrates = absolute_winrates[policy_mask_bool]
+                legal_policy_logits = policy_logits[policy_mask_bool]
+
+                raw_move_winrate_loss = F.binary_cross_entropy_with_logits(
+                    legal_policy_logits, legal_absolute_winrates, reduction='mean'
+                )
+                move_winrate_loss = self.move_winrate_loss_weight * raw_move_winrate_loss
+
+                # MAE metric for win% predictions (apply sigmoid for metric only)
+                legal_pred_winrates = torch.sigmoid(legal_policy_logits)
+                move_winrate_mae = torch.abs(
+                    legal_pred_winrates - legal_absolute_winrates).mean()
 
         wdl_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None
