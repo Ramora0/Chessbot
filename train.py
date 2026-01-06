@@ -389,6 +389,9 @@ def train() -> None:
         )
         config.policy_dim = len(policy_index)
 
+        # Enable conformer architecture with 2D spatial convolutions
+        config.use_conformer = True
+
         print(f"Model config created - policy dimension: {config.policy_dim}")
 
         print("Initializing Chess LLaMA model...")

@@ -10,6 +10,7 @@ from transformers import LlamaModel
 from transformers.modeling_outputs import ModelOutput
 from transformers.models.llama.modeling_llama import LlamaPreTrainedModel
 
+from conformer_layers import ChessConformerModel
 from loss_weights import (
     POLICY_LOSS_WEIGHT,
     WDL_LOSS_WEIGHT,
@@ -124,7 +125,15 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         empty_token_ids_list = getattr(config, 'empty_token_ids', None)
         self.empty_token_ids = set(
             empty_token_ids_list) if empty_token_ids_list else None
-        self.transformer = LlamaModel(config)
+
+        # Use conformer or standard transformer based on config
+        use_conformer = getattr(config, 'use_conformer', False)
+        if use_conformer:
+            self.transformer = ChessConformerModel(config)
+            print("Using ChessConformerModel with 2D spatial convolutions")
+        else:
+            self.transformer = LlamaModel(config)
+
         self._disable_causal_mask()
         hidden_size = config.hidden_size
 
@@ -217,7 +226,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
     def _disable_causal_mask(self) -> None:
         for block in self.transformer.layers:
-            block.self_attn.is_causal = False
+            # Handle both LlamaDecoderLayer and ChessConformerLayer
+            if hasattr(block, 'self_attn'):
+                block.self_attn.is_causal = False
 
     def forward(
         self,
