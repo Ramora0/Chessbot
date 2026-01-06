@@ -19,6 +19,46 @@ from loss_weights import (
 )
 
 
+def compute_geometric_bias_matrix(
+    bias_params: torch.Tensor,  # [num_heads, 15, 15]
+    device: torch.device
+) -> torch.Tensor:  # [num_heads, 70, 70]
+    """
+    Pre-compute 70×70 attention bias matrix from 15×15 displacement biases.
+
+    For board squares i→j, computes displacement (Δrow, Δcol) and looks up
+    bias_params[:, Δrow+7, Δcol+7]. Metadata tokens (64-69) get zero bias.
+
+    Example: e2 (pos 54) → e4 (pos 38): Δrow=-2, Δcol=0 → bias_params[:, 5, 7]
+    """
+    num_heads = bias_params.shape[0]
+    bias_matrix = torch.zeros(num_heads, 70, 70, device=device)
+
+    # For board squares (0-63): compute geometric biases
+    for i in range(64):
+        row_i, col_i = i // 8, i % 8  # Position 0 = (0,0) = a8
+
+        for j in range(64):
+            row_j, col_j = j // 8, j % 8
+
+            # Displacement: how to get from square i to square j
+            # Directional: i→j uses different bias than j→i
+            row_offset = row_j - row_i  # Range: [-7, 7]
+            col_offset = col_j - col_i  # Range: [-7, 7]
+
+            # Map to bias matrix indices [0, 14]
+            bias_row = row_offset + 7
+            bias_col = col_offset + 7
+
+            # Lookup bias for all heads
+            bias_matrix[:, i, j] = bias_params[:, bias_row, bias_col]
+
+    # Metadata tokens (64-69): remain zero (no geometric constraints)
+    # This allows turn/castling/en passant to attend freely
+
+    return bias_matrix
+
+
 class MultiTaskAttentionPooling(nn.Module):
     """Multi-task attention pooling with shared K/V projections.
 
@@ -137,6 +177,22 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         # Token 69: en passant square
         self.position_embeddings = nn.Embedding(70, hidden_size)
 
+        # Geometric attention biases: 15×15 for all displacement vectors
+        # Per-head biases allow each head to learn different spatial relationships
+        # (e.g., diagonal moves, knight moves, rank/file relationships)
+        num_heads = config.num_attention_heads  # 8
+        self.geometric_attention_bias = nn.Parameter(
+            torch.zeros(num_heads, 15, 15)
+        )
+
+        # Buffer to store pre-computed 70×70 bias matrix (recomputed if device changes)
+        self.register_buffer(
+            '_geometric_bias_matrix',
+            torch.zeros(num_heads, 70, 70),
+            persistent=False  # Don't save to checkpoint, recompute on load
+        )
+        self._bias_matrix_initialized = False
+
         # Multi-task attention pooling (shared K/V, task-specific queries)
         # WDL head now predicts win% in 128 bins (0.0 to 1.0)
         self.num_value_bins = 128
@@ -227,8 +283,63 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         return model
 
     def _disable_causal_mask(self) -> None:
-        for block in self.transformer.layers:
+        """Disable causal masking and inject geometric attention biases."""
+        for layer_idx, block in enumerate(self.transformer.layers):
             block.self_attn.is_causal = False
+
+            # Store reference to inject biases in attention forward pass
+            # We'll monkey-patch the attention module's forward method
+            original_forward = block.self_attn.forward
+
+            def forward_with_geometric_bias(
+                hidden_states,
+                attention_mask=None,
+                position_ids=None,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=False,
+                cache_position=None,
+                **kwargs
+            ):
+                # Get model's geometric bias matrix
+                # Access parent model via closure (self refers to ChessPolicyValueModel)
+                geometric_bias = self._geometric_bias_matrix  # [num_heads, 70, 70]
+
+                # Add geometric bias to attention_mask
+                # attention_mask shape: [batch, 1, seq_len, seq_len] or None
+                # geometric_bias shape: [num_heads, 70, 70]
+
+                if attention_mask is None:
+                    # Create attention_mask from geometric bias
+                    batch_size = hidden_states.shape[0]
+                    seq_len = hidden_states.shape[1]
+                    # Broadcast: [1, num_heads, seq_len, seq_len]
+                    attention_mask = geometric_bias.unsqueeze(0).expand(
+                        batch_size, -1, seq_len, seq_len
+                    )
+                else:
+                    # Add geometric bias to existing mask
+                    # attention_mask is [batch, 1, seq_len, seq_len]
+                    # Expand to [batch, num_heads, seq_len, seq_len]
+                    attention_mask = attention_mask.expand(
+                        -1, geometric_bias.shape[0], -1, -1
+                    )
+                    attention_mask = attention_mask + geometric_bias.unsqueeze(0)
+
+                # Call original attention forward with modified mask
+                return original_forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    **kwargs
+                )
+
+            # Replace the forward method
+            block.self_attn.forward = forward_with_geometric_bias
 
     def forward(
         self,
@@ -253,6 +364,19 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)  # [batch_size, seq_len]
         position_embeds = self.position_embeddings(position_ids)  # [batch_size, seq_len, hidden_size]
         input_embeds = input_embeds + position_embeds
+
+        # Lazily initialize geometric bias matrix on first forward pass
+        if not self._bias_matrix_initialized:
+            self._geometric_bias_matrix = compute_geometric_bias_matrix(
+                self.geometric_attention_bias,
+                device=input_embeds.device
+            )
+            self._bias_matrix_initialized = True
+
+        # Ensure bias matrix is on correct device (handles multi-GPU)
+        if self._geometric_bias_matrix.device != input_embeds.device:
+            self._geometric_bias_matrix = self._geometric_bias_matrix.to(input_embeds.device)
+            self._bias_matrix_initialized = True  # Mark as initialized for new device
 
         # Process all tokens through transformer
         transformer_outputs = self.transformer(
