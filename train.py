@@ -424,7 +424,7 @@ def train() -> None:
         run_name="testz",
         remove_unused_columns=False,
 
-        dataloader_num_workers=10,
+        dataloader_num_workers=16,
         dataloader_prefetch_factor=2,
         dataloader_pin_memory=True,
 

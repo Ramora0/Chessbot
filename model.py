@@ -185,13 +185,14 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             torch.zeros(num_heads, 15, 15)
         )
 
-        # Buffer to store pre-computed 70×70 bias matrix (recomputed if device changes)
+        # Note: We recompute the 70×70 bias matrix on each forward pass
+        # to avoid autograd graph issues. Stored in a non-persistent buffer
+        # that gets set during forward()
         self.register_buffer(
             '_geometric_bias_matrix',
             torch.zeros(num_heads, 70, 70),
-            persistent=False  # Don't save to checkpoint, recompute on load
+            persistent=False  # Don't save to checkpoint, recomputed each forward
         )
-        self._bias_matrix_initialized = False
 
         # Multi-task attention pooling (shared K/V, task-specific queries)
         # WDL head now predicts win% in 128 bins (0.0 to 1.0)
@@ -365,18 +366,13 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         position_embeds = self.position_embeddings(position_ids)  # [batch_size, seq_len, hidden_size]
         input_embeds = input_embeds + position_embeds
 
-        # Lazily initialize geometric bias matrix on first forward pass
-        if not self._bias_matrix_initialized:
-            self._geometric_bias_matrix = compute_geometric_bias_matrix(
-                self.geometric_attention_bias,
-                device=input_embeds.device
-            )
-            self._bias_matrix_initialized = True
-
-        # Ensure bias matrix is on correct device (handles multi-GPU)
-        if self._geometric_bias_matrix.device != input_embeds.device:
-            self._geometric_bias_matrix = self._geometric_bias_matrix.to(input_embeds.device)
-            self._bias_matrix_initialized = True  # Mark as initialized for new device
+        # Recompute geometric bias matrix on each forward pass to avoid autograd graph issues
+        # This is cheap (just indexing into 15x15 to create 70x70) and prevents
+        # "backward through graph a second time" errors
+        self._geometric_bias_matrix = compute_geometric_bias_matrix(
+            self.geometric_attention_bias,
+            device=input_embeds.device
+        )
 
         # Process all tokens through transformer
         transformer_outputs = self.transformer(
