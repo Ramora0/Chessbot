@@ -130,6 +130,13 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self._disable_causal_mask()
         hidden_size = config.hidden_size
 
+        # Learned positional embeddings for all tokens
+        # Tokens 0-63: board positions (a8, b8, ..., h1)
+        # Token 64: turn (w/b)
+        # Tokens 65-68: castling rights (K, Q, k, q)
+        # Token 69: en passant square
+        self.position_embeddings = nn.Embedding(70, hidden_size)
+
         # Multi-task attention pooling (shared K/V, task-specific queries)
         # WDL head now predicts win% in 128 bins (0.0 to 1.0)
         self.num_value_bins = 128
@@ -239,6 +246,13 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         batch_size = input_ids.size(0)
         input_embeds = self.transformer.embed_tokens(input_ids)
         original_seq_len = input_embeds.size(1)
+
+        # Add learned positional embeddings to all tokens
+        # This allows the model to instantly know each token's position (e.g., knight on f1 = position 61)
+        position_ids = torch.arange(original_seq_len, dtype=torch.long, device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)  # [batch_size, seq_len]
+        position_embeds = self.position_embeddings(position_ids)  # [batch_size, seq_len, hidden_size]
+        input_embeds = input_embeds + position_embeds
 
         # Process all tokens through transformer
         transformer_outputs = self.transformer(
