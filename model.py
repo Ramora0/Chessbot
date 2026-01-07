@@ -136,7 +136,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.task_head = MultiTaskAttentionPooling(
             hidden_size=hidden_size,
             task_output_dims={
-                'policy': self.policy_dim,  # Used for both softmax policy loss and sigmoid win% loss
+                'policy': self.policy_dim,  # Used for both softmax policy loss and regret prediction
                 'wdl': self.num_value_bins,  # 128 bins for win probability
                 'illegality': self.policy_dim,  # Separate head: predict legality for each move
             }
@@ -247,7 +247,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         # Multi-task attention pooling (single forward pass)
         task_outputs = self.task_head(hidden_states)
-        # Used for both softmax policy loss and sigmoid win% loss
+        # Used for both softmax policy loss and regret prediction
         policy_logits = task_outputs['policy']
         wdl_logits = task_outputs['wdl']
         # Separate head for legality prediction
@@ -257,7 +257,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         # Policy head has TWO losses on the SAME logits:
         # Loss 1: Softmax-based expected regret (original policy loss)
-        # Loss 2: Sigmoid-based win% prediction (encourages correct ranking of all moves)
+        # Loss 2: Direct regret prediction (encourages correct ranking of all moves)
         policy_loss: Optional[torch.Tensor] = None
         move_winrate_loss: Optional[torch.Tensor] = None
         move_winrate_mae: Optional[torch.Tensor] = None
@@ -289,34 +289,39 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             raw_policy_loss = -expected_win_value.mean()
             policy_loss = self.policy_loss_weight * raw_policy_loss
 
-            # Loss 2: Sigmoid-based absolute win% prediction for each move
+            # Loss 2: Regret prediction for each move
             # This encourages the model to rank ALL moves correctly, not just pick the best one
-            # Convert relative values to absolute win% using position value
+            # Convert logits to regret using -softplus(-x)/5
+            # For 0 regret (best move), x should be very high
             # policy: best move = 0, others = negative (win% lost vs best)
-            # true_value: position's absolute win% after best move is played
 
             if true_value is not None:
                 if true_value.device != target_device:
                     true_value = true_value.to(target_device)
 
-                # Convert relative to absolute: absolute_win%[move] = true_value + policy[move]
-                # Best move (policy=0): gets true_value
-                # Worse moves (policy<0): get true_value - loss
-                absolute_winrates = true_value.unsqueeze(1) + policy  # [batch, 1858]
+                # Convert policy values to regret: regret = -policy
+                # Best move (policy=0): regret = 0
+                # Worse moves (policy<0): regret > 0
+                target_regret = -policy  # [batch, 1858]
 
-                # Compute BCE loss only on legal moves using logits (safe for autocast)
-                legal_absolute_winrates = absolute_winrates[policy_mask_bool]
+                # Convert logits to predicted regret using -softplus(-x)/5
+                # For high x: -softplus(-x)/5 ≈ 0 (low regret, good move)
+                # For low x: -softplus(-x)/5 is negative, then more negative (high regret, bad move)
+                legal_target_regret = target_regret[policy_mask_bool]
                 legal_policy_logits = policy_logits[policy_mask_bool]
 
-                raw_move_winrate_loss = F.binary_cross_entropy_with_logits(
-                    legal_policy_logits, legal_absolute_winrates, reduction='mean'
+                # Predicted regret: -softplus(-x)/5
+                predicted_regret = -F.softplus(-legal_policy_logits) / 5.0
+
+                # MSE loss between predicted and target regret
+                raw_move_winrate_loss = F.mse_loss(
+                    predicted_regret, legal_target_regret, reduction='mean'
                 )
                 move_winrate_loss = self.move_winrate_loss_weight * raw_move_winrate_loss
 
-                # MAE metric for win% predictions (apply sigmoid for metric only)
-                legal_pred_winrates = torch.sigmoid(legal_policy_logits)
+                # MAE metric for regret predictions
                 move_winrate_mae = torch.abs(
-                    legal_pred_winrates - legal_absolute_winrates).mean()
+                    predicted_regret - legal_target_regret).mean()
 
         wdl_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None
@@ -463,16 +468,16 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         return ChessPolicyValueOutput(
             loss=loss,
-            # Used for both softmax policy loss and sigmoid win% loss
+            # Used for both softmax policy loss and regret prediction
             policy_logits=policy_logits,
             wdl_logits=wdl_logits,
             illegality_logits=illegality_logits,  # SEPARATE head for legality prediction
-            move_winrate_logits=policy_logits,  # Alias - sigmoid of policy_logits used for win%
+            move_winrate_logits=policy_logits,  # Alias - -softplus(-policy_logits)/5 used for regret
             policy_loss=policy_loss,  # Original softmax-based expected regret loss
             wdl_loss=wdl_loss,
             illegality_head_loss=illegality_head_loss,
             masked_token_loss=masked_token_loss,
-            move_winrate_loss=move_winrate_loss,  # New sigmoid-based win% prediction loss
+            move_winrate_loss=move_winrate_loss,  # Regret prediction loss (MSE)
             illegality_rate=illegality_rate,
             illegality_head_accuracy=illegality_head_accuracy,
             masked_token_accuracy=masked_token_accuracy,
