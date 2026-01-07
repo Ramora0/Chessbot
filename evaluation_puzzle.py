@@ -257,7 +257,8 @@ def evaluate_puzzles(
     verbose: bool = False,
     tokenizer=None,
     csv_path: Optional[str | Path] = None,
-) -> Tuple[List[Tuple[int, float]], EvaluationDetails]:
+    compute_both_sampling_modes: bool = False,
+) -> Tuple[List[Tuple[int, float]], Optional[List[Tuple[int, float]]], EvaluationDetails]:
     """Run the model on the evaluation dataset and collect per-puzzle statistics.
 
     For every puzzle we compute the probability the model selects the correct move
@@ -297,6 +298,7 @@ def evaluate_puzzles(
     model.eval()
 
     puzzle_probabilities: Dict[str, float] = defaultdict(lambda: 1.0)
+    puzzle_probabilities_greedy: Dict[str, float] = defaultdict(lambda: 1.0)
     puzzle_ratings: Dict[str, int] = {}
     puzzle_states: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     puzzle_state_counters: Dict[str, int] = defaultdict(int)
@@ -324,6 +326,11 @@ def evaluate_puzzles(
             selected_probs = probs.gather(
                 1, target_indices.unsqueeze(-1)).squeeze(-1)
 
+            # Greedy sampling - check if argmax equals target
+            if compute_both_sampling_modes:
+                greedy_predictions = masked_logits.argmax(dim=-1)  # [batch_size]
+                greedy_correct = (greedy_predictions == target_indices).float()  # [batch_size]
+
             # Filter legal moves on GPU before CPU transfer
             prob_mask = probs >= MOVE_PROB_THRESHOLD
             filtered_legal_masks = legal_masks & prob_mask
@@ -337,6 +344,8 @@ def evaluate_puzzles(
                 'target_indices': target_indices.cpu(),
                 'filtered_legal_masks': filtered_legal_masks.cpu(),
             }
+            if compute_both_sampling_modes:
+                batch_cpu['greedy_correct'] = greedy_correct.cpu()
 
             puzzle_ids = batch["puzzle_ids"]
             ratings = batch["ratings"]
@@ -350,6 +359,12 @@ def evaluate_puzzles(
 
                 prob = float(batch_cpu['selected_probs'][batch_index])
                 puzzle_probabilities[puzzle_id] *= prob
+
+                # Track greedy
+                if compute_both_sampling_modes:
+                    greedy_prob = float(batch_cpu['greedy_correct'][batch_index])
+                    puzzle_probabilities_greedy[puzzle_id] *= greedy_prob
+
                 puzzle_ratings[puzzle_id] = rating
 
                 target_idx = int(batch_cpu['target_indices'][batch_index])
@@ -395,10 +410,19 @@ def evaluate_puzzles(
                 )
                 puzzle_state_counters[puzzle_id] += 1
 
+    # Build probability-based results
     results: List[Tuple[int, float]] = []
     for puzzle_id in puzzle_order:
         combined_prob = puzzle_probabilities.get(puzzle_id, 0.0)
         results.append((puzzle_ratings.get(puzzle_id, 0), combined_prob))
+
+    # Build greedy results
+    results_greedy: Optional[List[Tuple[int, float]]] = None
+    if compute_both_sampling_modes:
+        results_greedy = []
+        for puzzle_id in puzzle_order:
+            combined_prob_greedy = puzzle_probabilities_greedy.get(puzzle_id, 0.0)
+            results_greedy.append((puzzle_ratings.get(puzzle_id, 0), combined_prob_greedy))
 
     details = EvaluationDetails(
         puzzle_order=puzzle_order,
@@ -407,7 +431,7 @@ def evaluate_puzzles(
         puzzle_states=dict(puzzle_states),
     )
 
-    return results, details
+    return (results, results_greedy, details) if compute_both_sampling_modes else (results, None, details)
 
 
 def _write_move_distribution_log(
@@ -499,16 +523,21 @@ def evaluate_model_elo(
     verbose: bool = False,
     tokenizer=None,
     csv_path: Optional[str | Path] = None,
-) -> Tuple[float, float, float]:
+    compute_both_sampling_modes: bool = False,
+) -> Tuple[float, float, float, Optional[float], Optional[float], Optional[float]]:
     """
     Run evaluation and return an Elo estimate, its standard error, and the
     expected puzzle solve percentage across the evaluation set.
 
     The estimator treats each puzzle solve probability as an independent Bernoulli
     trial under the Elo logistic model and fits the single Elo parameter R.
+
+    Returns:
+        Tuple of (elo_prob, elo_se_prob, solve_pct_prob, elo_greedy, elo_se_greedy, solve_pct_greedy)
+        Last 3 values are None if compute_both_sampling_modes=False.
     """
 
-    per_puzzle_results, eval_details = evaluate_puzzles(
+    per_puzzle_results, per_puzzle_results_greedy, eval_details = evaluate_puzzles(
         model=model,
         dataset_dir=dataset_dir,
         batch_size=batch_size,
@@ -517,6 +546,7 @@ def evaluate_model_elo(
         verbose=verbose,
         tokenizer=tokenizer,
         csv_path=csv_path,
+        compute_both_sampling_modes=compute_both_sampling_modes,
     )
 
     if not per_puzzle_results:
@@ -547,6 +577,21 @@ def evaluate_model_elo(
         init=init_rating,
     )
 
+    # Compute greedy ELO
+    elo_greedy, elo_se_greedy, solve_percentage_greedy = None, None, None
+    if compute_both_sampling_modes and per_puzzle_results_greedy is not None:
+        ratings_greedy = np.array([rating for rating, _ in per_puzzle_results_greedy], dtype=np.float64)
+        solve_probabilities_greedy = np.array([prob for _, prob in per_puzzle_results_greedy], dtype=np.float64)
+
+        expected_solved_greedy = float(np.sum(solve_probabilities_greedy))
+        solve_percentage_greedy = (expected_solved_greedy / total_puzzles * 100.0) if total_puzzles > 0 else float("nan")
+
+        elo_greedy, elo_se_greedy = estimate_elo_mle(
+            puzzle_ratings=ratings_greedy,
+            solve_probabilities=solve_probabilities_greedy,
+            init=init_rating,
+        )
+
     output_path = _write_move_distribution_log(
         details=eval_details,
         per_puzzle_results=per_puzzle_results,
@@ -559,14 +604,25 @@ def evaluate_model_elo(
 
     if total_puzzles > 0:
         print(
-            "Expected puzzle solve rate: "
+            "[Probability-based] Expected puzzle solve rate: "
             f"{solve_percentage:.2f}% "
             f"({expected_solved_puzzles:.2f}/{total_puzzles})"
         )
     else:
-        print("Expected puzzle solve rate: nan (no puzzles evaluated)")
+        print("[Probability-based] Expected puzzle solve rate: nan (no puzzles evaluated)")
 
-    return elo, elo_se, solve_percentage
+    # Print greedy results
+    if compute_both_sampling_modes and elo_greedy is not None:
+        if total_puzzles > 0:
+            print(
+                "[Greedy sampling] Expected puzzle solve rate: "
+                f"{solve_percentage_greedy:.2f}% "
+                f"({expected_solved_greedy:.2f}/{total_puzzles})"
+            )
+        else:
+            print("[Greedy sampling] Expected puzzle solve rate: nan (no puzzles evaluated)")
+
+    return elo, elo_se, solve_percentage, elo_greedy, elo_se_greedy, solve_percentage_greedy
 
 
 if __name__ == "__main__":

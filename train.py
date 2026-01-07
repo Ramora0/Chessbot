@@ -267,6 +267,7 @@ class EloEvaluationCallback(TrainerCallback):
         tokenizer,
         batch_size: int = EVAL_BATCH_SIZE,
         csv_path=None,
+        compute_both_sampling_modes: bool = True,
     ) -> None:
         super().__init__()
         self.eval_dataset = eval_dataset
@@ -274,6 +275,7 @@ class EloEvaluationCallback(TrainerCallback):
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.csv_path = csv_path
+        self.compute_both_sampling_modes = compute_both_sampling_modes
         self.trainer: Optional[Trainer] = None
         self._last_step_logged: int = -1
 
@@ -298,22 +300,29 @@ class EloEvaluationCallback(TrainerCallback):
 
         model = self.trainer.model
         was_training = model.training
-        elo, elo_se, solve_percentage = evaluate_model_elo(
+        elo, elo_se, solve_percentage, elo_greedy, elo_se_greedy, solve_percentage_greedy = evaluate_model_elo(
             model=model,
             batch_size=self.batch_size,
             dataset=self.eval_dataset,
             tokenizer=self.tokenizer,
             csv_path=self.csv_path,
+            compute_both_sampling_modes=self.compute_both_sampling_modes,
         )
         if was_training:
             model.train()
 
         metrics = {
             "eval_elo": float(elo),
-            "eval_elo_se": float(elo_se),
         }
         if not math.isnan(solve_percentage):
             metrics["eval_puzzle_accuracy"] = float(solve_percentage)
+
+        # Log greedy metrics
+        if self.compute_both_sampling_modes and elo_greedy is not None:
+            metrics["eval_elo_greedy"] = float(elo_greedy)
+            if not math.isnan(solve_percentage_greedy):
+                metrics["eval_puzzle_accuracy_greedy"] = float(solve_percentage_greedy)
+
         self.trainer.log(metrics)
         self._last_step_logged = step
 
@@ -463,7 +472,7 @@ def train() -> None:
     if csv_path.exists() and schedule.elo_eval_steps > 0:
         print(
             f"Registering Elo evaluation callback every {schedule.elo_eval_steps} steps "
-            f"(batch size {EVAL_BATCH_SIZE})"
+            f"(batch size {EVAL_BATCH_SIZE}, dual sampling mode enabled)"
         )
         elo_callback = EloEvaluationCallback(
             eval_dataset=eval_dataset,
@@ -471,6 +480,7 @@ def train() -> None:
             batch_size=EVAL_BATCH_SIZE,
             tokenizer=tokenizer,
             csv_path=csv_path,
+            compute_both_sampling_modes=True,
         )
         elo_callback.attach_trainer(trainer)
         trainer.add_callback(elo_callback)
