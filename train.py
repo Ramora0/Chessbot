@@ -397,8 +397,58 @@ def train() -> None:
         print("Initializing Chess LLaMA model...")
         model = ChessPolicyValueModel(config)
         model.config.use_cache = False
-        print(
-            f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
+
+        # Print detailed parameter breakdown
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"\nModel initialized with {total_params:,} total parameters")
+        print("\nParameter breakdown by component:")
+        print("-" * 80)
+
+        # Group parameters by component
+        param_groups = {}
+        for name, param in model.named_parameters():
+            parts = name.split('.')
+            if 'transformer' in parts:
+                if 'embed_tokens' in name:
+                    group = 'Embeddings'
+                elif 'layers' in name:
+                    if 'self_attn' in name:
+                        group = 'Attention (all layers)'
+                    elif 'ffn1' in name:
+                        group = 'FFN1 (all layers)'
+                    elif 'ffn2' in name:
+                        group = 'FFN2 (all layers)'
+                    elif 'conv_module' in name:
+                        group = 'Convolution (all layers)'
+                    elif 'rotary_emb' in name:
+                        group = 'Rotary Embeddings (all layers)'
+                    elif 'norm' in name:
+                        group = 'Layer Norms'
+                    else:
+                        group = 'Other'
+                elif 'norm' in name:
+                    group = 'Final Norm'
+                else:
+                    group = 'Transformer Other'
+            elif 'task_head' in name:
+                group = 'Task Head (Policy + WDL)'
+            elif 'lm_head' in name:
+                group = 'LM Head'
+            else:
+                group = 'Other'
+
+            if group not in param_groups:
+                param_groups[group] = 0
+            param_groups[group] += param.numel()
+
+        # Print sorted by parameter count
+        print("Component breakdown (sorted by size):")
+        for group, count in sorted(param_groups.items(), key=lambda x: -x[1]):
+            pct = 100 * count / total_params
+            print(f"  {group:<40} {count:>15,}  ({pct:5.1f}%)")
+        print("-" * 80)
+        print(f"{'TOTAL:':<40} {total_params:>15,}")
+        print()
 
     if hasattr(torch, "compile"):
         try:

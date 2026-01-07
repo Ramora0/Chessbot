@@ -13,22 +13,24 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_outputs import ModelOutput
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaPreTrainedModel,
     LlamaRMSNorm,
+    LlamaRotaryEmbedding,
 )
 
 
 class SpatialConvolutionModule(nn.Module):
     """
-    Spatial 2D convolution module for chess board tokens.
+    Lightweight spatial 2D convolution module for chess board tokens.
 
     Takes 64 sequential board tokens, reshapes them to an 8×8 spatial grid,
     applies depthwise Conv2d for spatial reasoning, then reshapes back to sequence.
 
     This module ONLY processes board tokens - metadata tokens must be handled separately.
+    Uses NO channel expansion to minimize parameters.
     """
 
     def __init__(self, hidden_size: int, kernel_size: int = 3, dropout: float = 0.1) -> None:
@@ -45,29 +47,24 @@ class SpatialConvolutionModule(nn.Module):
         # Pre-normalization (LayerNorm for token-level normalization)
         self.norm = nn.LayerNorm(hidden_size)
 
-        # Pointwise expansion: hidden → 2*hidden (increases channels)
-        self.pointwise_conv1 = nn.Linear(hidden_size, 2 * hidden_size)
-
         # Depthwise 2D convolution: spatial mixing on 8×8 board
         # groups=channels means depthwise (each channel convolved independently)
+        # NO channel expansion - keeps parameters minimal
         padding = (kernel_size - 1) // 2  # Same padding to preserve 8×8 dimensions
         self.depthwise_conv = nn.Conv2d(
-            in_channels=2 * hidden_size,
-            out_channels=2 * hidden_size,
+            in_channels=hidden_size,
+            out_channels=hidden_size,
             kernel_size=kernel_size,
             padding=padding,
-            groups=2 * hidden_size,  # Depthwise: each channel processes spatial info independently
+            groups=hidden_size,  # Depthwise: each channel processes spatial info independently
             bias=False
         )
 
         # Batch normalization for Conv2d (stabilizes training)
-        self.batch_norm = nn.BatchNorm2d(2 * hidden_size)
+        self.batch_norm = nn.BatchNorm2d(hidden_size)
 
         # Activation function (SiLU/Swish is conformer standard)
         self.activation = nn.SiLU()
-
-        # Pointwise compression: 2*hidden → hidden (reduces channels back)
-        self.pointwise_conv2 = nn.Linear(2 * hidden_size, hidden_size)
 
         # Dropout
         self.dropout = nn.Dropout(dropout)
@@ -87,28 +84,23 @@ class SpatialConvolutionModule(nn.Module):
         # Normalize
         x = self.norm(board_tokens)  # [batch, 64, hidden]
 
-        # Pointwise expansion
-        x = self.pointwise_conv1(x)  # [batch, 64, 2*hidden]
-        x = self.activation(x)
-
         # CRITICAL: Reshape to 2D spatial grid
-        # [batch, 64, 2*hidden] → [batch, 2*hidden, 8, 8]
+        # [batch, 64, hidden] → [batch, hidden, 8, 8]
         # Token order is row-major: rank 8→1, files a→h
-        x = x.transpose(1, 2)  # [batch, 2*hidden, 64]
-        x = x.view(batch_size, 2 * self.hidden_size, 8, 8)  # Reshape to 8×8 grid
+        x = x.transpose(1, 2)  # [batch, hidden, 64]
+        x = x.view(batch_size, self.hidden_size, 8, 8)  # Reshape to 8×8 grid
 
         # Apply 2D depthwise convolution for spatial reasoning
-        x = self.depthwise_conv(x)  # [batch, 2*hidden, 8, 8]
+        x = self.depthwise_conv(x)  # [batch, hidden, 8, 8]
         x = self.batch_norm(x)
         x = self.activation(x)
 
         # CRITICAL: Reshape back to sequence
-        # [batch, 2*hidden, 8, 8] → [batch, 64, 2*hidden]
-        x = x.view(batch_size, 2 * self.hidden_size, 64)  # Flatten 8×8 back to 64
-        x = x.transpose(1, 2)  # [batch, 64, 2*hidden]
+        # [batch, hidden, 8, 8] → [batch, 64, hidden]
+        x = x.view(batch_size, self.hidden_size, 64)  # Flatten 8×8 back to 64
+        x = x.transpose(1, 2)  # [batch, 64, hidden]
 
-        # Pointwise compression
-        x = self.pointwise_conv2(x)  # [batch, 64, hidden]
+        # Dropout
         x = self.dropout(x)
 
         return x
@@ -131,9 +123,11 @@ class ConformerFeedForward(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        # For half-step: intermediate = hidden * expansion_factor * 4
-        # For full FFN: would be hidden * 4
-        intermediate_size = int(config.hidden_size * expansion_factor * 4)
+        # Use config's intermediate_size as base, then apply expansion_factor
+        # For macaron-net: each half-step FFN gets expansion_factor * intermediate_size
+        # (0.5 for each half means 1.0 total = same as standard transformer)
+        base_intermediate = getattr(config, 'intermediate_size', config.hidden_size * 4)
+        intermediate_size = int(base_intermediate * expansion_factor)
 
         # SwiGLU gating (same as Llama)
         self.gate_proj = nn.Linear(self.hidden_size, intermediate_size, bias=False)
@@ -189,6 +183,9 @@ class ChessConformerLayer(nn.Module):
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
         self.attn_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Rotary embeddings for position encoding
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+
         # Component 3: Spatial convolution module (BOARD TOKENS ONLY)
         self.conv_module = SpatialConvolutionModule(
             hidden_size=config.hidden_size,
@@ -229,10 +226,20 @@ class ChessConformerLayer(nn.Module):
         # Step 2: Self-attention - applies to ALL tokens
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
+
+        # Compute position embeddings from position IDs
+        if position_ids is None:
+            # Create default position IDs if not provided
+            position_ids = torch.arange(
+                seq_len, dtype=torch.long, device=hidden_states.device
+            ).unsqueeze(0)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
         attn_output = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            position_embeddings=position_embeddings,
             **kwargs
         )
         # Handle tuple return from LlamaAttention (output, attention_weights, ...)
@@ -311,7 +318,7 @@ class ChessConformerModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs
-    ) -> ModelOutput:
+    ) -> BaseModelOutputWithPast:
         """
         Forward pass through conformer model.
 
@@ -322,7 +329,7 @@ class ChessConformerModel(LlamaPreTrainedModel):
             position_ids: Optional position IDs
 
         Returns:
-            ModelOutput with last_hidden_state
+            BaseModelOutputWithPast with last_hidden_state
         """
         # Get embeddings
         if inputs_embeds is None:
@@ -353,8 +360,9 @@ class ChessConformerModel(LlamaPreTrainedModel):
         hidden_states = self.norm(hidden_states)
 
         # Return in same format as LlamaModel for compatibility
-        return ModelOutput(
+        return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
             hidden_states=None,
             attentions=None
         )
