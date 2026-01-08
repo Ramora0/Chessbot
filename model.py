@@ -31,7 +31,7 @@ class MultiTaskAttentionPooling(nn.Module):
         Args:
             hidden_size: Dimension of input hidden states
             task_output_dims: Dict mapping task names to output dimensions
-                             e.g., {'policy': 1858, 'wdl': 3}
+                             e.g., {'policy': 1958, 'wdl': 3}
         """
         super().__init__()
         self.task_names = list(task_output_dims.keys())
@@ -249,9 +249,12 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         # Add learned positional embeddings to all tokens
         # This allows the model to instantly know each token's position (e.g., knight on f1 = position 61)
-        position_ids = torch.arange(original_seq_len, dtype=torch.long, device=input_ids.device)
-        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)  # [batch_size, seq_len]
-        position_embeds = self.position_embeddings(position_ids)  # [batch_size, seq_len, hidden_size]
+        position_ids = torch.arange(
+            original_seq_len, dtype=torch.long, device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand(
+            batch_size, -1)  # [batch_size, seq_len]
+        position_embeds = self.position_embeddings(
+            position_ids)  # [batch_size, seq_len, hidden_size]
         input_embeds = input_embeds + position_embeds
 
         # Process all tokens through transformer
@@ -316,7 +319,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 # Convert relative to absolute: absolute_win%[move] = true_value + policy[move]
                 # Best move (policy=0): gets true_value
                 # Worse moves (policy<0): get true_value - loss
-                absolute_winrates = true_value.unsqueeze(1) + policy  # [batch, 1858]
+                absolute_winrates = true_value.unsqueeze(
+                    1) + policy  # [batch, 1958]
 
                 # Compute BCE loss only on legal moves using logits (safe for autocast)
                 legal_absolute_winrates = absolute_winrates[policy_mask_bool]

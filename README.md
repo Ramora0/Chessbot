@@ -24,7 +24,7 @@ This project implements a **searchless chess policy network** inspired by Google
 
 - Custom tokenization scheme for chess positions (FEN notation)
 - Multi-task attention pooling with shared K/V projections
-- Separate prediction heads for policy (1858 moves), WDL (3-way), and move evaluation
+- Separate prediction heads for policy (1958 moves), WDL (3-way), and move evaluation
 
 **Training Infrastructure:**
 

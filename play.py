@@ -33,14 +33,15 @@ def get_model_move_probabilities(
     board: chess.Board,
     device: torch.device,
     tokenizer,
-) -> Tuple[List[Tuple[chess.Move, float, float]], float, float]:
+) -> Tuple[List[Tuple[chess.Move, float, float]], float, float, Optional[Tuple[str, float]]]:
     """Get move probabilities for all legal moves from the model.
 
     Returns:
-        Tuple of (move_probabilities, entropy, illegality_rate) where:
+        Tuple of (move_probabilities, entropy, illegality_rate, top_illegal_move) where:
         - entropy is in bits
         - illegality_rate is the fraction of probability mass on illegal moves
         - move_probabilities is a list of (move, probability, raw_logit) tuples
+        - top_illegal_move is (uci_string, logit) for the highest-logit illegal move, or None
     """
     # Process FEN and tokenize (testing without ACT token)
     fen = board.fen()
@@ -68,6 +69,17 @@ def get_model_move_probabilities(
     illegal_mask = ~legal_mask
     illegality_rate = (all_probs * illegal_mask.float()).sum().item()
 
+    # Find the illegal move with highest logit
+    top_illegal_move = None
+    if illegal_mask.any():
+        illegal_logits = policy_logits.clone()
+        illegal_logits[legal_mask] = float("-inf")
+        max_illegal_idx = illegal_logits.argmax().item()
+        if max_illegal_idx < len(policy_index):
+            max_illegal_logit = policy_logits[max_illegal_idx].item()
+            max_illegal_uci = policy_index[max_illegal_idx]
+            top_illegal_move = (max_illegal_uci, max_illegal_logit)
+
     # Mask illegal moves and get probabilities
     masked_logits = policy_logits.masked_fill(~legal_mask, float("-inf"))
     probs = F.softmax(masked_logits, dim=-1)
@@ -88,10 +100,10 @@ def get_model_move_probabilities(
 
     # Sort by probability descending
     move_probs.sort(key=lambda x: x[1], reverse=True)
-    return move_probs, entropy, illegality_rate
+    return move_probs, entropy, illegality_rate, top_illegal_move
 
 
-def display_move_probabilities(move_probs: List[Tuple[chess.Move, float, float]], entropy: float, illegality_rate: float, top_n: int = 10):
+def display_move_probabilities(move_probs: List[Tuple[chess.Move, float, float]], entropy: float, illegality_rate: float, top_illegal_move: Optional[Tuple[str, float]] = None, top_n: int = 10):
     """Display the top N moves and their probabilities in terminal."""
     print("\nModel move probabilities:")
     print("-" * 80)
@@ -104,6 +116,9 @@ def display_move_probabilities(move_probs: List[Tuple[chess.Move, float, float]]
     print(
         f"\nEntropy: {entropy:.3f} bits (max: {math.log2(len(move_probs)):.3f} bits for {len(move_probs)} moves)")
     print(f"Illegal move probability: {illegality_rate*100:.2f}%")
+    if top_illegal_move:
+        uci_move, logit = top_illegal_move
+        print(f"Top illegal move: {uci_move} (logit: {logit:.3f})")
 
 
 def load_piece_images() -> dict:
@@ -212,7 +227,7 @@ def draw_board(screen: pygame.Surface, board: chess.Board, piece_images: dict,
 
 def main():
     # Configuration
-    CHECKPOINT_PATH = "./new/checkpoint-32500"  # Adjust path as needed
+    CHECKPOINT_PATH = "./checkpoints/final/checkpoint-120000"  # Adjust path as needed
 
     print("Loading model from checkpoint...")
     model = ChessPolicyValueModel.from_pretrained_compiled(CHECKPOINT_PATH)
@@ -275,9 +290,10 @@ def main():
         # Handle AI move if it's AI's turn
         if ai_thinking and not game_over:
             print("\nModel is thinking...")
-            move_probs, entropy, illegality_rate = get_model_move_probabilities(
+            move_probs, entropy, illegality_rate, top_illegal_move = get_model_move_probabilities(
                 model, board, device, tokenizer)
-            display_move_probabilities(move_probs, entropy, illegality_rate, top_n=10)
+            display_move_probabilities(
+                move_probs, entropy, illegality_rate, top_illegal_move, top_n=10)
 
             if move_probs:
                 best_move, best_prob, best_logit = move_probs[0]

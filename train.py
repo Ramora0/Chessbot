@@ -23,7 +23,7 @@ from evaluation_puzzle import evaluate_model_elo, DEFAULT_EVAL_CSV_PATH
 from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 
-OUTPUT_DIR = "test"
+OUTPUT_DIR = "final_run"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 256  # Board tokens: 72
 DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value"
@@ -32,7 +32,7 @@ ELO_EVAL_STEPS = 4000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
 BASE_BATCH_SIZE = 256
-BASE_LEARNING_RATE = 2e-5
+BASE_LEARNING_RATE = 1e-5
 BASE_MAX_STEPS = 2_800_000
 BASE_SAVE_STEPS = 10_000
 BASE_LOGGING_STEPS = 200
@@ -321,7 +321,8 @@ class EloEvaluationCallback(TrainerCallback):
         if self.compute_both_sampling_modes and elo_greedy is not None:
             metrics["eval_elo_greedy"] = float(elo_greedy)
             if not math.isnan(solve_percentage_greedy):
-                metrics["eval_puzzle_accuracy_greedy"] = float(solve_percentage_greedy)
+                metrics["eval_puzzle_accuracy_greedy"] = float(
+                    solve_percentage_greedy)
 
         self.trainer.log(metrics)
         self._last_step_logged = step
@@ -421,7 +422,7 @@ def train() -> None:
         per_device_train_batch_size=per_device_batch_size,
         learning_rate=schedule.learning_rate,
         warmup_steps=schedule.warmup_steps,
-        weight_decay=0,
+        weight_decay=0.01,
         max_grad_norm=1.0,
         bf16=True,
         save_strategy="steps",

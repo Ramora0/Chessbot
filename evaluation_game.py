@@ -102,8 +102,6 @@ def _select_moves_from_model_batch(
     encodings = [tokenizer.encode(p) for p in processed]
     input_ids = torch.tensor(
         [enc.ids for enc in encodings], dtype=torch.long, device=device)
-    input_ids = input_ids - 1
-    input_ids = input_ids[:, :-1]
 
     # Get model predictions for entire batch
     with torch.no_grad():
@@ -641,7 +639,7 @@ def main():
     from model import ChessPolicyValueModel
 
     # Configuration
-    CHECKPOINT_PATH = "./long"
+    CHECKPOINT_PATH = "./checkpoints/final/checkpoint-115000"
     # Adjust path as needed
     STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
     NUM_GAMES = 400
