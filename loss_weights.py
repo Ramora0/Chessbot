@@ -8,7 +8,7 @@ POLICY_LOSS_WEIGHT: float = 0.5 / 3
 # This unified loss handles BOTH:
 #   - Ranking legal moves by their actual win% (e.g., 52%, 48%, etc.)
 #   - Illegality detection (illegal moves target 0% win rate, encouraging very negative logits)
-MOVE_WINRATE_LOSS_WEIGHT: float = 0.4 / 0.5
+MOVE_WINRATE_LOSS_WEIGHT: float = 0.5 / 0.5
 
 # WDL head predicts position value distribution
 WDL_LOSS_WEIGHT: float = 0 / 0.005
