@@ -26,7 +26,7 @@ from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 OUTPUT_DIR = "test"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 256  # Board tokens: 72
-DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value"
+DATASET_PATH = os.getenv("DATASET_PATH", "fuck")
 SHUFFLE_DATASET = True
 ELO_EVAL_STEPS = 16000
 EVAL_BATCH_SIZE = 4096
@@ -39,7 +39,8 @@ BASE_LOGGING_STEPS = 200
 BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
 
 # Game-based evaluation configuration
-GAME_EVAL_STEPS = 120000             # Base steps between game evaluations (30k at batch_size=1024)
+# Base steps between game evaluations (30k at batch_size=1024)
+GAME_EVAL_STEPS = 120000
 GAME_EVAL_NUM_GAMES = 400            # Number of games to play per evaluation
 GAME_EVAL_BATCH_SIZE = 128           # Parallel games during evaluation
 GAME_EVAL_OPPONENT_ELO = 1350        # Stockfish ELO level
@@ -49,7 +50,8 @@ BASE_GAME_EVAL_STEPS = GAME_EVAL_STEPS
 # Set to a checkpoint path to resume training (e.g., "./outputs/checkpoint-45000")
 # Set to None to start from scratch
 # RESUME_FROM_CHECKPOINT = "./outputs/checkpoint-90000"
-RESUME_FROM_CHECKPOINT = "./checkpoints/final/checkpoint-197500"
+# RESUME_FROM_CHECKPOINT = "./checkpoints/final/checkpoint-197500"
+RESUME_FROM_CHECKPOINT = None
 
 
 torch.backends.cuda.enable_flash_sdp(True)
@@ -428,7 +430,8 @@ class GameEvaluationCallback(TrainerCallback):
             self.trainer.log(metrics)
             self._last_step_logged = step
 
-            print(f"Game evaluation complete: ELO={estimated_elo:.1f} ± {std_error:.1f}")
+            print(
+                f"Game evaluation complete: ELO={estimated_elo:.1f} ± {std_error:.1f}")
             print(f"{'='*80}\n")
 
         except Exception as e:
@@ -618,7 +621,8 @@ def train() -> None:
         trainer.add_callback(game_callback)
     else:
         if not Path(GAME_EVAL_STOCKFISH_PATH).exists():
-            print(f"Stockfish not found at {GAME_EVAL_STOCKFISH_PATH}. Game evaluation disabled.")
+            print(
+                f"Stockfish not found at {GAME_EVAL_STOCKFISH_PATH}. Game evaluation disabled.")
         if schedule.game_eval_steps <= 0:
             print("Game evaluation frequency set to 0. Game evaluation disabled.")
 
