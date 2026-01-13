@@ -106,11 +106,9 @@ class TrackingTrainer(Trainer):
         self._last_policy_loss: Optional[float] = None
         self._last_wdl_loss: Optional[float] = None
         self._last_total_loss: Optional[float] = None
-        self._last_illegality_head_loss: Optional[float] = None
         self._last_masked_token_loss: Optional[float] = None
         self._last_move_winrate_loss: Optional[float] = None
         self._last_illegality_rate: Optional[float] = None
-        self._last_illegality_head_accuracy: Optional[float] = None
         self._last_masked_token_accuracy: Optional[float] = None
         self._last_best_move_prob: Optional[float] = None
         self._last_value_mae: Optional[float] = None
@@ -124,6 +122,8 @@ class TrackingTrainer(Trainer):
         return_outputs: bool = False,
         num_items_in_batch: Optional[int] = None,
     ):  # type: ignore[override]
+        # Pass the current training step to the model for annealing
+        inputs['training_step'] = self.state.global_step
         outputs = model(**inputs)
         loss = outputs.loss
         if loss is None:
@@ -151,19 +151,6 @@ class TrackingTrainer(Trainer):
             )
         else:
             self._last_wdl_loss = None
-
-        illegality_head_loss = getattr(outputs, "illegality_head_loss", None)
-        if illegality_head_loss is not None:
-            illegality_head_weight = float(
-                getattr(model, "illegality_head_loss_weight", 0.0))
-            illegality_head_value = float(illegality_head_loss.detach().item())
-            self._last_illegality_head_loss = (
-                illegality_head_value / illegality_head_weight
-                if illegality_head_weight > 0
-                else illegality_head_value
-            )
-        else:
-            self._last_illegality_head_loss = None
 
         masked_token_loss = getattr(outputs, "masked_token_loss", None)
         if masked_token_loss is not None:
@@ -196,13 +183,6 @@ class TrackingTrainer(Trainer):
         self._last_illegality_rate = (
             float(illegality_rate.detach().item()
                   ) if illegality_rate is not None else None
-        )
-
-        illegality_head_accuracy = getattr(
-            outputs, "illegality_head_accuracy", None)
-        self._last_illegality_head_accuracy = (
-            float(illegality_head_accuracy.detach().item()
-                  ) if illegality_head_accuracy is not None else None
         )
 
         masked_token_accuracy = getattr(outputs, "masked_token_accuracy", None)
@@ -246,9 +226,6 @@ class TrackingTrainer(Trainer):
                 logs.setdefault("policy_loss", self._last_policy_loss)
             if self._last_wdl_loss is not None:
                 logs.setdefault("wdl_loss", self._last_wdl_loss)
-            if self._last_illegality_head_loss is not None:
-                logs.setdefault("illegality_head_loss",
-                                self._last_illegality_head_loss)
             if self._last_masked_token_loss is not None:
                 logs.setdefault("masked_token_loss",
                                 self._last_masked_token_loss)
@@ -260,9 +237,6 @@ class TrackingTrainer(Trainer):
             if self._last_illegality_rate is not None:
                 logs.setdefault("illegality_rate",
                                 self._last_illegality_rate)
-            if self._last_illegality_head_accuracy is not None:
-                logs.setdefault("illegality_head_accuracy",
-                                self._last_illegality_head_accuracy)
             if self._last_masked_token_accuracy is not None:
                 logs.setdefault("masked_token_accuracy",
                                 self._last_masked_token_accuracy)
@@ -495,8 +469,12 @@ def train() -> None:
         model = ChessPolicyValueModel.from_pretrained_compiled(
             RESUME_FROM_CHECKPOINT)
         model.config.use_cache = False
+        # Update annealing steps for resumed training
+        model.config.illegality_penalty_annealing_steps = int(schedule.max_steps * 0.1)
+        model.illegality_penalty_annealing_steps = model.config.illegality_penalty_annealing_steps
         print(
             f"Model loaded from checkpoint with {sum(p.numel() for p in model.parameters()):,} parameters")
+        print(f"Illegality penalty annealing: {model.illegality_penalty_annealing_steps} steps (10% of epoch)")
     else:
         print("Creating model configuration...")
         config = LlamaConfig(
@@ -512,8 +490,13 @@ def train() -> None:
             pad_token_id=pad_token_id,
         )
         config.policy_dim = len(policy_index)
+        # Anneal illegality penalty over first 10% of epoch
+        # Start with -10 penalty on illegal logits, linearly reduce to 0
+        # This helps bootstrap learning by making illegal moves obviously bad at first
+        config.illegality_penalty_annealing_steps = int(schedule.max_steps * 0.1)
 
         print(f"Model config created - policy dimension: {config.policy_dim}")
+        print(f"Illegality penalty annealing: {config.illegality_penalty_annealing_steps} steps (10% of epoch)")
 
         print("Initializing Chess LLaMA model...")
         model = ChessPolicyValueModel(config)

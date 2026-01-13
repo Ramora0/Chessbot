@@ -7,13 +7,11 @@ POLICY_LOSS_WEIGHT: float = 0.5 / 3
 # 2. Sigmoid-based win% prediction loss
 # This unified loss handles BOTH:
 #   - Ranking legal moves by their actual win% (e.g., 52%, 48%, etc.)
-#   - Learning that illegal moves are bad (target 0% win rate)
+#   - Illegality detection (illegal moves target 0% win rate, encouraging very negative logits)
 MOVE_WINRATE_LOSS_WEIGHT: float = 0.4 / 0.5
 
 # WDL head predicts position value distribution
 WDL_LOSS_WEIGHT: float = 0 / 0.005
-
-ILLEGALITY_HEAD_LOSS_WEIGHT: float = 0.1 / 0.002
 
 # Masked token prediction - helps model learn board state representation
 MASKED_TOKEN_LOSS_WEIGHT: float = 1.0
