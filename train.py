@@ -23,12 +23,12 @@ from evaluation_puzzle import evaluate_model_elo, DEFAULT_EVAL_CSV_PATH
 from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 
-OUTPUT_DIR = "final_run"
+OUTPUT_DIR = "test"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 256  # Board tokens: 72
 DATASET_PATH = "/fs/scratch/PAS2836/lees_stuff/action_value"
 SHUFFLE_DATASET = True
-ELO_EVAL_STEPS = 4000
+ELO_EVAL_STEPS = 16000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
 BASE_BATCH_SIZE = 256
@@ -41,7 +41,7 @@ BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
 # Set to a checkpoint path to resume training (e.g., "./outputs/checkpoint-45000")
 # Set to None to start from scratch
 # RESUME_FROM_CHECKPOINT = "./outputs/checkpoint-90000"
-RESUME_FROM_CHECKPOINT = None
+RESUME_FROM_CHECKPOINT = "./checkpoints/final/checkpoint-197500"
 
 
 torch.backends.cuda.enable_flash_sdp(True)
@@ -102,6 +102,7 @@ class TrackingTrainer(Trainer):
         self._last_best_move_prob: Optional[float] = None
         self._last_value_mae: Optional[float] = None
         self._last_move_winrate_mae: Optional[float] = None
+        self._last_policy_entropy: Optional[float] = None
 
     def compute_loss(
         self,
@@ -213,6 +214,11 @@ class TrackingTrainer(Trainer):
             float(move_winrate_mae.detach().item())
         ) if move_winrate_mae is not None else None
 
+        policy_entropy = getattr(outputs, "policy_entropy", None)
+        self._last_policy_entropy = (
+            float(policy_entropy.detach().item())
+        ) if policy_entropy is not None else None
+
         if return_outputs:
             return loss, outputs
         return loss
@@ -256,6 +262,9 @@ class TrackingTrainer(Trainer):
             if self._last_move_winrate_mae is not None:
                 logs.setdefault("move_winrate_mae",
                                 self._last_move_winrate_mae)
+            if self._last_policy_entropy is not None:
+                logs.setdefault("policy_entropy",
+                                self._last_policy_entropy)
         super().log(logs, *args, **kwargs)
 
 
@@ -422,7 +431,7 @@ def train() -> None:
         per_device_train_batch_size=per_device_batch_size,
         learning_rate=schedule.learning_rate,
         warmup_steps=schedule.warmup_steps,
-        weight_decay=0.01,
+        weight_decay=0,
         max_grad_norm=1.0,
         bf16=True,
         save_strategy="steps",

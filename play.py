@@ -33,15 +33,16 @@ def get_model_move_probabilities(
     board: chess.Board,
     device: torch.device,
     tokenizer,
-) -> Tuple[List[Tuple[chess.Move, float, float]], float, float, Optional[Tuple[str, float]]]:
+) -> Tuple[List[Tuple[chess.Move, float, float, float]], float, float, Optional[Tuple[str, float]], float]:
     """Get move probabilities for all legal moves from the model.
 
     Returns:
-        Tuple of (move_probabilities, entropy, illegality_rate, top_illegal_move) where:
+        Tuple of (move_probabilities, entropy, illegality_rate, top_illegal_move, position_winrate) where:
         - entropy is in bits
         - illegality_rate is the fraction of probability mass on illegal moves
-        - move_probabilities is a list of (move, probability, raw_logit) tuples
+        - move_probabilities is a list of (move, probability, raw_logit, move_winrate) tuples
         - top_illegal_move is (uci_string, logit) for the highest-logit illegal move, or None
+        - position_winrate is the model's estimated win% for the position (after best move)
     """
     # Process FEN and tokenize (testing without ACT token)
     fen = board.fen()
@@ -53,6 +54,12 @@ def get_model_move_probabilities(
     with torch.no_grad():
         outputs = model(input_ids=input_ids, return_dict=True)
         policy_logits = outputs.policy_logits[0]
+        wdl_logits = outputs.wdl_logits[0]
+
+    # Calculate position win% from WDL head (128 bins from 0.0 to 1.0)
+    bin_centers = torch.linspace(0, 1, 128, device=device)
+    wdl_probs = F.softmax(wdl_logits, dim=-1)
+    position_winrate = (wdl_probs * bin_centers).sum().item()
 
     # Create legal moves mask
     legal_mask = torch.zeros(
@@ -91,34 +98,43 @@ def get_model_move_probabilities(
         if p > 0:
             entropy -= p * math.log2(p)
 
-    # Get probabilities and raw logits for all legal moves
+    # Get probabilities, raw logits, and move win% for all legal moves
+    # Move win% is computed using sigmoid on policy logits
     move_probs = []
     for move, idx in legal_moves_list:
         prob = probs[idx].item()
         raw_logit = policy_logits[idx].item()
-        move_probs.append((move, prob, raw_logit))
+        move_winrate = torch.sigmoid(policy_logits[idx]).item()
+        move_probs.append((move, prob, raw_logit, move_winrate))
 
     # Sort by probability descending
     move_probs.sort(key=lambda x: x[1], reverse=True)
-    return move_probs, entropy, illegality_rate, top_illegal_move
+    return move_probs, entropy, illegality_rate, top_illegal_move, position_winrate
 
 
-def display_move_probabilities(move_probs: List[Tuple[chess.Move, float, float]], entropy: float, illegality_rate: float, top_illegal_move: Optional[Tuple[str, float]] = None, top_n: int = 10):
+def display_move_probabilities(move_probs: List[Tuple[chess.Move, float, float, float]], entropy: float, illegality_rate: float, top_illegal_move: Optional[Tuple[str, float]] = None, position_winrate: float = 0.0, top_n: int = 10):
     """Display the top N moves and their probabilities in terminal."""
+    print("\n" + "=" * 80)
+    print(f"POSITION WIN%: {position_winrate*100:.2f}% (from WDL head)")
+    print("=" * 80)
     print("\nModel move probabilities:")
     print("-" * 80)
-    for i, (move, prob, logit) in enumerate(move_probs[:top_n]):
+    print(f"{'#':>2}  {'Move':6}  {'Prob':>6}  {'Win%':>6}  {'Logit':>7}  {'Index':>5}")
+    print("-" * 80)
+    for i, (move, prob, logit, move_winrate) in enumerate(move_probs[:top_n]):
         idx = _move_to_policy_index(move)
         print(
-            f"{i+1:2d}. {move.uci():6s}  {prob*100:6.2f}%  logit: {logit:7.3f}  (index: {idx})")
+            f"{i+1:2d}. {move.uci():6s}  {prob*100:6.2f}%  {move_winrate*100:6.2f}%  {logit:7.3f}  {idx:5d}")
     if len(move_probs) > top_n:
         print(f"... and {len(move_probs) - top_n} more moves")
+    print("-" * 80)
     print(
-        f"\nEntropy: {entropy:.3f} bits (max: {math.log2(len(move_probs)):.3f} bits for {len(move_probs)} moves)")
+        f"Entropy: {entropy:.3f} bits (max: {math.log2(len(move_probs)):.3f} bits for {len(move_probs)} moves)")
     print(f"Illegal move probability: {illegality_rate*100:.2f}%")
     if top_illegal_move:
         uci_move, logit = top_illegal_move
         print(f"Top illegal move: {uci_move} (logit: {logit:.3f})")
+    print("-" * 80)
 
 
 def load_piece_images() -> dict:
@@ -290,15 +306,15 @@ def main():
         # Handle AI move if it's AI's turn
         if ai_thinking and not game_over:
             print("\nModel is thinking...")
-            move_probs, entropy, illegality_rate, top_illegal_move = get_model_move_probabilities(
+            move_probs, entropy, illegality_rate, top_illegal_move, position_winrate = get_model_move_probabilities(
                 model, board, device, tokenizer)
             display_move_probabilities(
-                move_probs, entropy, illegality_rate, top_illegal_move, top_n=10)
+                move_probs, entropy, illegality_rate, top_illegal_move, position_winrate, top_n=10)
 
             if move_probs:
-                best_move, best_prob, best_logit = move_probs[0]
+                best_move, best_prob, best_logit, best_move_winrate = move_probs[0]
                 print(
-                    f"\nModel plays: {best_move.uci()} ({best_prob*100:.2f}%)")
+                    f"\nModel plays: {best_move.uci()} (prob: {best_prob*100:.2f}%, win%: {best_move_winrate*100:.2f}%)")
                 board.push(best_move)
                 ai_thinking = False
             else:

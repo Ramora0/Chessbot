@@ -114,6 +114,7 @@ class ChessPolicyValueOutput(ModelOutput):
     best_move_prob: Optional[torch.Tensor] = None
     value_mae: Optional[torch.Tensor] = None
     move_winrate_mae: Optional[torch.Tensor] = None
+    policy_entropy: Optional[torch.Tensor] = None
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
 
@@ -279,6 +280,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         move_winrate_loss: Optional[torch.Tensor] = None
         move_winrate_mae: Optional[torch.Tensor] = None
         policy_mask_bool: Optional[torch.Tensor] = None
+        policy_entropy: Optional[torch.Tensor] = None
 
         if policy is not None:
             if policy.device != target_device:
@@ -305,6 +307,13 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             expected_win_value = (model_probs * win_values).sum(dim=-1)
             raw_policy_loss = -expected_win_value.mean()
             policy_loss = self.policy_loss_weight * raw_policy_loss
+
+            # Compute policy entropy for monitoring saturation
+            # Only compute over legal moves
+            legal_probs = model_probs[policy_mask_bool]
+            # Reshape to [batch, num_legal_moves] - need to know batch structure
+            # For simplicity, compute entropy per position
+            policy_entropy = -(model_probs * torch.log(model_probs + 1e-10)).sum(dim=-1).mean()
 
             # Loss 2: Sigmoid-based absolute win% prediction for each move
             # This encourages the model to rank ALL moves correctly, not just pick the best one
@@ -497,6 +506,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             best_move_prob=best_move_prob,
             value_mae=value_mae,
             move_winrate_mae=move_winrate_mae,
+            policy_entropy=policy_entropy,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
