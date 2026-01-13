@@ -38,6 +38,14 @@ BASE_SAVE_STEPS = 10_000
 BASE_LOGGING_STEPS = 200
 BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
 
+# Game-based evaluation configuration
+GAME_EVAL_STEPS = 120000             # Base steps between game evaluations (30k at batch_size=1024)
+GAME_EVAL_NUM_GAMES = 400            # Number of games to play per evaluation
+GAME_EVAL_BATCH_SIZE = 128           # Parallel games during evaluation
+GAME_EVAL_OPPONENT_ELO = 1350        # Stockfish ELO level
+GAME_EVAL_STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
+BASE_GAME_EVAL_STEPS = GAME_EVAL_STEPS
+
 # Set to a checkpoint path to resume training (e.g., "./outputs/checkpoint-45000")
 # Set to None to start from scratch
 # RESUME_FROM_CHECKPOINT = "./outputs/checkpoint-90000"
@@ -58,6 +66,7 @@ class TrainingSchedule:
     save_steps: int
     logging_steps: int
     elo_eval_steps: int
+    game_eval_steps: int
     warmup_steps: int
 
 
@@ -73,6 +82,7 @@ def build_training_schedule(batch_size: int) -> TrainingSchedule:
     save_steps = max(1, int(BASE_SAVE_STEPS * inv_scale))
     logging_steps = max(1, int(BASE_LOGGING_STEPS * inv_scale))
     elo_eval_steps = max(1, int(BASE_ELO_EVAL_STEPS * inv_scale))
+    game_eval_steps = max(1, int(BASE_GAME_EVAL_STEPS * inv_scale))
     warmup_steps = max(1, int(max_steps * 0.02))  # 1% of total steps
 
     return TrainingSchedule(
@@ -81,6 +91,7 @@ def build_training_schedule(batch_size: int) -> TrainingSchedule:
         save_steps=save_steps,
         logging_steps=logging_steps,
         elo_eval_steps=elo_eval_steps,
+        game_eval_steps=game_eval_steps,
         warmup_steps=warmup_steps,
     )
 
@@ -339,6 +350,96 @@ class EloEvaluationCallback(TrainerCallback):
         return control
 
 
+class GameEvaluationCallback(TrainerCallback):
+    """Callback to run game-based evaluation against Stockfish during training."""
+
+    def __init__(
+        self,
+        frequency: int,
+        tokenizer,
+        stockfish_path: str,
+        num_games: int = GAME_EVAL_NUM_GAMES,
+        batch_size: int = GAME_EVAL_BATCH_SIZE,
+        opponent_elo: int = GAME_EVAL_OPPONENT_ELO,
+    ) -> None:
+        super().__init__()
+        self.frequency = max(0, int(frequency))
+        self.tokenizer = tokenizer
+        self.stockfish_path = stockfish_path
+        self.num_games = num_games
+        self.batch_size = batch_size
+        self.opponent_elo = opponent_elo
+        self.trainer: Optional[Trainer] = None
+        self._last_step_logged: int = -1
+
+    def attach_trainer(self, trainer: Trainer) -> None:
+        self.trainer = trainer
+
+    def _should_run(self, step: int) -> bool:
+        """Check if evaluation should run at this step."""
+        if self.trainer is None:
+            return False
+        if self.frequency <= 0:
+            return False
+        if step <= 0:
+            return False
+        if step == self._last_step_logged:
+            return False
+        return step % self.frequency == 0
+
+    def on_step_end(self, args, state, control, **kwargs):
+        step = state.global_step
+        if not self._should_run(step):
+            return control
+
+        model = self.trainer.model
+        was_training = model.training
+
+        # Import here to avoid circular dependency
+        from evaluation_game import evaluate_model_against_stockfish
+
+        try:
+            print(f"\n{'='*80}")
+            print(f"Running game evaluation at step {step}...")
+            print(f"{'='*80}")
+
+            # Run game evaluation
+            estimated_elo, std_error = evaluate_model_against_stockfish(
+                model=model,
+                stockfish_path=self.stockfish_path,
+                num_games=self.num_games,
+                tokenizer=self.tokenizer,
+                batch_size=self.batch_size,
+                opponent_elo=self.opponent_elo,
+                verbose=True,
+            )
+
+            # Restore training mode
+            if was_training:
+                model.train()
+
+            # Log metrics to wandb
+            metrics = {
+                "game_elo": float(estimated_elo),
+                "game_elo_se": float(std_error),
+                "game_opponent_elo": float(self.opponent_elo),
+            }
+
+            self.trainer.log(metrics)
+            self._last_step_logged = step
+
+            print(f"Game evaluation complete: ELO={estimated_elo:.1f} ± {std_error:.1f}")
+            print(f"{'='*80}\n")
+
+        except Exception as e:
+            print(f"ERROR during game evaluation at step {step}: {e}")
+            # Continue training even if evaluation fails
+            if was_training:
+                model.train()
+
+        return control
+
+
 def train() -> None:
     print("Starting chess transformer training...")
     os.environ["WANDB_PROJECT"] = "chessformer"
@@ -371,6 +472,7 @@ def train() -> None:
         f"save_steps={schedule.save_steps}",
         f"logging_steps={schedule.logging_steps}",
         f"elo_eval_steps={schedule.elo_eval_steps}",
+        f"game_eval_steps={schedule.game_eval_steps}",
     )
     eval_dataset = None
     csv_path = DEFAULT_EVAL_CSV_PATH
@@ -465,6 +567,7 @@ def train() -> None:
         f"save_steps={training_args.save_steps}",
         f"logging_steps={training_args.logging_steps}",
         f"elo_eval_steps={schedule.elo_eval_steps}",
+        f"game_eval_steps={schedule.game_eval_steps}",
     )
 
     print("Creating trainer...")
@@ -494,6 +597,30 @@ def train() -> None:
         )
         elo_callback.attach_trainer(trainer)
         trainer.add_callback(elo_callback)
+
+    # Game evaluation callback
+    if Path(GAME_EVAL_STOCKFISH_PATH).exists() and schedule.game_eval_steps > 0:
+        print(
+            f"Registering game evaluation callback every {schedule.game_eval_steps} steps "
+            f"(num_games={GAME_EVAL_NUM_GAMES}, batch_size={GAME_EVAL_BATCH_SIZE}, "
+            f"opponent_elo={GAME_EVAL_OPPONENT_ELO})"
+        )
+        print(f"  Stockfish path: {GAME_EVAL_STOCKFISH_PATH}")
+        game_callback = GameEvaluationCallback(
+            frequency=schedule.game_eval_steps,
+            tokenizer=tokenizer,
+            stockfish_path=GAME_EVAL_STOCKFISH_PATH,
+            num_games=GAME_EVAL_NUM_GAMES,
+            batch_size=GAME_EVAL_BATCH_SIZE,
+            opponent_elo=GAME_EVAL_OPPONENT_ELO,
+        )
+        game_callback.attach_trainer(trainer)
+        trainer.add_callback(game_callback)
+    else:
+        if not Path(GAME_EVAL_STOCKFISH_PATH).exists():
+            print(f"Stockfish not found at {GAME_EVAL_STOCKFISH_PATH}. Game evaluation disabled.")
+        if schedule.game_eval_steps <= 0:
+            print("Game evaluation frequency set to 0. Game evaluation disabled.")
 
     print("Starting training...")
     if RESUME_FROM_CHECKPOINT:
