@@ -110,10 +110,10 @@ class TrackingTrainer(Trainer):
         self._last_move_winrate_loss: Optional[float] = None
         self._last_illegality_rate: Optional[float] = None
         self._last_masked_token_accuracy: Optional[float] = None
-        self._last_best_move_prob: Optional[float] = None
+        self._last_top1_agreement: Optional[float] = None
         self._last_value_mae: Optional[float] = None
         self._last_move_winrate_mae: Optional[float] = None
-        self._last_policy_entropy: Optional[float] = None
+        self._last_model_entropy: Optional[float] = None
 
     def compute_loss(
         self,
@@ -191,10 +191,10 @@ class TrackingTrainer(Trainer):
                   ) if masked_token_accuracy is not None else None
         )
 
-        best_move_prob = getattr(outputs, "best_move_prob", None)
-        self._last_best_move_prob = (
-            float(best_move_prob.detach().item()
-                  ) if best_move_prob is not None else None
+        top1_agreement = getattr(outputs, "top1_agreement", None)
+        self._last_top1_agreement = (
+            float(top1_agreement.detach().item()
+                  ) if top1_agreement is not None else None
         )
 
         value_mae = getattr(outputs, "value_mae", None)
@@ -207,10 +207,10 @@ class TrackingTrainer(Trainer):
             float(move_winrate_mae.detach().item())
         ) if move_winrate_mae is not None else None
 
-        policy_entropy = getattr(outputs, "policy_entropy", None)
-        self._last_policy_entropy = (
-            float(policy_entropy.detach().item())
-        ) if policy_entropy is not None else None
+        model_entropy = getattr(outputs, "model_entropy", None)
+        self._last_model_entropy = (
+            float(model_entropy.detach().item())
+        ) if model_entropy is not None else None
 
         if return_outputs:
             return loss, outputs
@@ -240,18 +240,18 @@ class TrackingTrainer(Trainer):
             if self._last_masked_token_accuracy is not None:
                 logs.setdefault("masked_token_accuracy",
                                 self._last_masked_token_accuracy)
-            if self._last_best_move_prob is not None:
-                logs.setdefault("best_move_prob",
-                                self._last_best_move_prob)
+            if self._last_top1_agreement is not None:
+                logs.setdefault("top1_agreement",
+                                self._last_top1_agreement)
             if self._last_value_mae is not None:
                 logs.setdefault("value_mae",
                                 self._last_value_mae)
             if self._last_move_winrate_mae is not None:
                 logs.setdefault("move_winrate_mae",
                                 self._last_move_winrate_mae)
-            if self._last_policy_entropy is not None:
-                logs.setdefault("policy_entropy",
-                                self._last_policy_entropy)
+            if self._last_model_entropy is not None:
+                logs.setdefault("model_entropy",
+                                self._last_model_entropy)
         super().log(logs, *args, **kwargs)
 
 

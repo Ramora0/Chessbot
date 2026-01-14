@@ -615,7 +615,7 @@ def evaluate_model_against_stockfish(
 
     if verbose:
         print("=" * 60)
-        print("FINAL RESULTS")
+        print("EVALUATION STATISTICS")
         print("=" * 60)
         print(f"Games played: {num_games}")
         print(f"Record: {wins}W-{draws}D-{losses}L")
@@ -627,7 +627,6 @@ def evaluate_model_against_stockfish(
             print(f"Average illegality rate: {avg_illegality:.2%}")
         print()
         print(f"Estimated ELO: {estimated_elo:.0f} ± {standard_error:.0f}")
-        print(f"Opponent ELO: {opponent_elo}")
         print("=" * 60)
 
     return (estimated_elo, standard_error)

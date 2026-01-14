@@ -110,10 +110,10 @@ class ChessPolicyValueOutput(ModelOutput):
     illegality_rate: Optional[torch.Tensor] = None
     illegality_head_accuracy: Optional[torch.Tensor] = None
     masked_token_accuracy: Optional[torch.Tensor] = None
-    best_move_prob: Optional[torch.Tensor] = None
+    top1_agreement: Optional[torch.Tensor] = None
     value_mae: Optional[torch.Tensor] = None
     move_winrate_mae: Optional[torch.Tensor] = None
-    policy_entropy: Optional[torch.Tensor] = None
+    model_entropy: Optional[torch.Tensor] = None
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
 
@@ -281,7 +281,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         move_winrate_loss: Optional[torch.Tensor] = None
         move_winrate_mae: Optional[torch.Tensor] = None
         policy_mask_bool: Optional[torch.Tensor] = None
-        policy_entropy: Optional[torch.Tensor] = None
+        model_entropy: Optional[torch.Tensor] = None
 
         if policy is not None and true_value is not None:
             if policy.device != target_device:
@@ -343,7 +343,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             legal_probs = model_probs[policy_mask_bool]
             # Reshape to [batch, num_legal_moves] - need to know batch structure
             # For simplicity, compute entropy per position
-            policy_entropy = -(model_probs * torch.log(model_probs + 1e-10)).sum(dim=-1).mean()
+            model_entropy = -(model_probs * torch.log(model_probs + 1e-10)).sum(dim=-1).mean()
 
             # Loss 2: Sigmoid-based absolute win% prediction for each move
             # This now handles BOTH legal move ranking AND illegality prediction:
@@ -463,7 +463,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         # Compute metrics for reporting (not used in loss)
         illegality_rate: Optional[torch.Tensor] = None
-        best_move_prob: Optional[torch.Tensor] = None
+        top1_agreement: Optional[torch.Tensor] = None
 
         if policy is not None and policy_mask_bool is not None:
             # Illegality rate: fraction of probability mass on illegal moves (from policy head softmax)
@@ -472,10 +472,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             summed_illegal_prob = (illegal_probs * illegal_mask).sum(dim=-1)
             illegality_rate = summed_illegal_prob.mean()
 
-            # Best move probability: average probability assigned to Stockfish's best move
+            # Top-1 agreement: % of time model's top move matches Stockfish's best move
+            model_best_move_idx = model_probs.argmax(dim=-1)
             stockfish_best_move_idx = policy.argmax(dim=-1)
-            best_move_prob = model_probs.gather(
-                1, stockfish_best_move_idx.unsqueeze(1)).squeeze(1).mean()
+            top1_agreement = (model_best_move_idx == stockfish_best_move_idx).float().mean()
 
         loss_components = [
             component
@@ -510,10 +510,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             illegality_rate=illegality_rate,
             illegality_head_accuracy=None,  # Removed - illegality now implicit in move_winrate_loss
             masked_token_accuracy=masked_token_accuracy,
-            best_move_prob=best_move_prob,
+            top1_agreement=top1_agreement,
             value_mae=value_mae,
             move_winrate_mae=move_winrate_mae,  # Still computed only on legal moves
-            policy_entropy=policy_entropy,
+            model_entropy=model_entropy,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
