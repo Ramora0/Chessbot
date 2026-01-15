@@ -16,6 +16,8 @@ from loss_weights import (
     MASKED_TOKEN_LOSS_WEIGHT,
     MOVE_WINRATE_LOSS_WEIGHT,
     TEMPERATURE,
+    ATTENTION_POLICY_LOSS_WEIGHT,
+    ATTENTION_MOVE_WINRATE_LOSS_WEIGHT,
 )
 
 
@@ -88,6 +90,105 @@ class MultiTaskAttentionPooling(nn.Module):
         return outputs
 
 
+def uci_to_square_index(square_name: str) -> int:
+    """Convert UCI square notation to board index (0-63).
+
+    Board indexing: a8=0, b8=1, ..., h8=7, a7=8, ..., h1=63
+    This matches the tokenizer's board token ordering.
+
+    Args:
+        square_name: Two-character square name like 'e2', 'a8'
+
+    Returns:
+        Square index 0-63
+    """
+    file = ord(square_name[0]) - ord('a')  # 0-7 (a-h)
+    rank = int(square_name[1]) - 1          # 0-7 (1-8)
+    return (7 - rank) * 8 + file
+
+
+class AttentionPolicyHead(nn.Module):
+    """Attention-based policy head using 64x64 square-to-square attention.
+
+    Computes attention between all pairs of board squares, then extracts
+    move logits directly from the attention matrix. The attention logit
+    from square i to square j represents the move i→j.
+    """
+
+    def __init__(self, hidden_size: int, policy_dim: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.policy_dim = policy_dim
+        self.scale = hidden_size ** -0.5
+
+        # Projections for queries and keys
+        self.query_proj = nn.Linear(hidden_size, hidden_size)
+        self.key_proj = nn.Linear(hidden_size, hidden_size)
+
+        # NEW separate positional embeddings for attention head
+        self.position_embeddings = nn.Embedding(64, hidden_size)
+
+        # Precompute mapping: policy_index[i] -> (from_sq, to_sq)
+        # This is a [1968, 2] tensor where each row is [from_square_idx, to_square_idx]
+        move_mapping = self._build_move_mapping()
+        self.register_buffer('move_mapping', move_mapping)
+
+    def _build_move_mapping(self) -> torch.Tensor:
+        """Build [1968, 2] tensor mapping each policy move to (from_sq, to_sq) indices.
+
+        For promotion moves (e.g., a7b8q, a7b8r), we strip the promotion piece
+        and map all promotions to the same square as queen promotion.
+        """
+        from policy_index import policy_index
+
+        mapping = []
+        for move_uci in policy_index:
+            # Strip promotion piece if present (e.g., "a7b8q" -> "a7b8")
+            if len(move_uci) == 5:  # Promotion move
+                move_uci = move_uci[:4]  # Use same position for all promotions
+
+            from_sq = uci_to_square_index(move_uci[:2])
+            to_sq = uci_to_square_index(move_uci[2:4])
+            mapping.append([from_sq, to_sq])
+
+        return torch.tensor(mapping, dtype=torch.long)  # [1968, 2]
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute 64x64 attention and extract move logits.
+
+        Args:
+            hidden_states: [batch_size, seq_len, hidden_size] - full sequence including metadata
+
+        Returns:
+            policy_logits: [batch_size, policy_dim] - move logits (1968 moves)
+        """
+        # Extract only board tokens (first 64 positions)
+        batch_size = hidden_states.size(0)
+        board_hidden = hidden_states[:, :64, :]  # [batch, 64, hidden_size]
+
+        # Get positional embeddings for spatial awareness
+        pos_embeds = self.position_embeddings.weight  # [64, hidden_size]
+
+        # Project to queries and keys, adding positional information
+        queries = self.query_proj(board_hidden) + pos_embeds  # [batch, 64, hidden]
+        keys = self.key_proj(board_hidden) + pos_embeds  # [batch, 64, hidden]
+
+        # Compute 64x64 attention matrix (from_square -> to_square)
+        attn_logits = torch.matmul(
+            queries, keys.transpose(-2, -1)
+        ) * self.scale  # [batch, 64, 64]
+
+        # Extract 1968 move logits using precomputed mapping
+        # move_mapping: [1968, 2] where each row is [from_sq, to_sq]
+        from_indices = self.move_mapping[:, 0]  # [1968]
+        to_indices = self.move_mapping[:, 1]    # [1968]
+
+        # Advanced indexing: extract attn_logits[batch, from_i, to_i] for all moves
+        policy_logits = attn_logits[:, from_indices, to_indices]  # [batch, 1968]
+
+        return policy_logits
+
+
 DEFAULT_POLICY_LOSS_WEIGHT = POLICY_LOSS_WEIGHT
 DEFAULT_WDL_LOSS_WEIGHT = WDL_LOSS_WEIGHT
 DEFAULT_MASKED_TOKEN_LOSS_WEIGHT = MASKED_TOKEN_LOSS_WEIGHT
@@ -106,6 +207,10 @@ class ChessPolicyValueOutput(ModelOutput):
     illegality_head_loss: Optional[torch.Tensor] = None
     masked_token_loss: Optional[torch.Tensor] = None
     move_winrate_loss: Optional[torch.Tensor] = None
+    # NEW: Attention-based policy head outputs
+    attention_policy_logits: Optional[torch.Tensor] = None
+    attention_policy_loss: Optional[torch.Tensor] = None
+    attention_move_winrate_loss: Optional[torch.Tensor] = None
     # Metrics (not losses)
     illegality_rate: Optional[torch.Tensor] = None
     illegality_head_accuracy: Optional[torch.Tensor] = None
@@ -148,6 +253,12 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             }
         )
 
+        # NEW: Attention-based policy head (64x64 square attention)
+        self.attention_policy_head = AttentionPolicyHead(
+            hidden_size=hidden_size,
+            policy_dim=self.policy_dim
+        )
+
         # Language modeling head for masked token prediction
         self.lm_head = nn.Linear(hidden_size, config.vocab_size, bias=False)
 
@@ -156,6 +267,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.masked_token_loss_weight = float(DEFAULT_MASKED_TOKEN_LOSS_WEIGHT)
         self.move_winrate_loss_weight = float(DEFAULT_MOVE_WINRATE_LOSS_WEIGHT)
         self.temperature = float(TEMPERATURE)
+
+        # NEW: Attention head loss weights
+        self.attention_policy_loss_weight = float(ATTENTION_POLICY_LOSS_WEIGHT)
+        self.attention_move_winrate_loss_weight = float(ATTENTION_MOVE_WINRATE_LOSS_WEIGHT)
 
         # Illegality penalty annealing: start with -10 penalty, anneal to 0 over first 10% of epoch
         self.illegality_penalty_start = -10.0
@@ -272,6 +387,11 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         policy_logits = task_outputs['policy']
         wdl_logits = task_outputs['wdl']
 
+        # NEW: Attention-based policy head (64x64 square attention)
+        attention_policy_logits = None
+        if self.attention_policy_loss_weight > 0 or self.attention_move_winrate_loss_weight > 0:
+            attention_policy_logits = self.attention_policy_head(hidden_states)
+
         target_device = policy_logits.device
 
         # Policy head has TWO losses on the SAME logits:
@@ -370,6 +490,52 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             legal_absolute_winrates = absolute_winrates[policy_mask_bool]
             move_winrate_mae = torch.abs(
                 legal_pred_winrates - legal_absolute_winrates).mean()
+
+        # NEW: Attention-based policy head losses (same structure as existing policy head)
+        attention_policy_loss: Optional[torch.Tensor] = None
+        attention_move_winrate_loss: Optional[torch.Tensor] = None
+
+        if attention_policy_logits is not None and policy is not None and true_value is not None:
+            # Reuse policy_mask_bool and absolute_winrates from existing policy head logic
+
+            # Loss 1: Softmax expected regret loss
+            if self.attention_policy_loss_weight > 0:
+                # Create target distribution (same as existing policy head)
+                eps = 1e-7
+                clamped_winrates = torch.clamp(absolute_winrates, eps, 1 - eps)
+                target_logits = torch.where(
+                    policy_mask_bool,
+                    torch.log(clamped_winrates / (1 - clamped_winrates)),
+                    torch.full_like(clamped_winrates, -1e9)
+                )
+                target_probs = F.softmax(target_logits / self.temperature, dim=-1)
+
+                # Apply illegality penalty with annealing
+                masked_attn_logits = attention_policy_logits.clone()
+                if training_step is not None and self.illegality_penalty_annealing_steps > 0:
+                    if training_step < self.illegality_penalty_annealing_steps:
+                        progress = training_step / self.illegality_penalty_annealing_steps
+                        penalty = self.illegality_penalty_start * (1.0 - progress)
+                        masked_attn_logits[~policy_mask_bool] = masked_attn_logits[~policy_mask_bool] + penalty
+
+                # Always enforce floor at -1e9 for numerical stability
+                masked_attn_logits[~policy_mask_bool] = masked_attn_logits[~policy_mask_bool].clamp(max=-1e9)
+
+                model_probs_attn = F.softmax(masked_attn_logits / self.temperature, dim=-1)
+                raw_loss = -(target_probs * torch.log(model_probs_attn + 1e-10)).sum(dim=-1).mean()
+                attention_policy_loss = self.attention_policy_loss_weight * raw_loss
+
+            # Loss 2: Sigmoid move winrate loss
+            if self.attention_move_winrate_loss_weight > 0:
+                move_winrate_targets = torch.where(
+                    policy_mask_bool,
+                    absolute_winrates,
+                    torch.zeros_like(absolute_winrates)
+                )
+                raw_loss = F.binary_cross_entropy_with_logits(
+                    attention_policy_logits, move_winrate_targets, reduction='mean'
+                )
+                attention_move_winrate_loss = self.attention_move_winrate_loss_weight * raw_loss
 
         wdl_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None
@@ -479,7 +645,14 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         loss_components = [
             component
-            for component in (policy_loss, move_winrate_loss, wdl_loss, masked_token_loss)
+            for component in (
+                policy_loss,
+                move_winrate_loss,
+                wdl_loss,
+                masked_token_loss,
+                attention_policy_loss,
+                attention_move_winrate_loss,
+            )
             if component is not None
         ]
         loss: Optional[torch.Tensor] = None
@@ -507,6 +680,11 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             illegality_head_loss=None,  # Removed - now handled by move_winrate_loss
             masked_token_loss=masked_token_loss,
             move_winrate_loss=move_winrate_loss,  # Now handles BOTH legal move ranking AND illegality prediction
+            # NEW: Attention-based policy head outputs
+            attention_policy_logits=attention_policy_logits,
+            attention_policy_loss=attention_policy_loss,
+            attention_move_winrate_loss=attention_move_winrate_loss,
+            # Metrics
             illegality_rate=illegality_rate,
             illegality_head_accuracy=None,  # Removed - illegality now implicit in move_winrate_loss
             masked_token_accuracy=masked_token_accuracy,

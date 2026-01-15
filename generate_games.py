@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -228,6 +229,17 @@ def _select_moves_from_model_batch(
     # Get model predictions for entire batch
     with torch.no_grad():
         outputs = model(input_ids=input_ids, return_dict=True)
+
+    # DEFAULT: Prefer attention policy head
+    # Can be overridden with USE_OLD_POLICY_HEAD=1 environment variable
+    use_old_head = os.getenv('USE_OLD_POLICY_HEAD', '0') == '1'
+
+    if use_old_head:
+        policy_logits = outputs.policy_logits
+    elif hasattr(outputs, 'attention_policy_logits') and outputs.attention_policy_logits is not None:
+        policy_logits = outputs.attention_policy_logits
+    else:
+        # Fallback to old head if attention head not available
         policy_logits = outputs.policy_logits
 
     # Process each position in the batch

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -319,7 +320,18 @@ def evaluate_puzzles(
                 input_ids=input_ids,
                 return_dict=True,
             )
-            logits = outputs.policy_logits
+
+            # DEFAULT: Prefer attention policy head
+            # Can be overridden with USE_OLD_POLICY_HEAD=1 environment variable
+            use_old_head = os.getenv('USE_OLD_POLICY_HEAD', '0') == '1'
+
+            if use_old_head:
+                logits = outputs.policy_logits
+            elif hasattr(outputs, 'attention_policy_logits') and outputs.attention_policy_logits is not None:
+                logits = outputs.attention_policy_logits
+            else:
+                # Fallback to old head if attention head not available
+                logits = outputs.policy_logits
 
             masked_logits = logits.masked_fill(~legal_masks, float("-inf"))
             probs = softmax(masked_logits)

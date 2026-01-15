@@ -114,6 +114,9 @@ class TrackingTrainer(Trainer):
         self._last_value_mae: Optional[float] = None
         self._last_move_winrate_mae: Optional[float] = None
         self._last_model_entropy: Optional[float] = None
+        # NEW: Attention policy head losses
+        self._last_attention_policy_loss: Optional[float] = None
+        self._last_attention_move_winrate_loss: Optional[float] = None
 
     def compute_loss(
         self,
@@ -178,6 +181,27 @@ class TrackingTrainer(Trainer):
         else:
             self._last_move_winrate_loss = None
 
+        # NEW: Attention policy head losses
+        attention_policy_loss = getattr(outputs, "attention_policy_loss", None)
+        if attention_policy_loss is not None:
+            weight = float(getattr(model, "attention_policy_loss_weight", 0.0))
+            value = float(attention_policy_loss.detach().item())
+            self._last_attention_policy_loss = (
+                value / weight if weight > 0 else value
+            )
+        else:
+            self._last_attention_policy_loss = None
+
+        attention_move_winrate_loss = getattr(outputs, "attention_move_winrate_loss", None)
+        if attention_move_winrate_loss is not None:
+            weight = float(getattr(model, "attention_move_winrate_loss_weight", 0.0))
+            value = float(attention_move_winrate_loss.detach().item())
+            self._last_attention_move_winrate_loss = (
+                value / weight if weight > 0 else value
+            )
+        else:
+            self._last_attention_move_winrate_loss = None
+
         # Extract metrics (not losses)
         illegality_rate = getattr(outputs, "illegality_rate", None)
         self._last_illegality_rate = (
@@ -232,6 +256,12 @@ class TrackingTrainer(Trainer):
             if self._last_move_winrate_loss is not None:
                 logs.setdefault("move_winrate_loss",
                                 self._last_move_winrate_loss)
+            if self._last_attention_policy_loss is not None:
+                logs.setdefault("attention_policy_loss",
+                                self._last_attention_policy_loss)
+            if self._last_attention_move_winrate_loss is not None:
+                logs.setdefault("attention_move_winrate_loss",
+                                self._last_attention_move_winrate_loss)
 
             # Log metrics
             if self._last_illegality_rate is not None:
