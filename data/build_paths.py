@@ -1,26 +1,25 @@
 #!/usr/bin/env python
 """
-Build 8-move predecessor paths for each position in the dataset.
+Build move history paths for each position in the dataset.
 
-For each position, finds all sequences of up to 8 moves that could lead to it
-(where all intermediate positions exist in the dataset), tracking cumulative
-regret along each path.
+Single forward pass from ply 0 to max ply:
+- For each position, find up to 5 move sequences from game start
+- All intermediate positions must exist in the dataset (in-network)
+- Paths filtered by average regret (prefer 1-8% range)
+- Paths sampled for diversity (different sources, different regret levels)
 
-Output: New HuggingFace dataset with paths embedded as a column.
-
-Uses Arrow-native operations for speed - avoids slow JSON serialization.
+Output: One file per ply in paths_by_ply/ directory
 """
 import os
-import heapq
+import json
 import hashlib
-import gc
+import random
 from pathlib import Path
-from dataclasses import dataclass
+from collections import defaultdict
 from typing import Dict, List, Tuple, Set
 
 import chess
-import pyarrow as pa
-from datasets import Dataset, Features, Value, Sequence, load_from_disk, concatenate_datasets
+from datasets import load_from_disk
 from tqdm.auto import tqdm
 
 # -------------------------------------------------------------------
@@ -31,585 +30,282 @@ SCRATCH_BASE = Path("/fs/scratch/PAS2836/lees_stuff")
 
 os.environ["HF_HOME"] = str(SCRATCH_BASE / "hf_cache")
 os.environ["HF_DATASETS_CACHE"] = str(SCRATCH_BASE / "hf_cache" / "datasets")
-os.environ["HUGGINGFACE_HUB_CACHE"] = str(SCRATCH_BASE / "hf_cache" / "hub")
 
-temp_dir = SCRATCH_BASE / "tmp"
-temp_dir.mkdir(parents=True, exist_ok=True)
-os.environ["TMPDIR"] = str(temp_dir)
-os.environ["TEMP"] = str(temp_dir)
-os.environ["TMP"] = str(temp_dir)
-
-# Input/output paths
 DATASET_PATH = SCRATCH_BASE / "action_value"
-OUTPUT_PATH = SCRATCH_BASE / "action_value_with_paths"
-SORTED_DATASET_PATH = SCRATCH_BASE / "action_value_sorted_by_ply"
+OUTPUT_DIR = SCRATCH_BASE / "paths_by_ply"
 
-# Algorithm parameters
-MAX_PATHS_PER_POSITION = 10
-MAX_PATH_DEPTH = 8
-NUM_PROC = os.cpu_count()
+MAX_PATHS_PER_POSITION = 5
+MIN_AVG_REGRET = 0.01  # 1%
+MAX_AVG_REGRET = 0.08  # 8%
 
 # -------------------------------------------------------------------
-# DATA STRUCTURES
-# -------------------------------------------------------------------
-
-
-@dataclass
-class PositionData:
-    """Data for a single position in the dataset."""
-    fen: str
-    moves: List[str]
-    p_wins: List[float]
-    best_p_win: float
-    ply: int  # Total half-moves played to reach this position
-
-
-PositionIndex = Dict[int, PositionData]
-PredecessorGraph = Dict[int, List[Tuple[int, str, float]]]
-
-
-# -------------------------------------------------------------------
-# OUTPUT SCHEMA
-# -------------------------------------------------------------------
-
-OUTPUT_FEATURES = Features({
-    "fen": Value("string"),
-    "moves": Sequence(Value("string")),
-    "p_win": Sequence(Value("float32")),
-    "path_moves": Sequence(Sequence(Value("string"))),
-    "path_hashes": Sequence(Sequence(Value("int64"))),
-    "path_regrets": Sequence(Value("float32")),
-})
-
-
-# -------------------------------------------------------------------
-# FEN UTILITIES
+# UTILITIES
 # -------------------------------------------------------------------
 
 
 def board_hash(fen: str) -> int:
-    """Hash FEN to 64-bit integer using MD5."""
+    """Hash FEN to 64-bit integer."""
     digest = hashlib.md5(fen.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "little")
 
 
 def extract_ply(fen: str) -> int:
-    """
-    Extract ply (total half-moves played) from FEN.
-
-    ply = (fullmove - 1) * 2 + (1 if black to move else 0)
-
-    Examples:
-    - Starting position (white, fullmove=1): ply=0
-    - After 1.e4 (black, fullmove=1): ply=1
-    - After 1...e5 (white, fullmove=2): ply=2
-    """
+    """Extract ply from FEN: (fullmove-1)*2 + (1 if black else 0)."""
     parts = fen.split()
     side = parts[1]
     fullmove = int(parts[5])
     return (fullmove - 1) * 2 + (1 if side == 'b' else 0)
 
 
-def get_max_path_depth(ply: int) -> int:
-    """Get maximum path depth based on game progress."""
-    return min(MAX_PATH_DEPTH, ply)
-
-
 # -------------------------------------------------------------------
-# PHASE 1: ADD PLY COLUMN AND SORT
+# PATH FILTERING & SAMPLING
 # -------------------------------------------------------------------
 
 
-def prepare_sorted_dataset(dataset: Dataset) -> Dataset:
+def filter_and_sample_paths(
+    candidate_paths: List[Tuple[List[str], float, int]],
+    max_paths: int = MAX_PATHS_PER_POSITION,
+) -> List[Tuple[List[str], float, int]]:
     """
-    Add ply column and sort dataset by ply.
-    Uses Arrow-native operations for speed.
+    Filter and sample paths down to max_paths.
+
+    Each path is (moves, total_regret, source_hash).
+
+    Strategy:
+    1. Compute avg_regret for each path
+    2. Prefer paths with 1% <= avg_regret <= 8%
+    3. If still > max_paths, sample for diversity:
+       - Different source positions
+       - Different avg_regret values
     """
-    print("Phase 1: Adding ply column and sorting...")
+    if len(candidate_paths) <= max_paths:
+        return candidate_paths
 
-    # Check if sorted dataset already exists
-    if SORTED_DATASET_PATH.exists():
-        print(f"Loading pre-sorted dataset from {SORTED_DATASET_PATH}")
-        return load_from_disk(str(SORTED_DATASET_PATH))
+    # Compute avg regret for each path
+    def avg_regret(path):
+        moves, total_regret, _ = path
+        return total_regret / len(moves) if moves else 0.0
 
-    # Add ply column using fast batch mapping
-    def add_ply(batch):
-        plies = [extract_ply(fen) for fen in batch["fen"]]
-        return {"ply": plies}
+    # Split into preferred (1-8% avg regret) and other
+    preferred = []
+    other = []
+    for path in candidate_paths:
+        ar = avg_regret(path)
+        if MIN_AVG_REGRET <= ar <= MAX_AVG_REGRET:
+            preferred.append(path)
+        else:
+            other.append(path)
 
-    print("Adding ply column...")
-    dataset = dataset.map(
-        add_ply,
-        batched=True,
-        batch_size=100_000,
-        num_proc=NUM_PROC,
-        desc="Adding ply",
-    )
+    # Use preferred if available, otherwise fall back to all
+    pool = preferred if preferred else candidate_paths
 
-    print("Sorting by ply...")
-    dataset = dataset.sort("ply")
+    if len(pool) <= max_paths:
+        return pool
 
-    print(f"Saving sorted dataset to {SORTED_DATASET_PATH}")
-    dataset.save_to_disk(str(SORTED_DATASET_PATH))
+    # Sample for diversity: different sources and different regret levels
+    # Group by source_hash
+    by_source: Dict[int, List] = defaultdict(list)
+    for path in pool:
+        _, _, source_hash = path
+        by_source[source_hash].append(path)
 
-    return dataset
+    selected = []
+    sources = list(by_source.keys())
+    random.shuffle(sources)
 
+    # Round-robin from different sources
+    while len(selected) < max_paths and any(by_source.values()):
+        for src in sources:
+            if by_source[src] and len(selected) < max_paths:
+                # Pick path with median-ish regret from this source
+                by_source[src].sort(key=avg_regret)
+                mid = len(by_source[src]) // 2
+                selected.append(by_source[src].pop(mid))
 
-def get_ply_ranges(dataset: Dataset) -> Dict[int, Tuple[int, int]]:
-    """
-    Build index of ply -> (start_idx, end_idx) ranges.
-    Since dataset is sorted, positions with same ply are contiguous.
-    """
-    print("Building ply range index...")
-
-    plies = dataset["ply"]
-    ranges = {}
-
-    current_ply = plies[0]
-    start_idx = 0
-
-    for i, p in enumerate(tqdm(plies, desc="Indexing plies")):
-        if p != current_ply:
-            ranges[current_ply] = (start_idx, i)
-            current_ply = p
-            start_idx = i
-
-    # Don't forget the last range
-    ranges[current_ply] = (start_idx, len(plies))
-
-    print(f"Found {len(ranges)} distinct ply values")
-    return ranges
+    return selected
 
 
 # -------------------------------------------------------------------
-# PHASE 2: BUILD TRANSITION GRAPH
+# MAIN ALGORITHM
 # -------------------------------------------------------------------
 
 
-def build_position_index(dataset: Dataset, start_idx: int, end_idx: int) -> PositionIndex:
-    """Build position index from a slice of the dataset."""
-    index = {}
+def build_index(dataset) -> Tuple[Dict[int, Set[int]], Dict[int, int]]:
+    """
+    Build:
+    1. hashes_at_ply: ply -> set of position hashes
+    2. hash_to_idx: hash -> dataset index (for loading position data)
+    """
+    print("Building index...")
 
-    for i in range(start_idx, end_idx):
+    hashes_at_ply = defaultdict(set)
+    hash_to_idx = {}
+
+    for i in tqdm(range(len(dataset)), desc="Indexing"):
+        fen = dataset[i]["fen"]
+        ply = extract_ply(fen)
+        h = board_hash(fen)
+
+        hashes_at_ply[ply].add(h)
+        hash_to_idx[h] = i
+
+    max_ply = max(hashes_at_ply.keys()) if hashes_at_ply else 0
+    print(f"Found {len(hashes_at_ply)} distinct plies (0 to {max_ply})")
+    print(f"Indexed {len(hash_to_idx):,} positions")
+    return dict(hashes_at_ply), hash_to_idx
+
+
+def load_positions_by_hash(dataset, hashes: Set[int], hash_to_idx: Dict[int, int]) -> Dict[int, dict]:
+    """Load position data for specific hashes. Returns hash -> {fen, moves, p_win, best_p_win}."""
+    data = {}
+    for h in hashes:
+        if h not in hash_to_idx:
+            continue
+        i = hash_to_idx[h]
         row = dataset[i]
         fen = row["fen"]
-        moves = list(row["moves"])
         p_wins = list(row["p_win"])
-
-        h = board_hash(fen)
-        index[h] = PositionData(
-            fen=fen,
-            moves=moves,
-            p_wins=p_wins,
-            best_p_win=max(p_wins) if p_wins else 0.5,
-            ply=row["ply"],
-        )
-
-    return index
+        data[h] = {
+            "fen": fen,
+            "moves": list(row["moves"]),
+            "p_win": p_wins,
+            "best_p_win": max(p_wins) if p_wins else 0.5,
+        }
+    return data
 
 
-def compute_transitions(pos: PositionData) -> List[Tuple[str, int, float]]:
-    """Compute all transitions from this position."""
-    board = chess.Board(pos.fen)
-    transitions = []
+def save_ply_paths(ply: int, paths_by_hash: Dict[int, List[Tuple[List[str], float, int]]]):
+    """Save paths for a ply to disk."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT_DIR / f"ply_{ply:04d}.json"
 
-    for move_uci, p_win in zip(pos.moves, pos.p_wins):
-        try:
-            move = chess.Move.from_uci(move_uci)
-            board.push(move)
-            result_fen = board.fen()
-            target_hash = board_hash(result_fen)
-            board.pop()
-
-            regret = pos.best_p_win - p_win
-            transitions.append((move_uci, target_hash, regret))
-        except Exception:
-            continue
-
-    return transitions
-
-
-def build_predecessor_graph(position_index: PositionIndex) -> PredecessorGraph:
-    """Build inverted graph: target_hash -> [(source_hash, move, regret), ...]"""
-    from collections import defaultdict
-    predecessors = defaultdict(list)
-
-    for source_hash, pos in position_index.items():
-        for move_uci, target_hash, regret in compute_transitions(pos):
-            if target_hash in position_index:
-                predecessors[target_hash].append((source_hash, move_uci, regret))
-
-    return dict(predecessors)
-
-
-# -------------------------------------------------------------------
-# PHASE 3: BACKWARD PATH ENUMERATION
-# -------------------------------------------------------------------
-
-
-def find_paths(
-    target_hash: int,
-    target_pos: PositionData,
-    predecessors: PredecessorGraph,
-    position_index: PositionIndex,
-    max_paths: int = MAX_PATHS_PER_POSITION,
-) -> List[Tuple[List[str], List[int], float]]:
-    """Find up to max_paths paths leading to target."""
-    max_depth = get_max_path_depth(target_pos.ply)
-
-    if max_depth == 0:
-        return []
-
-    heap = [(0.0, target_hash, [], [], 0)]
-    paths = []
-    visited_states: Set[Tuple[int, int]] = set()
-
-    while heap and len(paths) < max_paths:
-        regret, current_hash, path_moves, path_hashes, d = heapq.heappop(heap)
-
-        state = (current_hash, d)
-        if state in visited_states:
-            continue
-        visited_states.add(state)
-
-        if d == max_depth:
-            paths.append((
-                list(reversed(path_moves)),
-                list(reversed(path_hashes)),
-                round(regret, 6),
-            ))
-            continue
-
-        for pred_hash, move_uci, move_regret in predecessors.get(current_hash, []):
-            if pred_hash not in position_index:
-                continue
-
-            heapq.heappush(heap, (
-                regret + move_regret,
-                pred_hash,
-                path_moves + [move_uci],
-                path_hashes + [pred_hash],
-                d + 1,
-            ))
-
-    return paths
-
-
-# -------------------------------------------------------------------
-# PHASE 4: PROCESS BY PLY WINDOWS
-# -------------------------------------------------------------------
-
-
-def process_ply_window(
-    dataset: Dataset,
-    ply_ranges: Dict[int, Tuple[int, int]],
-    target_ply: int,
-) -> Dict[int, List[Tuple[List[str], List[int], float]]]:
-    """
-    Process positions at target_ply, loading a window of preceding plies.
-    Returns dict mapping target_hash -> list of paths.
-    """
-    # For 8-move paths ending at ply P, we need plies P-8 through P-1
-    window_start_ply = max(0, target_ply - MAX_PATH_DEPTH)
-
-    # Build position index for the window
-    position_index = {}
-    for p in range(window_start_ply, target_ply + 1):
-        if p in ply_ranges:
-            start_idx, end_idx = ply_ranges[p]
-            window_positions = build_position_index(dataset, start_idx, end_idx)
-            position_index.update(window_positions)
-
-    if not position_index:
-        return {}
-
-    # Get target positions (at target_ply only)
-    target_hashes = {
-        h for h, pos in position_index.items()
-        if pos.ply == target_ply
+    # Convert to JSON-serializable format
+    data = {
+        str(h): [
+            {"moves": moves, "total_regret": round(regret, 6), "source_hash": src}
+            for moves, regret, src in path_list
+        ]
+        for h, path_list in paths_by_hash.items()
     }
 
-    if not target_hashes:
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
+def load_ply_paths(ply: int) -> Dict[int, List[Tuple[List[str], float, int]]]:
+    """Load paths for a ply from disk."""
+    path = OUTPUT_DIR / f"ply_{ply:04d}.json"
+    if not path.exists():
         return {}
 
-    # Build predecessor graph
-    predecessors = build_predecessor_graph(position_index)
+    with open(path, "r") as f:
+        data = json.load(f)
 
-    # Find paths for each target
-    results = {}
-    for target_hash in target_hashes:
-        paths = find_paths(
-            target_hash,
-            position_index[target_hash],
-            predecessors,
-            position_index,
-        )
-        if paths:
-            results[target_hash] = paths
-
-    return results
-
-
-# -------------------------------------------------------------------
-# PHASE 5: CREATE FINAL DATASET
-# -------------------------------------------------------------------
-
-
-def create_output_dataset(
-    dataset: Dataset,
-    ply_ranges: Dict[int, Tuple[int, int]],
-) -> Dataset:
-    """
-    Create final dataset with paths.
-    Processes one ply at a time to manage memory.
-    """
-    print("\nPhase 2: Computing paths and building output dataset...")
-
-    plies = sorted(ply_ranges.keys())
-    all_rows = []
-
-    for target_ply in tqdm(plies, desc="Processing plies"):
-        # Compute paths for this ply
-        paths_by_hash = process_ply_window(dataset, ply_ranges, target_ply)
-
-        # Get rows for this ply
-        start_idx, end_idx = ply_ranges[target_ply]
-
-        for i in range(start_idx, end_idx):
-            row = dataset[i]
-            fen = row["fen"]
-            h = board_hash(fen)
-
-            position_paths = paths_by_hash.get(h, [])
-
-            if position_paths:
-                path_moves = [p[0] for p in position_paths]
-                path_hashes = [p[1] for p in position_paths]
-                path_regrets = [p[2] for p in position_paths]
-            else:
-                path_moves = []
-                path_hashes = []
-                path_regrets = []
-
-            all_rows.append({
-                "fen": fen,
-                "moves": list(row["moves"]),
-                "p_win": list(row["p_win"]),
-                "path_moves": path_moves,
-                "path_hashes": path_hashes,
-                "path_regrets": path_regrets,
-            })
-
-        # Periodically save to avoid memory issues
-        if len(all_rows) >= 10_000_000:
-            print(f"\nFlushing {len(all_rows):,} rows to intermediate dataset...")
-            # TODO: Could save intermediate chunks here
-            pass
-
-        gc.collect()
-
-    print(f"\nCreating final dataset with {len(all_rows):,} rows...")
-    output_dataset = Dataset.from_list(all_rows, features=OUTPUT_FEATURES)
-
-    return output_dataset
-
-
-# -------------------------------------------------------------------
-# ALTERNATIVE: STREAMING APPROACH FOR HUGE DATASETS
-# -------------------------------------------------------------------
-
-
-def process_streaming(dataset: Dataset, ply_ranges: Dict[int, Tuple[int, int]]):
-    """
-    Process dataset in streaming fashion, writing output incrementally.
-    Better for very large datasets that don't fit in memory.
-    """
-    print("\nPhase 2: Computing paths (streaming mode)...")
-
-    plies = sorted(ply_ranges.keys())
-    output_path = OUTPUT_PATH / "data"
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    chunk_idx = 0
-    rows_buffer = []
-    CHUNK_SIZE = 1_000_000
-
-    for target_ply in tqdm(plies, desc="Processing plies"):
-        paths_by_hash = process_ply_window(dataset, ply_ranges, target_ply)
-
-        start_idx, end_idx = ply_ranges[target_ply]
-
-        for i in range(start_idx, end_idx):
-            row = dataset[i]
-            fen = row["fen"]
-            h = board_hash(fen)
-
-            position_paths = paths_by_hash.get(h, [])
-
-            if position_paths:
-                path_moves = [p[0] for p in position_paths]
-                path_hashes = [p[1] for p in position_paths]
-                path_regrets = [float(p[2]) for p in position_paths]
-            else:
-                path_moves = []
-                path_hashes = []
-                path_regrets = []
-
-            rows_buffer.append({
-                "fen": fen,
-                "moves": list(row["moves"]),
-                "p_win": [float(x) for x in row["p_win"]],
-                "path_moves": path_moves,
-                "path_hashes": path_hashes,
-                "path_regrets": path_regrets,
-            })
-
-            if len(rows_buffer) >= CHUNK_SIZE:
-                chunk_ds = Dataset.from_list(rows_buffer, features=OUTPUT_FEATURES)
-                chunk_ds.save_to_disk(str(output_path / f"chunk_{chunk_idx:04d}"))
-                print(f"\nSaved chunk {chunk_idx} ({len(rows_buffer):,} rows)")
-                rows_buffer = []
-                chunk_idx += 1
-                gc.collect()
-
-        gc.collect()
-
-    # Save remaining rows
-    if rows_buffer:
-        chunk_ds = Dataset.from_list(rows_buffer, features=OUTPUT_FEATURES)
-        chunk_ds.save_to_disk(str(output_path / f"chunk_{chunk_idx:04d}"))
-        print(f"\nSaved final chunk {chunk_idx} ({len(rows_buffer):,} rows)")
-
-    # Concatenate all chunks
-    print("\nConcatenating chunks...")
-    chunk_paths = sorted(output_path.glob("chunk_*"))
-    chunks = [load_from_disk(str(p)) for p in chunk_paths]
-    final_dataset = concatenate_datasets(chunks)
-
-    print(f"Final dataset has {len(final_dataset):,} examples")
-    final_dataset.save_to_disk(str(OUTPUT_PATH))
-
-    # Cleanup chunks
-    import shutil
-    shutil.rmtree(output_path)
-
-
-# -------------------------------------------------------------------
-# MAIN
-# -------------------------------------------------------------------
+    return {
+        int(h): [
+            (p["moves"], p["total_regret"], p["source_hash"])
+            for p in path_list
+        ]
+        for h, path_list in data.items()
+    }
 
 
 def main():
-    """Main entry point."""
     print(f"Loading dataset from {DATASET_PATH}...")
     dataset = load_from_disk(str(DATASET_PATH))
-    print(f"Dataset has {len(dataset):,} examples")
-    print(f"Max paths per position: {MAX_PATHS_PER_POSITION}")
-    print(f"Max path depth: {MAX_PATH_DEPTH}")
+    print(f"Dataset has {len(dataset):,} positions")
 
-    # Phase 1: Sort by ply (uses Arrow, much faster than JSON partitioning)
-    dataset = prepare_sorted_dataset(dataset)
+    # Build index
+    hashes_at_ply, hash_to_idx = build_index(dataset)
+    plies = sorted(hashes_at_ply.keys())
 
-    # Build ply range index
-    ply_ranges = get_ply_ranges(dataset)
+    print(f"\nProcessing {len(plies)} plies...")
 
-    # Phase 2-3: Process and create output (streaming for large datasets)
-    process_streaming(dataset, ply_ranges)
+    # Initialize ply 0 with empty paths
+    current_paths: Dict[int, List[Tuple[List[str], float, int]]] = {}
 
-    print(f"\nFinal dataset saved to: {OUTPUT_PATH}")
+    if 0 in hashes_at_ply:
+        for h in hashes_at_ply[0]:
+            current_paths[h] = [([], 0.0, None)]  # empty moves, 0 regret, no source
+        save_ply_paths(0, current_paths)
+        print(f"Ply 0: {len(current_paths)} positions initialized")
 
+    # Forward pass
+    for ply in tqdm(plies, desc="Processing plies"):
+        if ply == 0:
+            continue
 
-def verify_paths(sample_size: int = 100):
-    """Verify a sample of paths for correctness."""
-    import random
+        prev_ply = ply - 1
 
-    print(f"Loading dataset from {OUTPUT_PATH}...")
-    dataset = load_from_disk(str(OUTPUT_PATH))
-    print(f"Dataset has {len(dataset):,} examples")
+        # Load previous ply paths if not in memory (resuming)
+        if not current_paths and prev_ply in hashes_at_ply:
+            current_paths = load_ply_paths(prev_ply)
 
-    indices_with_paths = [
-        i for i in range(min(100000, len(dataset)))
-        if len(dataset[i]["path_moves"]) > 0
-    ]
+        if not current_paths:
+            print(f"Ply {ply}: No paths from previous ply, skipping")
+            continue
 
-    print(f"Found {len(indices_with_paths):,} examples with paths (in first 100k)")
+        # Get hashes that exist at current ply (targets)
+        target_hashes = hashes_at_ply.get(ply, set())
+        if not target_hashes:
+            current_paths = {}
+            continue
 
-    if len(indices_with_paths) < sample_size:
-        sample_indices = indices_with_paths
-    else:
-        sample_indices = random.sample(indices_with_paths, sample_size)
+        # Load position data for positions that have paths (previous ply)
+        source_hashes = set(current_paths.keys())
+        prev_data = load_positions_by_hash(dataset, source_hashes, hash_to_idx)
 
-    print(f"Verifying {len(sample_indices)} random paths...")
+        # Compute candidate paths for each position at current ply
+        next_paths: Dict[int, List[Tuple[List[str], float, int]]] = defaultdict(list)
 
-    # Build hash lookup
-    print("Building hash lookup (first 1M positions)...")
-    hash_to_fen = {}
-    for i in tqdm(range(min(1_000_000, len(dataset))), desc="Indexing"):
-        fen = dataset[i]["fen"]
-        hash_to_fen[board_hash(fen)] = fen
-
-    errors = 0
-    for idx in tqdm(sample_indices, desc="Verifying"):
-        example = dataset[idx]
-        target_fen = example["fen"]
-        target_hash = board_hash(target_fen)
-
-        for path_idx, (moves, hashes, regret) in enumerate(zip(
-            example["path_moves"],
-            example["path_hashes"],
-            example["path_regrets"],
-        )):
-            if len(moves) != len(hashes):
-                print(f"ERROR: moves/hashes length mismatch")
-                errors += 1
+        for source_hash, source_paths in current_paths.items():
+            if source_hash not in prev_data:
                 continue
 
-            if not hashes:
-                continue
+            pos = prev_data[source_hash]
+            board = chess.Board(pos["fen"])
 
-            starting_hash = hashes[0]
-            if starting_hash not in hash_to_fen:
-                # May not be in our limited lookup
-                continue
+            for move_uci, p_win in zip(pos["moves"], pos["p_win"]):
+                regret = pos["best_p_win"] - p_win
 
-            starting_fen = hash_to_fen[starting_hash]
-            board = chess.Board(starting_fen)
-
-            try:
-                for i, (move_uci, expected_hash) in enumerate(zip(moves, hashes)):
-                    actual_hash = board_hash(board.fen())
-                    if actual_hash != expected_hash:
-                        print(f"ERROR: Hash mismatch at step {i}")
-                        errors += 1
-                        break
-
+                try:
                     move = chess.Move.from_uci(move_uci)
-                    if move not in board.legal_moves:
-                        print(f"ERROR: Illegal move {move_uci}")
-                        errors += 1
-                        break
-
                     board.push(move)
+                    target_hash = board_hash(board.fen())
+                    board.pop()
+                except:
+                    continue
 
-                final_hash = board_hash(board.fen())
-                if final_hash != target_hash:
-                    print(f"ERROR: Did not reach target")
-                    errors += 1
+                # Only add if target exists in dataset at this ply
+                if target_hash not in target_hashes:
+                    continue
 
-            except Exception as e:
-                print(f"ERROR: {e}")
-                errors += 1
+                # Extend each source path with this move
+                for moves, total_regret, _ in source_paths:
+                    new_path = (
+                        moves + [move_uci],
+                        total_regret + regret,
+                        source_hash,
+                    )
+                    next_paths[target_hash].append(new_path)
 
-    if errors == 0:
-        print(f"All {len(sample_indices)} verified paths passed!")
-    else:
-        print(f"Found {errors} errors")
+        # Filter and sample paths for each position
+        current_paths = {
+            h: filter_and_sample_paths(candidates)
+            for h, candidates in next_paths.items()
+        }
+
+        # Save this ply
+        save_ply_paths(ply, current_paths)
+
+        if ply % 10 == 0:
+            positions_with_paths = len(current_paths)
+            total_at_ply = len(target_hashes)
+            pct = 100 * positions_with_paths / total_at_ply if total_at_ply else 0
+            print(f"Ply {ply}: {positions_with_paths:,}/{total_at_ply:,} positions have paths ({pct:.1f}%)")
+
+    print(f"\nDone! Paths saved to {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == "--verify":
-        verify_paths()
-    else:
-        main()
+    main()
