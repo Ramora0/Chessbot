@@ -192,9 +192,11 @@ class TrackingTrainer(Trainer):
         else:
             self._last_attention_policy_loss = None
 
-        attention_move_winrate_loss = getattr(outputs, "attention_move_winrate_loss", None)
+        attention_move_winrate_loss = getattr(
+            outputs, "attention_move_winrate_loss", None)
         if attention_move_winrate_loss is not None:
-            weight = float(getattr(model, "attention_move_winrate_loss_weight", 0.0))
+            weight = float(
+                getattr(model, "attention_move_winrate_loss_weight", 0.0))
             value = float(attention_move_winrate_loss.detach().item())
             self._last_attention_move_winrate_loss = (
                 value / weight if weight > 0 else value
@@ -500,11 +502,13 @@ def train() -> None:
             RESUME_FROM_CHECKPOINT)
         model.config.use_cache = False
         # Update annealing steps for resumed training
-        model.config.illegality_penalty_annealing_steps = int(schedule.max_steps * 0.1)
+        model.config.illegality_penalty_annealing_steps = int(
+            schedule.max_steps * 0.1)
         model.illegality_penalty_annealing_steps = model.config.illegality_penalty_annealing_steps
         print(
             f"Model loaded from checkpoint with {sum(p.numel() for p in model.parameters()):,} parameters")
-        print(f"Illegality penalty annealing: {model.illegality_penalty_annealing_steps} steps (10% of epoch)")
+        print(
+            f"Illegality penalty annealing: {model.illegality_penalty_annealing_steps} steps (10% of epoch)")
     else:
         print("Creating model configuration...")
         config = LlamaConfig(
@@ -523,10 +527,12 @@ def train() -> None:
         # Anneal illegality penalty over first 10% of epoch
         # Start with -10 penalty on illegal logits, linearly reduce to 0
         # This helps bootstrap learning by making illegal moves obviously bad at first
-        config.illegality_penalty_annealing_steps = int(schedule.max_steps * 0.1)
+        config.illegality_penalty_annealing_steps = int(
+            schedule.max_steps * 0.1)
 
         print(f"Model config created - policy dimension: {config.policy_dim}")
-        print(f"Illegality penalty annealing: {config.illegality_penalty_annealing_steps} steps (10% of epoch)")
+        print(
+            f"Illegality penalty annealing: {config.illegality_penalty_annealing_steps} steps (10% of epoch)")
 
         print("Initializing Chess LLaMA model...")
         model = ChessPolicyValueModel(config)
@@ -552,6 +558,7 @@ def train() -> None:
         weight_decay=0,
         max_grad_norm=1.0,
         bf16=True,
+        # fp16=True,
         save_strategy="steps",
         save_steps=schedule.save_steps,
         save_total_limit=2,
