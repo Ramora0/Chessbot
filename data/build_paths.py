@@ -42,7 +42,7 @@ os.environ["TMP"] = str(temp_dir)
 # Input/output paths
 DATASET_PATH = SCRATCH_BASE / "action_value"
 OUTPUT_PATH = SCRATCH_BASE / "action_value_with_paths"
-SORTED_DATASET_PATH = SCRATCH_BASE / "action_value_sorted"
+SORTED_DATASET_PATH = SCRATCH_BASE / "action_value_sorted_by_ply"
 
 # Algorithm parameters
 MAX_PATHS_PER_POSITION = 10
@@ -61,8 +61,7 @@ class PositionData:
     moves: List[str]
     p_wins: List[float]
     best_p_win: float
-    side: str
-    fullmove: int
+    ply: int  # Total half-moves played to reach this position
 
 
 PositionIndex = Dict[int, PositionData]
@@ -94,55 +93,61 @@ def board_hash(fen: str) -> int:
     return int.from_bytes(digest[:8], "little")
 
 
-def extract_fullmove(fen: str) -> int:
-    """Extract fullmove number from FEN string."""
-    return int(fen.split()[5])
+def extract_ply(fen: str) -> int:
+    """
+    Extract ply (total half-moves played) from FEN.
+
+    ply = (fullmove - 1) * 2 + (1 if black to move else 0)
+
+    Examples:
+    - Starting position (white, fullmove=1): ply=0
+    - After 1.e4 (black, fullmove=1): ply=1
+    - After 1...e5 (white, fullmove=2): ply=2
+    """
+    parts = fen.split()
+    side = parts[1]
+    fullmove = int(parts[5])
+    return (fullmove - 1) * 2 + (1 if side == 'b' else 0)
 
 
-def extract_side(fen: str) -> str:
-    """Extract side to move from FEN string."""
-    return fen.split()[1]
-
-
-def get_max_path_depth(side: str, fullmove: int) -> int:
+def get_max_path_depth(ply: int) -> int:
     """Get maximum path depth based on game progress."""
-    ply = (fullmove - 1) * 2 + (1 if side == 'b' else 0)
     return min(MAX_PATH_DEPTH, ply)
 
 
 # -------------------------------------------------------------------
-# PHASE 1: ADD FULLMOVE COLUMN AND SORT
+# PHASE 1: ADD PLY COLUMN AND SORT
 # -------------------------------------------------------------------
 
 
 def prepare_sorted_dataset(dataset: Dataset) -> Dataset:
     """
-    Add fullmove column and sort dataset by fullmove.
+    Add ply column and sort dataset by ply.
     Uses Arrow-native operations for speed.
     """
-    print("Phase 1: Adding fullmove column and sorting...")
+    print("Phase 1: Adding ply column and sorting...")
 
     # Check if sorted dataset already exists
     if SORTED_DATASET_PATH.exists():
         print(f"Loading pre-sorted dataset from {SORTED_DATASET_PATH}")
         return load_from_disk(str(SORTED_DATASET_PATH))
 
-    # Add fullmove column using fast batch mapping
-    def add_fullmove(batch):
-        fullmoves = [int(fen.split()[5]) for fen in batch["fen"]]
-        return {"fullmove": fullmoves}
+    # Add ply column using fast batch mapping
+    def add_ply(batch):
+        plies = [extract_ply(fen) for fen in batch["fen"]]
+        return {"ply": plies}
 
-    print("Adding fullmove column...")
+    print("Adding ply column...")
     dataset = dataset.map(
-        add_fullmove,
+        add_ply,
         batched=True,
         batch_size=100_000,
         num_proc=NUM_PROC,
-        desc="Adding fullmove",
+        desc="Adding ply",
     )
 
-    print("Sorting by fullmove...")
-    dataset = dataset.sort("fullmove")
+    print("Sorting by ply...")
+    dataset = dataset.sort("ply")
 
     print(f"Saving sorted dataset to {SORTED_DATASET_PATH}")
     dataset.save_to_disk(str(SORTED_DATASET_PATH))
@@ -150,29 +155,29 @@ def prepare_sorted_dataset(dataset: Dataset) -> Dataset:
     return dataset
 
 
-def get_fullmove_ranges(dataset: Dataset) -> Dict[int, Tuple[int, int]]:
+def get_ply_ranges(dataset: Dataset) -> Dict[int, Tuple[int, int]]:
     """
-    Build index of fullmove -> (start_idx, end_idx) ranges.
-    Since dataset is sorted, positions with same fullmove are contiguous.
+    Build index of ply -> (start_idx, end_idx) ranges.
+    Since dataset is sorted, positions with same ply are contiguous.
     """
-    print("Building fullmove range index...")
+    print("Building ply range index...")
 
-    fullmoves = dataset["fullmove"]
+    plies = dataset["ply"]
     ranges = {}
 
-    current_fm = fullmoves[0]
+    current_ply = plies[0]
     start_idx = 0
 
-    for i, fm in enumerate(tqdm(fullmoves, desc="Indexing fullmoves")):
-        if fm != current_fm:
-            ranges[current_fm] = (start_idx, i)
-            current_fm = fm
+    for i, p in enumerate(tqdm(plies, desc="Indexing plies")):
+        if p != current_ply:
+            ranges[current_ply] = (start_idx, i)
+            current_ply = p
             start_idx = i
 
     # Don't forget the last range
-    ranges[current_fm] = (start_idx, len(fullmoves))
+    ranges[current_ply] = (start_idx, len(plies))
 
-    print(f"Found {len(ranges)} distinct fullmove values")
+    print(f"Found {len(ranges)} distinct ply values")
     return ranges
 
 
@@ -197,8 +202,7 @@ def build_position_index(dataset: Dataset, start_idx: int, end_idx: int) -> Posi
             moves=moves,
             p_wins=p_wins,
             best_p_win=max(p_wins) if p_wins else 0.5,
-            side=extract_side(fen),
-            fullmove=row["fullmove"],
+            ply=row["ply"],
         )
 
     return index
@@ -251,7 +255,7 @@ def find_paths(
     max_paths: int = MAX_PATHS_PER_POSITION,
 ) -> List[Tuple[List[str], List[int], float]]:
     """Find up to max_paths paths leading to target."""
-    max_depth = get_max_path_depth(target_pos.side, target_pos.fullmove)
+    max_depth = get_max_path_depth(target_pos.ply)
 
     if max_depth == 0:
         return []
@@ -292,37 +296,37 @@ def find_paths(
 
 
 # -------------------------------------------------------------------
-# PHASE 4: PROCESS BY FULLMOVE WINDOWS
+# PHASE 4: PROCESS BY PLY WINDOWS
 # -------------------------------------------------------------------
 
 
-def process_fullmove_window(
+def process_ply_window(
     dataset: Dataset,
-    fullmove_ranges: Dict[int, Tuple[int, int]],
-    target_fm: int,
+    ply_ranges: Dict[int, Tuple[int, int]],
+    target_ply: int,
 ) -> Dict[int, List[Tuple[List[str], List[int], float]]]:
     """
-    Process positions at target_fm, loading a window of preceding fullmoves.
+    Process positions at target_ply, loading a window of preceding plies.
     Returns dict mapping target_hash -> list of paths.
     """
-    # Determine window: need to go back ~4 fullmoves for 8 ply
-    window_start_fm = max(1, target_fm - (MAX_PATH_DEPTH // 2 + 1))
+    # For 8-move paths ending at ply P, we need plies P-8 through P-1
+    window_start_ply = max(0, target_ply - MAX_PATH_DEPTH)
 
     # Build position index for the window
     position_index = {}
-    for fm in range(window_start_fm, target_fm + 1):
-        if fm in fullmove_ranges:
-            start_idx, end_idx = fullmove_ranges[fm]
+    for p in range(window_start_ply, target_ply + 1):
+        if p in ply_ranges:
+            start_idx, end_idx = ply_ranges[p]
             window_positions = build_position_index(dataset, start_idx, end_idx)
             position_index.update(window_positions)
 
     if not position_index:
         return {}
 
-    # Get target positions (at target_fm only)
+    # Get target positions (at target_ply only)
     target_hashes = {
         h for h, pos in position_index.items()
-        if pos.fullmove == target_fm
+        if pos.ply == target_ply
     }
 
     if not target_hashes:
@@ -353,23 +357,23 @@ def process_fullmove_window(
 
 def create_output_dataset(
     dataset: Dataset,
-    fullmove_ranges: Dict[int, Tuple[int, int]],
+    ply_ranges: Dict[int, Tuple[int, int]],
 ) -> Dataset:
     """
     Create final dataset with paths.
-    Processes one fullmove at a time to manage memory.
+    Processes one ply at a time to manage memory.
     """
     print("\nPhase 2: Computing paths and building output dataset...")
 
-    fullmoves = sorted(fullmove_ranges.keys())
+    plies = sorted(ply_ranges.keys())
     all_rows = []
 
-    for target_fm in tqdm(fullmoves, desc="Processing fullmoves"):
-        # Compute paths for this fullmove
-        paths_by_hash = process_fullmove_window(dataset, fullmove_ranges, target_fm)
+    for target_ply in tqdm(plies, desc="Processing plies"):
+        # Compute paths for this ply
+        paths_by_hash = process_ply_window(dataset, ply_ranges, target_ply)
 
-        # Get rows for this fullmove
-        start_idx, end_idx = fullmove_ranges[target_fm]
+        # Get rows for this ply
+        start_idx, end_idx = ply_ranges[target_ply]
 
         for i in range(start_idx, end_idx):
             row = dataset[i]
@@ -415,16 +419,14 @@ def create_output_dataset(
 # -------------------------------------------------------------------
 
 
-def process_streaming(dataset: Dataset, fullmove_ranges: Dict[int, Tuple[int, int]]):
+def process_streaming(dataset: Dataset, ply_ranges: Dict[int, Tuple[int, int]]):
     """
     Process dataset in streaming fashion, writing output incrementally.
     Better for very large datasets that don't fit in memory.
     """
-    import pyarrow.parquet as pq
-
     print("\nPhase 2: Computing paths (streaming mode)...")
 
-    fullmoves = sorted(fullmove_ranges.keys())
+    plies = sorted(ply_ranges.keys())
     output_path = OUTPUT_PATH / "data"
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -432,10 +434,10 @@ def process_streaming(dataset: Dataset, fullmove_ranges: Dict[int, Tuple[int, in
     rows_buffer = []
     CHUNK_SIZE = 1_000_000
 
-    for target_fm in tqdm(fullmoves, desc="Processing fullmoves"):
-        paths_by_hash = process_fullmove_window(dataset, fullmove_ranges, target_fm)
+    for target_ply in tqdm(plies, desc="Processing plies"):
+        paths_by_hash = process_ply_window(dataset, ply_ranges, target_ply)
 
-        start_idx, end_idx = fullmove_ranges[target_fm]
+        start_idx, end_idx = ply_ranges[target_ply]
 
         for i in range(start_idx, end_idx):
             row = dataset[i]
@@ -505,14 +507,14 @@ def main():
     print(f"Max paths per position: {MAX_PATHS_PER_POSITION}")
     print(f"Max path depth: {MAX_PATH_DEPTH}")
 
-    # Phase 1: Sort by fullmove (uses Arrow, much faster than JSON partitioning)
+    # Phase 1: Sort by ply (uses Arrow, much faster than JSON partitioning)
     dataset = prepare_sorted_dataset(dataset)
 
-    # Build fullmove range index
-    fullmove_ranges = get_fullmove_ranges(dataset)
+    # Build ply range index
+    ply_ranges = get_ply_ranges(dataset)
 
     # Phase 2-3: Process and create output (streaming for large datasets)
-    process_streaming(dataset, fullmove_ranges)
+    process_streaming(dataset, ply_ranges)
 
     print(f"\nFinal dataset saved to: {OUTPUT_PATH}")
 
