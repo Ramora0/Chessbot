@@ -74,21 +74,33 @@ def main():
     dataset = dataset.sort("ply")
     print("Sort complete.")
 
-    # Step 3: Find ply boundaries
+    # Step 3: Find ply boundaries using binary search (data is sorted)
     print("\nStep 3: Finding ply boundaries...")
-    plies_column = dataset["ply"]
+    n = len(dataset)
+    min_ply = dataset[0]["ply"]
+    max_ply = dataset[n - 1]["ply"]
+    print(f"Ply range: {min_ply} to {max_ply}")
 
-    boundaries: Dict[int, tuple] = {}  # ply -> (start_idx, end_idx)
-    current_ply = plies_column[0]
+    def find_first(target_ply: int) -> int:
+        """Binary search for first occurrence of target_ply."""
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if dataset[mid]["ply"] < target_ply:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    boundaries: Dict[int, tuple] = {}
     start_idx = 0
 
-    for i, ply in enumerate(tqdm(plies_column, desc="Scanning boundaries")):
-        if ply != current_ply:
-            boundaries[current_ply] = (start_idx, i)
-            current_ply = ply
-            start_idx = i
-    # Don't forget the last ply
-    boundaries[current_ply] = (start_idx, len(plies_column))
+    for ply in tqdm(range(min_ply, max_ply + 1), desc="Finding boundaries"):
+        # Find where next ply starts
+        end_idx = find_first(ply + 1)
+        if end_idx > start_idx:
+            boundaries[ply] = (start_idx, end_idx)
+        start_idx = end_idx
 
     plies = sorted(boundaries.keys())
     print(f"Found {len(plies)} distinct plies (0 to {max(plies)})")
