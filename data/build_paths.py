@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """
-Build move history paths for each position in the dataset.
+Phase 2: Build move history paths using ply-partitioned datasets.
 
-Single forward pass from ply 0 to max ply:
+Reads adjacent ply datasets (from build_plys.py) and builds paths:
 - For each position, find up to 5 move sequences from game start
 - All intermediate positions must exist in the dataset (in-network)
 - Paths filtered by average regret (prefer 1-8% range)
@@ -31,7 +31,7 @@ SCRATCH_BASE = Path("/fs/scratch/PAS2836/lees_stuff")
 os.environ["HF_HOME"] = str(SCRATCH_BASE / "hf_cache")
 os.environ["HF_DATASETS_CACHE"] = str(SCRATCH_BASE / "hf_cache" / "datasets")
 
-DATASET_PATH = SCRATCH_BASE / "action_value"
+PLYS_DIR = SCRATCH_BASE / "plys_data"
 OUTPUT_DIR = SCRATCH_BASE / "paths_by_ply"
 
 MAX_PATHS_PER_POSITION = 5
@@ -47,14 +47,6 @@ def board_hash(fen: str) -> int:
     """Hash FEN to 64-bit integer."""
     digest = hashlib.md5(fen.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "little")
-
-
-def extract_ply(fen: str) -> int:
-    """Extract ply from FEN: (fullmove-1)*2 + (1 if black else 0)."""
-    parts = fen.split()
-    side = parts[1]
-    fullmove = int(parts[5])
-    return (fullmove - 1) * 2 + (1 if side == 'b' else 0)
 
 
 # -------------------------------------------------------------------
@@ -81,7 +73,6 @@ def filter_and_sample_paths(
     if len(candidate_paths) <= max_paths:
         return candidate_paths
 
-    # Compute avg regret for each path
     def avg_regret(path):
         moves, total_regret, _ = path
         return total_regret / len(moves) if moves else 0.0
@@ -96,14 +87,12 @@ def filter_and_sample_paths(
         else:
             other.append(path)
 
-    # Use preferred if available, otherwise fall back to all
     pool = preferred if preferred else candidate_paths
 
     if len(pool) <= max_paths:
         return pool
 
     # Sample for diversity: different sources and different regret levels
-    # Group by source_hash
     by_source: Dict[int, List] = defaultdict(list)
     for path in pool:
         _, _, source_hash = path
@@ -113,11 +102,9 @@ def filter_and_sample_paths(
     sources = list(by_source.keys())
     random.shuffle(sources)
 
-    # Round-robin from different sources
     while len(selected) < max_paths and any(by_source.values()):
         for src in sources:
             if by_source[src] and len(selected) < max_paths:
-                # Pick path with median-ish regret from this source
                 by_source[src].sort(key=avg_regret)
                 mid = len(by_source[src]) // 2
                 selected.append(by_source[src].pop(mid))
@@ -126,52 +113,64 @@ def filter_and_sample_paths(
 
 
 # -------------------------------------------------------------------
-# MAIN ALGORITHM
+# PLY DATA LOADING
 # -------------------------------------------------------------------
 
 
-def build_index(dataset) -> Tuple[Dict[int, Set[int]], Dict[int, int]]:
+def load_ply_data(ply: int) -> Tuple[any, Dict[int, int], Set[int]]:
     """
-    Build:
-    1. hashes_at_ply: ply -> set of position hashes
-    2. hash_to_idx: hash -> dataset index (for loading position data)
+    Load data for a single ply.
+
+    Returns:
+    - dataset: HuggingFace dataset for this ply
+    - hash_to_idx: hash -> index within this ply's dataset
+    - hashes: set of all hashes at this ply
     """
-    print("Building index...")
+    ply_dir = PLYS_DIR / f"ply_{ply:04d}"
 
-    hashes_at_ply = defaultdict(set)
-    hash_to_idx = {}
+    if not ply_dir.exists():
+        return None, {}, set()
 
-    for i in tqdm(range(len(dataset)), desc="Indexing"):
-        fen = dataset[i]["fen"]
-        ply = extract_ply(fen)
-        h = board_hash(fen)
+    # Load hash map
+    with open(ply_dir / "hash_to_idx.json", "r") as f:
+        raw = json.load(f)
+    hash_to_idx = {int(k): v for k, v in raw.items()}
 
-        hashes_at_ply[ply].add(h)
-        hash_to_idx[h] = i
+    # Load dataset
+    dataset = load_from_disk(str(ply_dir / "data"))
 
-    max_ply = max(hashes_at_ply.keys()) if hashes_at_ply else 0
-    print(f"Found {len(hashes_at_ply)} distinct plies (0 to {max_ply})")
-    print(f"Indexed {len(hash_to_idx):,} positions")
-    return dict(hashes_at_ply), hash_to_idx
+    return dataset, hash_to_idx, set(hash_to_idx.keys())
 
 
-def load_positions_by_hash(dataset, hashes: Set[int], hash_to_idx: Dict[int, int]) -> Dict[int, dict]:
-    """Load position data for specific hashes. Returns hash -> {fen, moves, p_win, best_p_win}."""
+def load_positions_from_ply(
+    dataset, hash_to_idx: Dict[int, int], hashes: Set[int]
+) -> Dict[int, dict]:
+    """
+    Load position data for specific hashes from a ply dataset.
+
+    Returns hash -> {fen, moves, p_win, best_p_win}
+    """
     data = {}
+
     for h in hashes:
         if h not in hash_to_idx:
             continue
         i = hash_to_idx[h]
         row = dataset[i]
-        fen = row["fen"]
         p_wins = list(row["p_win"])
         data[h] = {
-            "fen": fen,
+            "fen": row["fen"],
             "moves": list(row["moves"]),
             "p_win": p_wins,
             "best_p_win": max(p_wins) if p_wins else 0.5,
         }
+
     return data
+
+
+# -------------------------------------------------------------------
+# PATH PERSISTENCE
+# -------------------------------------------------------------------
 
 
 def save_ply_paths(ply: int, paths_by_hash: Dict[int, List[Tuple[List[str], float, int]]]):
@@ -179,7 +178,6 @@ def save_ply_paths(ply: int, paths_by_hash: Dict[int, List[Tuple[List[str], floa
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_DIR / f"ply_{ply:04d}.json"
 
-    # Convert to JSON-serializable format
     data = {
         str(h): [
             {"moves": moves, "total_regret": round(regret, 6), "source_hash": src}
@@ -210,50 +208,69 @@ def load_ply_paths(ply: int) -> Dict[int, List[Tuple[List[str], float, int]]]:
     }
 
 
+# -------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------
+
+
 def main():
-    print(f"Loading dataset from {DATASET_PATH}...")
-    dataset = load_from_disk(str(DATASET_PATH))
-    print(f"Dataset has {len(dataset):,} positions")
+    # Load metadata
+    metadata_path = PLYS_DIR / "metadata.json"
+    if not metadata_path.exists():
+        print(f"Error: {metadata_path} not found. Run build_plys.py first.")
+        return
 
-    # Build index
-    hashes_at_ply, hash_to_idx = build_index(dataset)
-    plies = sorted(hashes_at_ply.keys())
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
 
-    print(f"\nProcessing {len(plies)} plies...")
+    plies = metadata["plies"]
+    print(f"Found {len(plies)} plies (0 to {max(plies)})")
+    print(f"Total positions: {metadata['total']:,}")
 
-    # Initialize ply 0 with empty paths
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Initialize ply 0
     current_paths: Dict[int, List[Tuple[List[str], float, int]]] = {}
 
-    if 0 in hashes_at_ply:
-        for h in hashes_at_ply[0]:
-            current_paths[h] = [([], 0.0, None)]  # empty moves, 0 regret, no source
+    if 0 in plies:
+        _, hash_to_idx_0, hashes_0 = load_ply_data(0)
+        for h in hashes_0:
+            current_paths[h] = [([], 0.0, None)]
         save_ply_paths(0, current_paths)
         print(f"Ply 0: {len(current_paths)} positions initialized")
+
+    # Track what's loaded to avoid reloading
+    prev_dataset = None
+    prev_hash_to_idx = {}
+    prev_hashes = set()
 
     # Forward pass
     for ply in tqdm(plies, desc="Processing plies"):
         if ply == 0:
+            # Load ply 0 data for next iteration
+            prev_dataset, prev_hash_to_idx, prev_hashes = load_ply_data(0)
             continue
 
-        prev_ply = ply - 1
+        # Load current ply data (targets)
+        curr_dataset, curr_hash_to_idx, curr_hashes = load_ply_data(ply)
+
+        if not curr_hashes:
+            current_paths = {}
+            prev_dataset, prev_hash_to_idx, prev_hashes = curr_dataset, curr_hash_to_idx, curr_hashes
+            continue
 
         # Load previous ply paths if not in memory (resuming)
-        if not current_paths and prev_ply in hashes_at_ply:
-            current_paths = load_ply_paths(prev_ply)
+        if not current_paths and (ply - 1) in plies:
+            current_paths = load_ply_paths(ply - 1)
 
         if not current_paths:
             print(f"Ply {ply}: No paths from previous ply, skipping")
+            prev_dataset, prev_hash_to_idx, prev_hashes = curr_dataset, curr_hash_to_idx, curr_hashes
             continue
 
-        # Get hashes that exist at current ply (targets)
-        target_hashes = hashes_at_ply.get(ply, set())
-        if not target_hashes:
-            current_paths = {}
-            continue
-
-        # Load position data for positions that have paths (previous ply)
+        # Load position data for source positions (those with paths)
         source_hashes = set(current_paths.keys())
-        prev_data = load_positions_by_hash(dataset, source_hashes, hash_to_idx)
+        prev_data = load_positions_from_ply(prev_dataset, prev_hash_to_idx, source_hashes)
 
         # Compute candidate paths for each position at current ply
         next_paths: Dict[int, List[Tuple[List[str], float, int]]] = defaultdict(list)
@@ -276,8 +293,8 @@ def main():
                 except:
                     continue
 
-                # Only add if target exists in dataset at this ply
-                if target_hash not in target_hashes:
+                # Only add if target exists at this ply
+                if target_hash not in curr_hashes:
                     continue
 
                 # Extend each source path with this move
@@ -289,7 +306,7 @@ def main():
                     )
                     next_paths[target_hash].append(new_path)
 
-        # Filter and sample paths for each position
+        # Filter and sample paths
         current_paths = {
             h: filter_and_sample_paths(candidates)
             for h, candidates in next_paths.items()
@@ -298,9 +315,12 @@ def main():
         # Save this ply
         save_ply_paths(ply, current_paths)
 
+        # Shift: current becomes previous
+        prev_dataset, prev_hash_to_idx, prev_hashes = curr_dataset, curr_hash_to_idx, curr_hashes
+
         if ply % 10 == 0:
             positions_with_paths = len(current_paths)
-            total_at_ply = len(target_hashes)
+            total_at_ply = len(curr_hashes)
             pct = 100 * positions_with_paths / total_at_ply if total_at_ply else 0
             print(f"Ply {ply}: {positions_with_paths:,}/{total_at_ply:,} positions have paths ({pct:.1f}%)")
 
