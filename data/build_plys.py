@@ -1,22 +1,20 @@
 #!/usr/bin/env python
 """
-Phase 1: Partition dataset by ply.
+Phase 1a: Partition dataset by ply.
 
-Reads the original action_value dataset and creates:
-- One dataset per ply value in plys_data/ply_XXXX/
-- One hash map per ply in plys_data/ply_XXXX/hash_to_idx.json
+1. Add ply column to dataset (fast batched map)
+2. Sort by ply (contiguous grouping)
+3. Split into separate datasets per ply
 
-This enables sequential access in phase 2 (build_paths.py).
+Output: plys_data/ply_XXXX/data/
+Run build_hashes.py after this to generate hash maps.
 """
 import os
 import json
-import hashlib
 from pathlib import Path
-from collections import defaultdict
-from typing import Dict, List, Tuple
-from multiprocessing import Pool
+from typing import Dict
 
-from datasets import load_from_disk, Dataset
+from datasets import load_from_disk
 from tqdm.auto import tqdm
 
 # -------------------------------------------------------------------
@@ -31,18 +29,11 @@ os.environ["HF_DATASETS_CACHE"] = str(SCRATCH_BASE / "hf_cache" / "datasets")
 DATASET_PATH = SCRATCH_BASE / "action_value"
 OUTPUT_DIR = SCRATCH_BASE / "plys_data"
 
-NUM_WORKERS = 10
-CHUNK_SIZE = 50000
+BATCH_SIZE = 10000  # For map operations
 
 # -------------------------------------------------------------------
 # UTILITIES
 # -------------------------------------------------------------------
-
-
-def board_hash(fen: str) -> int:
-    """Hash FEN to 64-bit integer."""
-    digest = hashlib.md5(fen.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "little")
 
 
 def extract_ply(fen: str) -> int:
@@ -53,15 +44,10 @@ def extract_ply(fen: str) -> int:
     return (fullmove - 1) * 2 + (1 if side == 'b' else 0)
 
 
-def process_fen_batch(args: Tuple[int, List[str]]) -> List[Tuple[int, int, int]]:
-    """Process a batch of FENs. Returns list of (index, ply, hash)."""
-    start_idx, fens = args
-    results = []
-    for i, fen in enumerate(fens):
-        ply = extract_ply(fen)
-        h = board_hash(fen)
-        results.append((start_idx + i, ply, h))
-    return results
+def add_ply_batch(batch):
+    """Add ply column to a batch of examples."""
+    batch["ply"] = [extract_ply(fen) for fen in batch["fen"]]
+    return batch
 
 
 # -------------------------------------------------------------------
@@ -69,87 +55,67 @@ def process_fen_batch(args: Tuple[int, List[str]]) -> List[Tuple[int, int, int]]
 # -------------------------------------------------------------------
 
 
-def build_ply_index(dataset) -> Dict[int, List[Tuple[int, int]]]:
-    """
-    Build index: ply -> list of (dataset_index, hash).
-
-    Uses parallel processing for CPU-bound ply/hash computation.
-    """
-    n = len(dataset)
-    num_batches = (n + CHUNK_SIZE - 1) // CHUNK_SIZE
-
-    print(f"Processing {n:,} positions ({NUM_WORKERS} workers, {CHUNK_SIZE} batch size)...")
-
-    indices_by_ply: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
-
-    with Pool(NUM_WORKERS) as pool:
-        pending = []
-
-        for start in tqdm(range(0, n, CHUNK_SIZE), total=num_batches, desc="Indexing"):
-            end = min(start + CHUNK_SIZE, n)
-            batch_fens = list(dataset.select(range(start, end))["fen"])
-            pending.append(pool.apply_async(process_fen_batch, ((start, batch_fens),)))
-
-            # Collect results periodically
-            if len(pending) >= NUM_WORKERS * 2:
-                result = pending.pop(0).get()
-                for idx, ply, h in result:
-                    indices_by_ply[ply].append((idx, h))
-
-        # Collect remaining
-        for future in pending:
-            result = future.get()
-            for idx, ply, h in result:
-                indices_by_ply[ply].append((idx, h))
-
-    return dict(indices_by_ply)
-
-
-def save_ply_dataset(dataset, ply: int, entries: List[Tuple[int, int]]):
-    """
-    Save dataset subset and hash map for a single ply.
-
-    entries: list of (dataset_index, hash)
-    """
-    ply_dir = OUTPUT_DIR / f"ply_{ply:04d}"
-    ply_dir.mkdir(parents=True, exist_ok=True)
-
-    # Sort by index for sequential access when reading
-    entries.sort(key=lambda x: x[0])
-    indices = [idx for idx, _ in entries]
-    hashes = [h for _, h in entries]
-
-    # Save hash -> local_index map (index within this ply's dataset)
-    hash_to_idx = {h: i for i, h in enumerate(hashes)}
-    with open(ply_dir / "hash_to_idx.json", "w") as f:
-        json.dump({str(k): v for k, v in hash_to_idx.items()}, f)
-
-    # Select and save dataset subset
-    ply_dataset = dataset.select(indices)
-    ply_dataset.save_to_disk(str(ply_dir / "data"))
-
-
 def main():
     print(f"Loading dataset from {DATASET_PATH}...")
     dataset = load_from_disk(str(DATASET_PATH))
     print(f"Dataset has {len(dataset):,} positions")
 
-    # Build index
-    indices_by_ply = build_ply_index(dataset)
-    plies = sorted(indices_by_ply.keys())
-    print(f"\nFound {len(plies)} distinct plies (0 to {max(plies)})")
+    # Step 1: Add ply column
+    print("\nStep 1: Adding ply column...")
+    dataset = dataset.map(
+        add_ply_batch,
+        batched=True,
+        batch_size=BATCH_SIZE,
+        desc="Computing plies",
+    )
 
-    # Save each ply
+    # Step 2: Sort by ply
+    print("\nStep 2: Sorting by ply...")
+    dataset = dataset.sort("ply")
+    print("Sort complete.")
+
+    # Step 3: Find ply boundaries
+    print("\nStep 3: Finding ply boundaries...")
+    plies_column = dataset["ply"]
+
+    boundaries: Dict[int, tuple] = {}  # ply -> (start_idx, end_idx)
+    current_ply = plies_column[0]
+    start_idx = 0
+
+    for i, ply in enumerate(tqdm(plies_column, desc="Scanning boundaries")):
+        if ply != current_ply:
+            boundaries[current_ply] = (start_idx, i)
+            current_ply = ply
+            start_idx = i
+    # Don't forget the last ply
+    boundaries[current_ply] = (start_idx, len(plies_column))
+
+    plies = sorted(boundaries.keys())
+    print(f"Found {len(plies)} distinct plies (0 to {max(plies)})")
+
+    # Step 4: Split and save each ply
+    print("\nStep 4: Splitting and saving ply datasets...")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    for ply in tqdm(plies, desc="Saving ply datasets"):
-        entries = indices_by_ply[ply]
-        save_ply_dataset(dataset, ply, entries)
+    ply_counts = {}
+
+    for ply in tqdm(plies, desc="Saving plies"):
+        start, end = boundaries[ply]
+        ply_dataset = dataset.select(range(start, end))
+
+        ply_dir = OUTPUT_DIR / f"ply_{ply:04d}"
+        ply_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save dataset (without ply column - no longer needed)
+        ply_dataset = ply_dataset.remove_columns(["ply"])
+        ply_dataset.save_to_disk(str(ply_dir / "data"))
+
+        ply_counts[ply] = end - start
 
     # Save metadata
     metadata = {
         "plies": plies,
-        "counts": {ply: len(indices_by_ply[ply]) for ply in plies},
+        "counts": ply_counts,
         "total": len(dataset),
     }
     with open(OUTPUT_DIR / "metadata.json", "w") as f:
@@ -158,6 +124,7 @@ def main():
     print(f"\nDone! Ply datasets saved to {OUTPUT_DIR}/")
     print(f"Plies: {min(plies)} to {max(plies)}")
     print(f"Total positions: {len(dataset):,}")
+    print("\nRun build_hashes.py next to generate hash maps.")
 
 
 if __name__ == "__main__":
