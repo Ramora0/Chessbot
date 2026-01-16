@@ -20,6 +20,7 @@ from model import ChessPolicyValueModel
 from policy_index import policy_index
 from tokenizer import create_tokenizer
 from evaluation_puzzle import evaluate_model_elo, DEFAULT_EVAL_CSV_PATH
+from evaluation_regret import evaluate_regret, print_regret_results, NUM_EVAL_POSITIONS
 from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 
@@ -37,6 +38,10 @@ BASE_MAX_STEPS = 2_800_000
 BASE_SAVE_STEPS = 10_000
 BASE_LOGGING_STEPS = 200
 BASE_ELO_EVAL_STEPS = ELO_EVAL_STEPS
+
+# Regret evaluation configuration
+REGRET_EVAL_STEPS = 16000  # Same frequency as ELO evaluation
+BASE_REGRET_EVAL_STEPS = REGRET_EVAL_STEPS
 
 # Game-based evaluation configuration
 # Base steps between game evaluations (30k at batch_size=1024)
@@ -68,6 +73,7 @@ class TrainingSchedule:
     save_steps: int
     logging_steps: int
     elo_eval_steps: int
+    regret_eval_steps: int
     game_eval_steps: int
     warmup_steps: int
 
@@ -84,6 +90,7 @@ def build_training_schedule(batch_size: int) -> TrainingSchedule:
     save_steps = max(1, int(BASE_SAVE_STEPS * inv_scale))
     logging_steps = max(1, int(BASE_LOGGING_STEPS * inv_scale))
     elo_eval_steps = max(1, int(BASE_ELO_EVAL_STEPS * inv_scale))
+    regret_eval_steps = max(1, int(BASE_REGRET_EVAL_STEPS * inv_scale))
     game_eval_steps = max(1, int(BASE_GAME_EVAL_STEPS * inv_scale))
     warmup_steps = max(1, int(max_steps * 0.02))  # 1% of total steps
 
@@ -93,6 +100,7 @@ def build_training_schedule(batch_size: int) -> TrainingSchedule:
         save_steps=save_steps,
         logging_steps=logging_steps,
         elo_eval_steps=elo_eval_steps,
+        regret_eval_steps=regret_eval_steps,
         game_eval_steps=game_eval_steps,
         warmup_steps=warmup_steps,
     )
@@ -449,6 +457,89 @@ class GameEvaluationCallback(TrainerCallback):
         return control
 
 
+class RegretEvaluationCallback(TrainerCallback):
+    """Callback to evaluate regret by game phase during training."""
+
+    def __init__(
+        self,
+        frequency: int,
+        dataset_path: str,
+        tokenizer,
+        num_positions: int = NUM_EVAL_POSITIONS,
+    ) -> None:
+        super().__init__()
+        self.frequency = max(0, int(frequency))
+        self.dataset_path = dataset_path
+        self.tokenizer = tokenizer
+        self.num_positions = num_positions
+        self.trainer: Optional[Trainer] = None
+        self._last_step_logged: int = -1
+
+    def attach_trainer(self, trainer: Trainer) -> None:
+        self.trainer = trainer
+
+    def _should_run(self, step: int) -> bool:
+        """Check if evaluation should run at this step."""
+        if self.trainer is None:
+            return False
+        if self.frequency <= 0:
+            return False
+        if step <= 0:
+            return False
+        if step == self._last_step_logged:
+            return False
+        return step % self.frequency == 0
+
+    def on_step_end(self, args, state, control, **kwargs):
+        step = state.global_step
+        if not self._should_run(step):
+            return control
+
+        model = self.trainer.model
+        was_training = model.training
+
+        try:
+            print(f"\n{'='*80}")
+            print(f"Running regret evaluation at step {step}...")
+            print(f"{'='*80}")
+
+            results = evaluate_regret(
+                model=model,
+                dataset_path=self.dataset_path,
+                tokenizer=self.tokenizer,
+                num_positions=self.num_positions,
+                verbose=True,
+            )
+
+            if was_training:
+                model.train()
+
+            print_regret_results(results)
+
+            # Log metrics to wandb
+            metrics = {
+                "regret_overall": float(results.overall_regret),
+                "regret_opening": float(results.opening_regret),
+                "regret_middlegame": float(results.middlegame_regret),
+                "regret_endgame": float(results.endgame_regret),
+                "regret_opening_count": results.opening_count,
+                "regret_middlegame_count": results.middlegame_count,
+                "regret_endgame_count": results.endgame_count,
+            }
+
+            self.trainer.log(metrics)
+            self._last_step_logged = step
+
+        except Exception as e:
+            print(f"ERROR during regret evaluation at step {step}: {e}")
+            import traceback
+            traceback.print_exc()
+            if was_training:
+                model.train()
+
+        return control
+
+
 def train() -> None:
     print("Starting chess transformer training...")
     os.environ["WANDB_PROJECT"] = "chessformer"
@@ -481,6 +572,7 @@ def train() -> None:
         f"save_steps={schedule.save_steps}",
         f"logging_steps={schedule.logging_steps}",
         f"elo_eval_steps={schedule.elo_eval_steps}",
+        f"regret_eval_steps={schedule.regret_eval_steps}",
         f"game_eval_steps={schedule.game_eval_steps}",
     )
     eval_dataset = None
@@ -590,6 +682,7 @@ def train() -> None:
         f"save_steps={training_args.save_steps}",
         f"logging_steps={training_args.logging_steps}",
         f"elo_eval_steps={schedule.elo_eval_steps}",
+        f"regret_eval_steps={schedule.regret_eval_steps}",
         f"game_eval_steps={schedule.game_eval_steps}",
     )
 
@@ -645,6 +738,23 @@ def train() -> None:
                 f"Stockfish not found at {GAME_EVAL_STOCKFISH_PATH}. Game evaluation disabled.")
         if schedule.game_eval_steps <= 0:
             print("Game evaluation frequency set to 0. Game evaluation disabled.")
+
+    # Regret evaluation callback
+    if schedule.regret_eval_steps > 0:
+        print(
+            f"Registering regret evaluation callback every {schedule.regret_eval_steps} steps "
+            f"(num_positions={NUM_EVAL_POSITIONS}, phases: opening/middlegame/endgame)"
+        )
+        regret_callback = RegretEvaluationCallback(
+            frequency=schedule.regret_eval_steps,
+            dataset_path=DATASET_PATH,
+            tokenizer=tokenizer,
+            num_positions=NUM_EVAL_POSITIONS,
+        )
+        regret_callback.attach_trainer(trainer)
+        trainer.add_callback(regret_callback)
+    else:
+        print("Regret evaluation frequency set to 0. Regret evaluation disabled.")
 
     print("Starting training...")
     if RESUME_FROM_CHECKPOINT:

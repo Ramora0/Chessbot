@@ -22,8 +22,8 @@ PIECE_VALUES = {
 # Maximum possible material (starting position): 2*(8*1 + 2*3 + 2*3 + 2*5 + 1*9) = 78
 MAX_MATERIAL = 78
 
-# Endgame threshold: each side must have <= 13 points of material
-ENDGAME_THRESHOLD = 13
+# Endgame threshold: total material < 26 points
+ENDGAME_THRESHOLD = 26
 
 # Opening threshold: fullmove number <= 10 (halfmoves <= 20)
 OPENING_FULLMOVE_THRESHOLD = 10
@@ -79,15 +79,15 @@ def classify_position(fen: str) -> str:
     """
     Classify a position as opening, middlegame, or endgame.
 
-    - Endgame: both white and black piece value <= 13
+    - Endgame: total piece value < 26
     - Opening: fullmove number <= 10 (and not endgame)
     - Middlegame: otherwise
     """
-    white_material, black_material = calculate_material_by_side(fen)
+    total_material = calculate_total_piece_value(fen)
     fullmove = get_fullmove_number(fen)
 
     # Check endgame first (material-based, takes priority)
-    if white_material <= ENDGAME_THRESHOLD and black_material <= ENDGAME_THRESHOLD:
+    if total_material < ENDGAME_THRESHOLD:
         return "endgame"
 
     # Check opening (move-based)
