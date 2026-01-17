@@ -6,6 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=10
 #SBATCH --gpus-per-node=1
+#SBATCH --mem=128G
 #SBATCH --account=PAS2836
 #SBATCH --output=./slurms/slurm-%j.out
 #SBATCH --error=./slurms/slurm-%j.err
