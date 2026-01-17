@@ -27,7 +27,7 @@ echo "================================================"
 # Copy dataset to local node storage
 mkdir -p "$DATASET_LOCAL"
 
-time rsync -a --info=progress2 "$DATASET_SOURCE/" "$DATASET_LOCAL/"
+time cp -r "$DATASET_SOURCE/"* "$DATASET_LOCAL/"
 
 echo "Dataset copy complete. Size:"
 du -sh "$DATASET_LOCAL"
