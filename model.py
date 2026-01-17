@@ -447,10 +447,20 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                     # Linear annealing from -10 to 0
                     progress = training_step / self.illegality_penalty_annealing_steps  # 0 to 1
                     illegality_penalty = self.illegality_penalty_start * (1.0 - progress)  # -10 to 0
-                    masked_logits[~policy_mask_bool] = masked_logits[~policy_mask_bool] + illegality_penalty
+                    # Use torch.where instead of boolean indexing to avoid torch.compile graph break
+                    masked_logits = torch.where(
+                        policy_mask_bool,
+                        masked_logits,
+                        masked_logits + illegality_penalty
+                    )
 
             # Always enforce floor at -1e9 for numerical stability in softmax
-            masked_logits[~policy_mask_bool] = masked_logits[~policy_mask_bool].clamp(max=-1e9)
+            # Use torch.where instead of boolean indexing to avoid torch.compile graph break
+            masked_logits = torch.where(
+                policy_mask_bool,
+                masked_logits,
+                torch.clamp(masked_logits, max=-1e9)
+            )
 
             model_probs = F.softmax(masked_logits / self.temperature, dim=-1)
 
@@ -459,10 +469,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             policy_loss = self.policy_loss_weight * raw_policy_loss
 
             # Compute policy entropy for monitoring saturation
-            # Only compute over legal moves
-            legal_probs = model_probs[policy_mask_bool]
-            # Reshape to [batch, num_legal_moves] - need to know batch structure
-            # For simplicity, compute entropy per position
             model_entropy = -(model_probs * torch.log(model_probs + 1e-10)).sum(dim=-1).mean()
 
             # Loss 2: Sigmoid-based absolute win% prediction for each move
@@ -486,10 +492,11 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             move_winrate_loss = self.move_winrate_loss_weight * raw_move_winrate_loss
 
             # MAE metric for win% predictions - ONLY on legal moves for monitoring
-            legal_pred_winrates = torch.sigmoid(policy_logits[policy_mask_bool])
-            legal_absolute_winrates = absolute_winrates[policy_mask_bool]
-            move_winrate_mae = torch.abs(
-                legal_pred_winrates - legal_absolute_winrates).mean()
+            # Use masked mean to avoid boolean indexing (torch.compile graph break)
+            pred_winrates = torch.sigmoid(policy_logits)
+            mae_per_move = torch.abs(pred_winrates - absolute_winrates)
+            legal_count = policy_mask_bool.float().sum()
+            move_winrate_mae = (mae_per_move * policy_mask_bool.float()).sum() / legal_count.clamp(min=1)
 
         # NEW: Attention-based policy head losses (same structure as existing policy head)
         attention_policy_loss: Optional[torch.Tensor] = None
@@ -516,10 +523,20 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                     if training_step < self.illegality_penalty_annealing_steps:
                         progress = training_step / self.illegality_penalty_annealing_steps
                         penalty = self.illegality_penalty_start * (1.0 - progress)
-                        masked_attn_logits[~policy_mask_bool] = masked_attn_logits[~policy_mask_bool] + penalty
+                        # Use torch.where instead of boolean indexing to avoid torch.compile graph break
+                        masked_attn_logits = torch.where(
+                            policy_mask_bool,
+                            masked_attn_logits,
+                            masked_attn_logits + penalty
+                        )
 
                 # Always enforce floor at -1e9 for numerical stability
-                masked_attn_logits[~policy_mask_bool] = masked_attn_logits[~policy_mask_bool].clamp(max=-1e9)
+                # Use torch.where instead of boolean indexing to avoid torch.compile graph break
+                masked_attn_logits = torch.where(
+                    policy_mask_bool,
+                    masked_attn_logits,
+                    torch.clamp(masked_attn_logits, max=-1e9)
+                )
 
                 model_probs_attn = F.softmax(masked_attn_logits / self.temperature, dim=-1)
                 raw_loss = -(target_probs * torch.log(model_probs_attn + 1e-10)).sum(dim=-1).mean()

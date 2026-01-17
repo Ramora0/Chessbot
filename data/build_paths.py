@@ -38,6 +38,9 @@ MAX_PATHS_PER_POSITION = 5
 MIN_AVG_REGRET = 0.01  # 1%
 MAX_AVG_REGRET = 0.08  # 8%
 
+# Show progress bar for plies with more than this many positions
+VERBOSE_PLY_THRESHOLD = 1000
+
 # -------------------------------------------------------------------
 # UTILITIES
 # -------------------------------------------------------------------
@@ -275,7 +278,17 @@ def main():
         # Compute candidate paths for each position at current ply
         next_paths: Dict[int, List[Tuple[List[str], float, int]]] = defaultdict(list)
 
-        for source_hash, source_paths in current_paths.items():
+        # Show progress for large plies
+        source_items = current_paths.items()
+        if len(current_paths) >= VERBOSE_PLY_THRESHOLD:
+            source_items = tqdm(
+                source_items,
+                desc=f"  Ply {ply} positions",
+                total=len(current_paths),
+                leave=False,
+            )
+
+        for source_hash, source_paths in source_items:
             if source_hash not in prev_data:
                 continue
 
@@ -307,9 +320,17 @@ def main():
                     next_paths[target_hash].append(new_path)
 
         # Filter and sample paths
+        filter_items = next_paths.items()
+        if len(next_paths) >= VERBOSE_PLY_THRESHOLD:
+            filter_items = tqdm(
+                filter_items,
+                desc=f"  Ply {ply} filtering",
+                total=len(next_paths),
+                leave=False,
+            )
         current_paths = {
             h: filter_and_sample_paths(candidates)
-            for h, candidates in next_paths.items()
+            for h, candidates in filter_items
         }
 
         # Save this ply
