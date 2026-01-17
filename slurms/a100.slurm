@@ -9,7 +9,6 @@
 #SBATCH --account=PAS2836
 #SBATCH --output=./slurms/slurm-%j.out
 #SBATCH --error=./slurms/slurm-%j.err
-#SBATCH --constraint=ascend
 
 set -euo pipefail
 
