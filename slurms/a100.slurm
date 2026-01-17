@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=chessformer
 #SBATCH --partition=gpu
-#SBATCH --time=3:00:00
+#SBATCH --time=5:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10
@@ -9,6 +9,7 @@
 #SBATCH --account=PAS2836
 #SBATCH --output=./slurms/slurm-%j.out
 #SBATCH --error=./slurms/slurm-%j.err
+#SBATCH --constraint=ascend
 
 set -euo pipefail
 
@@ -31,10 +32,10 @@ echo "Dataset copy complete. Size:"
 du -sh "$DATASET_LOCAL"
 
 # Go to your code
-cd "$HOME/personal/chessformer"
+cd "$HOME/personal/Chessbot"
 
 # Your python env
-source .h100/bin/activate
+source .a100/bin/activate
 
 # Run training with local dataset path
 export DATASET_PATH="$DATASET_LOCAL"
