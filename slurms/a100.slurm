@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=chessformer
-#SBATCH --partition=gpu
+#SBATCH --partition=nextgen
 #SBATCH --time=5:00:00
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=10
-#SBATCH --gpus-per-task=1
+#SBATCH --gpus-per-node=1
 #SBATCH --account=PAS2836
 #SBATCH --output=./slurms/slurm-%j.out
 #SBATCH --error=./slurms/slurm-%j.err
@@ -25,7 +25,9 @@ echo "Destination: $DATASET_LOCAL"
 echo "================================================"
 
 # Copy dataset to local node storage
-time rsync -a --info=progress2 "$DATASET_SOURCE" "$DATASET_LOCAL"
+mkdir -p "$DATASET_LOCAL"
+
+time rsync -a --info=progress2 "$DATASET_SOURCE/" "$DATASET_LOCAL/"
 
 echo "Dataset copy complete. Size:"
 du -sh "$DATASET_LOCAL"
