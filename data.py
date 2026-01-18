@@ -1,23 +1,63 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Optional
 
 import torch
 
 from policy_index import policy_index
+from loss_weights import ENDGAME_WEIGHT, ENDGAME_MATERIAL_THRESHOLD
+
+# Material values for chess pieces (kings excluded - always present)
+PIECE_MATERIAL_VALUES = {
+    'Q': 9, 'R': 5, 'B': 3, 'N': 3, 'P': 1,  # White pieces
+    'q': 9, 'r': 5, 'b': 3, 'n': 3, 'p': 1,  # Black pieces
+}
+
+
+def build_material_lookup(vocab_size: int, token_to_id: dict) -> torch.Tensor:
+    """Build a lookup tensor mapping token IDs to (white_material, black_material).
+
+    Args:
+        vocab_size: Total vocabulary size
+        token_to_id: Mapping from token string to token ID
+
+    Returns:
+        Tensor of shape [vocab_size, 2] where [:, 0] is white material and [:, 1] is black
+    """
+    material_lookup = torch.zeros(vocab_size, 2, dtype=torch.float32)
+
+    for piece, value in PIECE_MATERIAL_VALUES.items():
+        token = f"{piece}-p"
+        if token in token_to_id:
+            token_id = token_to_id[token]
+            # White pieces are uppercase, black pieces are lowercase
+            if piece.isupper():
+                material_lookup[token_id, 0] = value  # White material
+            else:
+                material_lookup[token_id, 1] = value  # Black material
+
+    return material_lookup
 
 
 class ChessPolicyCollator:
     """Collator that batches tensor creation for already-tokenized data.
 
     Optionally applies masked token prediction by randomly masking 5% of tokens
-    in 50% of examples.
+    in 50% of examples. Also computes endgame weights for loss upweighting.
     """
 
-    def __init__(self, mask_token_id: int | None = None, mask_prob: float = 0.05) -> None:
+    def __init__(
+        self,
+        mask_token_id: int | None = None,
+        mask_prob: float = 0.05,
+        material_lookup: Optional[torch.Tensor] = None,
+    ) -> None:
         self.policy_size = len(policy_index)
         self.mask_token_id = mask_token_id
         self.mask_prob = mask_prob
+        self.material_lookup = material_lookup
+        self.endgame_weight = ENDGAME_WEIGHT
+        self.endgame_threshold = ENDGAME_MATERIAL_THRESHOLD
 
         # Maskable positions: board (0-63), castling (65-68)
         # Never mask: turn (64), en passant (69) - both are time-dependent
@@ -131,5 +171,30 @@ class ChessPolicyCollator:
         if original_input_ids is not None:
             result["original_input_ids"] = original_input_ids
             result["masked_positions"] = masked_positions
+
+        # Compute endgame weights for loss upweighting (done on CPU in dataloader workers)
+        if self.material_lookup is not None:
+            batch_size = input_ids.size(0)
+            # Only look at board tokens (first 64 positions)
+            board_tokens = input_ids[:, :64]  # [batch, 64]
+
+            # Gather material values for each token
+            material_per_square = self.material_lookup[board_tokens]  # [batch, 64, 2]
+
+            # Sum material for white (index 0) and black (index 1)
+            white_material = material_per_square[:, :, 0].sum(dim=1)  # [batch]
+            black_material = material_per_square[:, :, 1].sum(dim=1)  # [batch]
+
+            # Endgame: both sides have <= threshold material
+            is_endgame = (white_material <= self.endgame_threshold) & \
+                         (black_material <= self.endgame_threshold)
+
+            # Apply endgame weight (3x by default), else 1.0
+            endgame_weights = torch.where(
+                is_endgame,
+                torch.full((batch_size,), self.endgame_weight, dtype=torch.float32),
+                torch.ones(batch_size, dtype=torch.float32)
+            )
+            result["endgame_weights"] = endgame_weights
 
         return result

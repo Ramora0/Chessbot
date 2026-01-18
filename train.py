@@ -14,7 +14,7 @@ from transformers import (
     TrainerCallback,
 )
 
-from data import ChessPolicyCollator
+from data import ChessPolicyCollator, build_material_lookup
 from action_value_dataset import create_action_value_dataset
 from model import ChessPolicyValueModel
 from policy_index import policy_index
@@ -548,9 +548,14 @@ def train() -> None:
 
     print("Creating tokenizer...")
     tokenizer = create_tokenizer()
-    vocab_size = len(tokenizer.get_vocab())
+    vocab = tokenizer.get_vocab()
+    vocab_size = len(vocab)
     pad_token_id = tokenizer.token_to_id("[PAD]")
     mask_token_id = tokenizer.token_to_id("[MASK]")
+
+    # Build material lookup for endgame detection (computed in dataloader workers)
+    token_to_id = {token: id for token, id in vocab.items()}
+    material_lookup = build_material_lookup(vocab_size, token_to_id)
 
     print(f"Loading action value dataset from: {DATASET_PATH}...")
     train_dataset = create_action_value_dataset(
@@ -689,7 +694,10 @@ def train() -> None:
     print("Creating trainer...")
     # Only enable token masking if MASKED_TOKEN_LOSS_WEIGHT > 0
     effective_mask_token_id = mask_token_id if MASKED_TOKEN_LOSS_WEIGHT > 0 else None
-    data_collator = ChessPolicyCollator(mask_token_id=effective_mask_token_id)
+    data_collator = ChessPolicyCollator(
+        mask_token_id=effective_mask_token_id,
+        material_lookup=material_lookup,
+    )
 
     trainer = TrackingTrainer(
         model=model,

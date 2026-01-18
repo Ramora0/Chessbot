@@ -151,16 +151,16 @@ def compute_regret_batch(
     device: torch.device,
 ) -> torch.Tensor:
     """
-    Compute regret for a batch of positions.
+    Compute regret for a batch of positions using greedy (argmax) move selection.
 
-    Regret = expected win% lost from model's move distribution vs always playing best.
+    Regret = win% lost from model's top move vs the optimal move.
 
     Since policy targets are encoded as:
     - Best move: 0.0
     - Other legal moves: negative (win% difference from best)
     - Illegal moves: -1.0 (sentinel)
 
-    Regret = -sum(P(move) * target[move]) for legal moves only
+    Regret = -target[argmax(logits)] for the model's chosen move
     """
     model.eval()
 
@@ -182,17 +182,18 @@ def compute_regret_batch(
         # Create legal move mask (policy_target > -1 means legal)
         legal_mask = policy_targets > -0.5  # Small tolerance for floating point
 
-        # Mask illegal moves for softmax
+        # Mask illegal moves for argmax
         masked_logits = logits.masked_fill(~legal_mask, float("-inf"))
 
-        # Get probability distribution over legal moves
-        probs = torch.softmax(masked_logits, dim=-1)
+        # Get the greedy (argmax) move for each position
+        chosen_moves = torch.argmax(masked_logits, dim=-1)
 
-        # Compute regret: -sum(P(move) * target[move]) for legal moves
-        # Since targets are 0 for best move and negative for others,
-        # regret = -E[target] = -sum(P * target)
-        # This gives positive regret (expected win% lost)
-        regret = -torch.sum(probs * policy_targets * legal_mask.float(), dim=-1)
+        # Get the regret for the chosen move: -target[chosen_move]
+        # Use gather to index into policy_targets
+        chosen_targets = policy_targets.gather(dim=-1, index=chosen_moves.unsqueeze(-1)).squeeze(-1)
+
+        # Regret is the negative of the target (since targets are 0 for best, negative for worse)
+        regret = -chosen_targets
 
     return regret
 

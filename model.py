@@ -242,6 +242,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         masked_positions: Optional[torch.Tensor] = None,
         original_input_ids: Optional[torch.Tensor] = None,
         legal_move_mask: Optional[torch.Tensor] = None,
+        endgame_weights: Optional[torch.Tensor] = None,
         training_step: Optional[int] = None,
         return_dict: bool = True,
         **kwargs,
@@ -273,6 +274,12 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         wdl_logits = task_outputs['wdl']
 
         target_device = policy_logits.device
+
+        # Use passed endgame weights for loss upweighting, or default to uniform weights
+        if endgame_weights is None:
+            endgame_weights = torch.ones(batch_size, device=target_device)
+        elif endgame_weights.device != target_device:
+            endgame_weights = endgame_weights.to(target_device)
 
         # Policy head has TWO losses on the SAME logits:
         # Loss 1: Cross-entropy with softmax target distribution (from un-sigmoid'd Stockfish win%)
@@ -345,7 +352,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             model_probs = F.softmax(masked_logits / self.temperature, dim=-1)
 
             # Cross-entropy loss: -sum(target_probs * log(model_probs))
-            raw_policy_loss = -(target_probs * torch.log(model_probs + 1e-10)).sum(dim=-1).mean()
+            # Compute per-sample loss, apply endgame weights, then take weighted mean
+            per_sample_policy_loss = -(target_probs * torch.log(model_probs + 1e-10)).sum(dim=-1)  # [batch]
+            raw_policy_loss = (per_sample_policy_loss * endgame_weights).sum() / endgame_weights.sum()
             policy_loss = self.policy_loss_weight * raw_policy_loss
 
             # Compute policy entropy for monitoring saturation
@@ -366,9 +375,12 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             )
 
             # Compute BCE loss on ALL moves (legal + illegal)
-            raw_move_winrate_loss = F.binary_cross_entropy_with_logits(
-                policy_logits, move_winrate_targets, reduction='mean'
-            )
+            # Per-sample loss with endgame weighting
+            per_move_bce = F.binary_cross_entropy_with_logits(
+                policy_logits, move_winrate_targets, reduction='none'
+            )  # [batch, policy_dim]
+            per_sample_winrate_loss = per_move_bce.mean(dim=-1)  # [batch]
+            raw_move_winrate_loss = (per_sample_winrate_loss * endgame_weights).sum() / endgame_weights.sum()
             move_winrate_loss = self.move_winrate_loss_weight * raw_move_winrate_loss
 
             # MAE metric for win% predictions - ONLY on legal moves for monitoring
@@ -403,8 +415,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
             # Huber loss: smooth L1 that's quadratic for small errors, linear for large
             # This is smooth AND cares about distance between bins
-            raw_wdl_loss = F.huber_loss(
-                predicted_value, target_value, delta=0.1)
+            # Per-sample loss with endgame weighting
+            per_sample_wdl_loss = F.huber_loss(
+                predicted_value, target_value, delta=0.1, reduction='none')  # [batch]
+            raw_wdl_loss = (per_sample_wdl_loss * endgame_weights).sum() / endgame_weights.sum()
             wdl_loss = self.wdl_loss_weight * raw_wdl_loss
 
             # MAE metric (same as before)
@@ -437,9 +451,28 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 masked_labels = original_ids_flat[masked_positions_flat]
 
                 if masked_labels.numel() > 0:
-                    raw_masked_token_loss = F.cross_entropy(
-                        masked_lm_logits, masked_labels, reduction='mean'
-                    )
+                    # Compute per-token loss without reduction
+                    per_token_loss = F.cross_entropy(
+                        masked_lm_logits, masked_labels, reduction='none'
+                    )  # [num_masked_tokens]
+
+                    # Reshape to [batch, seq_len] and compute per-sample mean
+                    # masked_positions is [batch, seq_len] bool tensor
+                    seq_len = masked_positions.size(1)
+                    per_sample_masked_loss = torch.zeros(batch_size, device=target_device)
+
+                    # Scatter per-token losses back to samples and average
+                    # Create sample indices for each masked token
+                    sample_indices = torch.arange(batch_size, device=target_device).unsqueeze(1).expand(-1, seq_len)
+                    sample_indices_flat = sample_indices.reshape(-1)[masked_positions_flat]
+
+                    # Aggregate losses per sample
+                    per_sample_masked_loss.scatter_add_(0, sample_indices_flat, per_token_loss)
+                    tokens_per_sample = masked_positions.float().sum(dim=1).clamp(min=1)
+                    per_sample_masked_loss = per_sample_masked_loss / tokens_per_sample
+
+                    # Apply endgame weighting
+                    raw_masked_token_loss = (per_sample_masked_loss * endgame_weights).sum() / endgame_weights.sum()
                     masked_token_loss = self.masked_token_loss_weight * raw_masked_token_loss
 
                     # Compute accuracy only on masked positions that are pieces (not empty squares)
