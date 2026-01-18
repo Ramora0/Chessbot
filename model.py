@@ -135,7 +135,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         # Token 64: turn (w/b)
         # Tokens 65-68: castling rights (K, Q, k, q)
         # Token 69: en passant square
-        self.position_embeddings = nn.Embedding(70, hidden_size)
+        # Token 70: halfmove clock
+        # Token 71: fullmove number
+        self.position_embeddings = nn.Embedding(72, hidden_size)
 
         # Multi-task attention pooling (shared K/V, task-specific queries)
         # WDL head now predicts win% in 128 bins (0.0 to 1.0)

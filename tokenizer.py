@@ -30,6 +30,8 @@ _CASTLING_TOKENS = {c: f"{c}-c" for c in _CASTLING_ORDER}
 _CASTLING_EMPTY = "e-c"
 _EN_PASSANT_EMPTY = "e-ep"
 _EN_PASSANT_SUFFIX = "-ep"
+_HALFMOVE_SUFFIX = "-hm"
+_FULLMOVE_SUFFIX = "-fm"
 
 
 def process_fen(fen: str) -> str:
@@ -67,12 +69,12 @@ def process_fen(fen: str) -> str:
     en_passant = (parts[3] + '-ep') if parts[3] != '-' else 'e-ep'
 
     # Fifth part (halfmove): add -hm
-    # halfmove = parts[4] + '-hm'
+    halfmove = parts[4] + '-hm'
 
     # Sixth part (fullmove): add -fm
-    # fullmove = parts[5] + '-fm'
+    fullmove = parts[5] + '-fm'
 
-    return f"{board_result} {turn} {castling} {en_passant}"
+    return f"{board_result} {turn} {castling} {en_passant} {halfmove} {fullmove}"
 
 
 def process_fen_batch(fens: Iterable[str]) -> List[str]:
@@ -88,9 +90,11 @@ def process_fen_batch(fens: Iterable[str]) -> List[str]:
     castling_empty = _CASTLING_EMPTY
     en_passant_empty = _EN_PASSANT_EMPTY
     en_passant_suffix = _EN_PASSANT_SUFFIX
+    halfmove_suffix = _HALFMOVE_SUFFIX
+    fullmove_suffix = _FULLMOVE_SUFFIX
 
     for fen in fens:
-        board, turn, castling, en_passant, *_ = fen.split()
+        board, turn, castling, en_passant, halfmove, fullmove = fen.split()
 
         board_tokens: List[str] = []
         board_append = board_tokens.append
@@ -113,9 +117,11 @@ def process_fen_batch(fens: Iterable[str]) -> List[str]:
             if en_passant != "-"
             else en_passant_empty
         )
+        halfmove_token = f"{halfmove}{halfmove_suffix}"
+        fullmove_token = f"{fullmove}{fullmove_suffix}"
 
         append_result(
-            f"{board_str} {turn_token} {castling_str} {en_passant_token}"
+            f"{board_str} {turn_token} {castling_str} {en_passant_token} {halfmove_token} {fullmove_token}"
         )
 
     return results
@@ -147,13 +153,13 @@ def create_vocabulary():
         vocab.add(f"{file}6-ep")
     vocab.add("e-ep")
 
-    # 5. Halfmove clock (0..800)
-    # for i in range(801):
-    #     vocab.add(f"{i}-hm")
+    # 5. Halfmove clock (0..200)
+    for i in range(201):
+        vocab.add(f"{i}-hm")
 
-    # 6. Fullmove number (1..400)
-    # for i in range(1, 401):
-    #     vocab.add(f"{i}-fm")
+    # 6. Fullmove number (1..500)
+    for i in range(1, 501):
+        vocab.add(f"{i}-fm")
 
     return sorted(vocab)
 

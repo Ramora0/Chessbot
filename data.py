@@ -60,7 +60,7 @@ class ChessPolicyCollator:
         self.endgame_threshold = ENDGAME_MATERIAL_THRESHOLD
 
         # Maskable positions: board (0-63), castling (65-68)
-        # Never mask: turn (64), en passant (69) - both are time-dependent
+        # Never mask: turn (64), en passant (69), halfmove (70), fullmove (71) - all time-dependent
         self.maskable_positions = list(range(64)) + list(range(65, 69))
 
     def __call__(self, batch: Iterable[Dict[str, object]]) -> Dict[str, torch.Tensor]:
