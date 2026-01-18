@@ -2,7 +2,7 @@
 
 # Global pooling policy head
 POLICY_LOSS_WEIGHT: float = 0.5 / 3  # Softmax expected regret
-MOVE_WINRATE_LOSS_WEIGHT: float = 0.5 / 0.015  # Sigmoid win% prediction
+MOVE_WINRATE_LOSS_WEIGHT: float = 0.5 / 0.5  # Sigmoid win% prediction
 
 # WDL head predicts position value distribution
 WDL_LOSS_WEIGHT: float = 0 / 0.005
