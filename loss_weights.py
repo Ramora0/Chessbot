@@ -7,8 +7,10 @@ POLICY_LOSS_WEIGHT: float = 0.5 / 3  # Softmax expected regret
 # Legal moves: mean BCE per position, expected ~0.5 after training
 # Illegal moves: mean BCE per position, expected ~0.015 after training
 # Weights chosen so both contribute ~1.0 initially (when both have ~0.69 raw loss)
-LEGAL_MOVE_WINRATE_LOSS_WEIGHT: float = 1.0 / 0.5  # ~2.0, gives ~1.0 contribution at convergence
-ILLEGAL_MOVE_WINRATE_LOSS_WEIGHT: float = 0.7 / 0.69  # ~1.0, conservative to not dominate initially
+# ~2.0, gives ~1.0 contribution at convergence
+LEGAL_MOVE_WINRATE_LOSS_WEIGHT: float = 1.0 / 0.5
+# ~1.0, conservative to not dominate initially
+ILLEGAL_MOVE_WINRATE_LOSS_WEIGHT: float = 1.0 / 0.5
 
 # WDL head predicts position value distribution
 WDL_LOSS_WEIGHT: float = 0 / 0.005

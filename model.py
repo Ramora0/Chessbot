@@ -143,7 +143,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.task_head = MultiTaskAttentionPooling(
             hidden_size=hidden_size,
             task_output_dims={
-                'policy': self.policy_dim,  # Used for both softmax policy loss and sigmoid win% loss (includes illegality)
+                # Used for both softmax policy loss and sigmoid win% loss (includes illegality)
+                'policy': self.policy_dim,
                 'wdl': self.num_value_bins,  # 128 bins for win probability
             }
         )
@@ -154,13 +155,16 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.policy_loss_weight = float(DEFAULT_POLICY_LOSS_WEIGHT)
         self.wdl_loss_weight = float(DEFAULT_WDL_LOSS_WEIGHT)
         self.masked_token_loss_weight = float(DEFAULT_MASKED_TOKEN_LOSS_WEIGHT)
-        self.legal_move_winrate_loss_weight = float(LEGAL_MOVE_WINRATE_LOSS_WEIGHT)
-        self.illegal_move_winrate_loss_weight = float(ILLEGAL_MOVE_WINRATE_LOSS_WEIGHT)
+        self.legal_move_winrate_loss_weight = float(
+            LEGAL_MOVE_WINRATE_LOSS_WEIGHT)
+        self.illegal_move_winrate_loss_weight = float(
+            ILLEGAL_MOVE_WINRATE_LOSS_WEIGHT)
         self.temperature = float(TEMPERATURE)
 
         # Illegality penalty annealing: start with -10 penalty, anneal to 0 over first 10% of epoch
         self.illegality_penalty_start = -10.0
-        self.illegality_penalty_annealing_steps = getattr(config, 'illegality_penalty_annealing_steps', 0)
+        self.illegality_penalty_annealing_steps = getattr(
+            config, 'illegality_penalty_annealing_steps', 0)
 
         self.post_init()
 
@@ -306,7 +310,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # This aligns the softmax and MCE losses to target the same underlying values
 
             # Convert relative to absolute win%: absolute_win%[move] = true_value + policy[move]
-            absolute_winrates = true_value.unsqueeze(1) + policy  # [batch, policy_dim]
+            absolute_winrates = true_value.unsqueeze(
+                1) + policy  # [batch, policy_dim]
 
             # Un-sigmoid (logit transform): logit(p) = log(p / (1-p))
             # Clamp to avoid log(0) and division by zero
@@ -324,9 +329,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # Apply softmax with temperature to get target probability distribution
             target_probs = F.softmax(target_logits / self.temperature, dim=-1)
 
-            # Compute model's move probabilities (softmax over all moves)
-            # Mask illegal moves with large negative logits before softmax
-            masked_logits = policy_logits.clone()
+            # Apply annealing penalty to illegal moves (helps both policy and BCE losses)
+            annealed_logits = policy_logits.clone()
 
             # Annealing: Start by adding -10 penalty to illegal moves, gradually reduce to 0
             # This helps bootstrap learning by making illegal moves obviously bad at the start
@@ -334,32 +338,37 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 if training_step < self.illegality_penalty_annealing_steps:
                     # Linear annealing from -10 to 0
                     progress = training_step / self.illegality_penalty_annealing_steps  # 0 to 1
-                    illegality_penalty = self.illegality_penalty_start * (1.0 - progress)  # -10 to 0
+                    illegality_penalty = self.illegality_penalty_start * \
+                        (1.0 - progress)  # -10 to 0
                     # Use torch.where instead of boolean indexing to avoid torch.compile graph break
-                    masked_logits = torch.where(
+                    annealed_logits = torch.where(
                         policy_mask_bool,
-                        masked_logits,
-                        masked_logits + illegality_penalty
+                        annealed_logits,
+                        annealed_logits + illegality_penalty
                     )
 
-            # Always enforce floor at -1e9 for numerical stability in softmax
+            # For softmax: also enforce floor at -1e9 for numerical stability
             # Use torch.where instead of boolean indexing to avoid torch.compile graph break
             masked_logits = torch.where(
                 policy_mask_bool,
-                masked_logits,
-                torch.clamp(masked_logits, max=-1e9)
+                annealed_logits,
+                torch.clamp(annealed_logits, max=-1e9)
             )
 
             model_probs = F.softmax(masked_logits / self.temperature, dim=-1)
 
             # Cross-entropy loss: -sum(target_probs * log(model_probs))
             # Compute per-sample loss, apply endgame weights, then take weighted mean
-            per_sample_policy_loss = -(target_probs * torch.log(model_probs + 1e-10)).sum(dim=-1)  # [batch]
-            raw_policy_loss = (per_sample_policy_loss * endgame_weights).sum() / endgame_weights.sum()
+            per_sample_policy_loss = - \
+                (target_probs * torch.log(model_probs + 1e-10)
+                 ).sum(dim=-1)  # [batch]
+            raw_policy_loss = (per_sample_policy_loss *
+                               endgame_weights).sum() / endgame_weights.sum()
             policy_loss = self.policy_loss_weight * raw_policy_loss
 
             # Compute policy entropy for monitoring saturation
-            model_entropy = -(model_probs * torch.log(model_probs + 1e-10)).sum(dim=-1).mean()
+            model_entropy = - \
+                (model_probs * torch.log(model_probs + 1e-10)).sum(dim=-1).mean()
 
             # Loss 2: Sigmoid-based absolute win% prediction for each move
             # This now handles BOTH legal move ranking AND illegality prediction:
@@ -377,7 +386,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
             # Compute BCE loss on ALL moves, then average separately for legal/illegal
             per_move_bce = F.binary_cross_entropy_with_logits(
-                policy_logits, move_winrate_targets, reduction='none'
+                annealed_logits, move_winrate_targets, reduction='none'
             )  # [batch, policy_dim]
 
             # Separate legal and illegal move losses, average per position
@@ -385,25 +394,32 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             illegal_mask = 1.0 - legal_mask
 
             # Mean over legal moves per sample (position-level normalization)
-            legal_count_per_sample = legal_mask.sum(dim=-1).clamp(min=1)  # [batch]
-            legal_bce_per_sample = (per_move_bce * legal_mask).sum(dim=-1) / legal_count_per_sample
+            legal_count_per_sample = legal_mask.sum(
+                dim=-1).clamp(min=1)  # [batch]
+            legal_bce_per_sample = (
+                per_move_bce * legal_mask).sum(dim=-1) / legal_count_per_sample
 
             # Mean over illegal moves per sample (position-level normalization)
-            illegal_count_per_sample = illegal_mask.sum(dim=-1).clamp(min=1)  # [batch]
-            illegal_bce_per_sample = (per_move_bce * illegal_mask).sum(dim=-1) / illegal_count_per_sample
+            illegal_count_per_sample = illegal_mask.sum(
+                dim=-1).clamp(min=1)  # [batch]
+            illegal_bce_per_sample = (
+                per_move_bce * illegal_mask).sum(dim=-1) / illegal_count_per_sample
 
             # Apply endgame weighting and combine with separate loss weights
-            raw_legal_loss = (legal_bce_per_sample * endgame_weights).sum() / endgame_weights.sum()
-            raw_illegal_loss = (illegal_bce_per_sample * endgame_weights).sum() / endgame_weights.sum()
+            raw_legal_loss = (legal_bce_per_sample *
+                              endgame_weights).sum() / endgame_weights.sum()
+            raw_illegal_loss = (illegal_bce_per_sample *
+                                endgame_weights).sum() / endgame_weights.sum()
             move_winrate_loss = (self.legal_move_winrate_loss_weight * raw_legal_loss +
                                  self.illegal_move_winrate_loss_weight * raw_illegal_loss)
 
             # MAE metric for win% predictions - ONLY on legal moves for monitoring
-            # Use masked mean to avoid boolean indexing (torch.compile graph break)
-            pred_winrates = torch.sigmoid(policy_logits)
+            # Uses annealed_logits for consistency with training loss
+            pred_winrates = torch.sigmoid(annealed_logits)
             mae_per_move = torch.abs(pred_winrates - absolute_winrates)
             legal_count = policy_mask_bool.float().sum()
-            move_winrate_mae = (mae_per_move * policy_mask_bool.float()).sum() / legal_count.clamp(min=1)
+            move_winrate_mae = (
+                mae_per_move * policy_mask_bool.float()).sum() / legal_count.clamp(min=1)
 
         wdl_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None
@@ -432,8 +448,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # This is smooth AND cares about distance between bins
             # Per-sample loss with endgame weighting
             per_sample_wdl_loss = F.huber_loss(
-                predicted_value, target_value, delta=0.1, reduction='none')  # [batch]
-            raw_wdl_loss = (per_sample_wdl_loss * endgame_weights).sum() / endgame_weights.sum()
+                # [batch]
+                predicted_value, target_value, delta=0.1, reduction='none')
+            raw_wdl_loss = (per_sample_wdl_loss *
+                            endgame_weights).sum() / endgame_weights.sum()
             wdl_loss = self.wdl_loss_weight * raw_wdl_loss
 
             # MAE metric (same as before)
@@ -474,20 +492,25 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                     # Reshape to [batch, seq_len] and compute per-sample mean
                     # masked_positions is [batch, seq_len] bool tensor
                     seq_len = masked_positions.size(1)
-                    per_sample_masked_loss = torch.zeros(batch_size, device=target_device)
+                    per_sample_masked_loss = torch.zeros(
+                        batch_size, device=target_device)
 
                     # Scatter per-token losses back to samples and average
                     # Create sample indices for each masked token
-                    sample_indices = torch.arange(batch_size, device=target_device).unsqueeze(1).expand(-1, seq_len)
-                    sample_indices_flat = sample_indices.reshape(-1)[masked_positions_flat]
+                    sample_indices = torch.arange(
+                        batch_size, device=target_device).unsqueeze(1).expand(-1, seq_len)
+                    sample_indices_flat = sample_indices.reshape(
+                        -1)[masked_positions_flat]
 
                     # Aggregate losses per sample
-                    per_sample_masked_loss.scatter_add_(0, sample_indices_flat, per_token_loss)
+                    per_sample_masked_loss.scatter_add_(
+                        0, sample_indices_flat, per_token_loss)
                     tokens_per_sample = masked_positions.float().sum(dim=1).clamp(min=1)
                     per_sample_masked_loss = per_sample_masked_loss / tokens_per_sample
 
                     # Apply endgame weighting
-                    raw_masked_token_loss = (per_sample_masked_loss * endgame_weights).sum() / endgame_weights.sum()
+                    raw_masked_token_loss = (
+                        per_sample_masked_loss * endgame_weights).sum() / endgame_weights.sum()
                     masked_token_loss = self.masked_token_loss_weight * raw_masked_token_loss
 
                     # Compute accuracy only on masked positions that are pieces (not empty squares)
@@ -515,7 +538,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                         masked_token_accuracy = (
                             masked_preds == masked_labels).float().mean()
 
-
         # Compute metrics for reporting (not used in loss)
         illegality_rate: Optional[torch.Tensor] = None
         top1_agreement: Optional[torch.Tensor] = None
@@ -530,7 +552,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # Top-1 agreement: % of time model's top move matches Stockfish's best move
             model_best_move_idx = model_probs.argmax(dim=-1)
             stockfish_best_move_idx = policy.argmax(dim=-1)
-            top1_agreement = (model_best_move_idx == stockfish_best_move_idx).float().mean()
+            top1_agreement = (model_best_move_idx ==
+                              stockfish_best_move_idx).float().mean()
 
         loss_components = [
             component
@@ -560,16 +583,20 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # Used for softmax policy loss, sigmoid win% loss, AND illegality prediction
             policy_logits=policy_logits,
             wdl_logits=wdl_logits,
-            illegality_logits=policy_logits,  # Now unified with policy_logits - sigmoid predicts both win% and legality
-            move_winrate_logits=policy_logits,  # Alias - sigmoid of policy_logits used for win% and legality
+            # Now unified with policy_logits - sigmoid predicts both win% and legality
+            illegality_logits=policy_logits,
+            # Alias - sigmoid of policy_logits used for win% and legality
+            move_winrate_logits=policy_logits,
             policy_loss=policy_loss,  # Cross-entropy with softmax target from un-sigmoid'd Stockfish win%
             wdl_loss=wdl_loss,
             illegality_head_loss=None,  # Removed - now handled by move_winrate_loss
             masked_token_loss=masked_token_loss,
-            move_winrate_loss=move_winrate_loss,  # Now handles BOTH legal move ranking AND illegality prediction
+            # Now handles BOTH legal move ranking AND illegality prediction
+            move_winrate_loss=move_winrate_loss,
             # Metrics
             illegality_rate=illegality_rate,
-            illegality_head_accuracy=None,  # Removed - illegality now implicit in move_winrate_loss
+            # Removed - illegality now implicit in move_winrate_loss
+            illegality_head_accuracy=None,
             masked_token_accuracy=masked_token_accuracy,
             top1_agreement=top1_agreement,
             value_mae=value_mae,
