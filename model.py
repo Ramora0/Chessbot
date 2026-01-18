@@ -385,8 +385,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             )
 
             # Compute BCE loss on ALL moves, then average separately for legal/illegal
+            # Use raw policy_logits (not annealed) so the model learns illegality naturally
+            # Annealing is only for softmax policy loss to help focus on legal moves
             per_move_bce = F.binary_cross_entropy_with_logits(
-                annealed_logits, move_winrate_targets, reduction='none'
+                policy_logits, move_winrate_targets, reduction='none'
             )  # [batch, policy_dim]
 
             # Separate legal and illegal move losses, average per position
@@ -414,8 +416,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                                  self.illegal_move_winrate_loss_weight * raw_illegal_loss)
 
             # MAE metric for win% predictions - ONLY on legal moves for monitoring
-            # Uses annealed_logits for consistency with training loss
-            pred_winrates = torch.sigmoid(annealed_logits)
+            # Uses raw policy_logits (annealing only affects illegal moves anyway)
+            pred_winrates = torch.sigmoid(policy_logits)
             mae_per_move = torch.abs(pred_winrates - absolute_winrates)
             legal_count = policy_mask_bool.float().sum()
             move_winrate_mae = (
