@@ -68,6 +68,7 @@ class ChessPolicyCollator:
         policy_list = []
         wdl_list = []
         legal_move_mask_list = []
+        control_map_list = []
 
         for item in batch:
             # Convert lists to tensors (HF datasets return lists)
@@ -91,6 +92,12 @@ class ChessPolicyCollator:
                 if not isinstance(legal_move_mask, torch.Tensor):
                     legal_move_mask = torch.tensor(legal_move_mask, dtype=torch.float32)
                 legal_move_mask_list.append(legal_move_mask)
+
+            if "control_map" in item:
+                control_map = item["control_map"]
+                if not isinstance(control_map, torch.Tensor):
+                    control_map = torch.tensor(control_map, dtype=torch.float32)
+                control_map_list.append(control_map)
 
         if not input_ids_list:
             raise ValueError("Empty batch provided to ChessPolicyCollator")
@@ -166,6 +173,10 @@ class ChessPolicyCollator:
         if legal_move_mask_list:
             legal_move_masks = torch.stack(legal_move_mask_list)
             result["legal_move_mask"] = legal_move_masks
+
+        if control_map_list:
+            control_maps = torch.stack(control_map_list)
+            result["control_map"] = control_maps
 
         # Add masking-related fields if masking was applied
         if original_input_ids is not None:

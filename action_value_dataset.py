@@ -122,6 +122,7 @@ def _transform_example(
     all_wdl = []
     all_true_value = []
     all_legal_move_mask = []
+    all_control_map = []
 
     # Process each example in the batch
     for i in range(batch_size):
@@ -184,12 +185,27 @@ def _transform_example(
             if move_uci in move_to_idx:
                 legal_move_mask[move_to_idx[move_uci]] = 1.0
 
+        # 5. Compute control map: count attackers per square for each side
+        # Shape: [128] = [64 white counts, 64 black counts]
+        # Square order matches board tokens: a8, b8, ..., h1
+        control_map = np.zeros(128, dtype=np.float32)
+        for sq in range(64):
+            # Convert to chess square (our order: a8=0, h1=63; chess: a1=0, h8=63)
+            # Our tokens: rank 8 first (a8-h8), then rank 7, ..., rank 1
+            # chess.SQUARES: a1=0, b1=1, ..., h8=63
+            file_idx = sq % 8  # 0-7 for a-h
+            rank_idx = 7 - (sq // 8)  # Our sq 0-7 is rank 8, so chess rank 7
+            chess_sq = rank_idx * 8 + file_idx
+            control_map[sq] = len(board.attackers(chess.WHITE, chess_sq))
+            control_map[64 + sq] = len(board.attackers(chess.BLACK, chess_sq))
+
         # Add to batch outputs
         all_input_ids.append(input_ids)
         all_policy.append(policy.tolist())
         all_wdl.append(value_dist.tolist())
         all_true_value.append(float(best_win_prob))
         all_legal_move_mask.append(legal_move_mask.tolist())
+        all_control_map.append(control_map.tolist())
 
     return {
         "input_ids": all_input_ids,
@@ -197,4 +213,5 @@ def _transform_example(
         "wdl": all_wdl,
         "true_value": all_true_value,
         "legal_move_mask": all_legal_move_mask,
+        "control_map": all_control_map,
     }

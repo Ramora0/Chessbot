@@ -10,10 +10,14 @@ WDL_LOSS_WEIGHT: float = 0 / 0.005
 # Masked token prediction - helps model learn board state representation
 MASKED_TOKEN_LOSS_WEIGHT: float = 1.0
 
+# Control map prediction - count attackers per square for each side
+# Helps model learn board control and piece activity
+CONTROL_MAP_LOSS_WEIGHT: float = 1.0
+
 # Temperature for softmax loss
 TEMPERATURE: float = 0.5
 
 # Endgame upweighting: multiply loss by this factor for endgame positions
 # Endgame defined as both players having <= 13 points of material
-ENDGAME_WEIGHT: float = 3.0
+ENDGAME_WEIGHT: float = 1.0
 ENDGAME_MATERIAL_THRESHOLD: int = 13
