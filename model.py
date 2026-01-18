@@ -14,7 +14,8 @@ from loss_weights import (
     POLICY_LOSS_WEIGHT,
     WDL_LOSS_WEIGHT,
     MASKED_TOKEN_LOSS_WEIGHT,
-    MOVE_WINRATE_LOSS_WEIGHT,
+    LEGAL_MOVE_WINRATE_LOSS_WEIGHT,
+    ILLEGAL_MOVE_WINRATE_LOSS_WEIGHT,
     TEMPERATURE,
 )
 
@@ -91,7 +92,6 @@ class MultiTaskAttentionPooling(nn.Module):
 DEFAULT_POLICY_LOSS_WEIGHT = POLICY_LOSS_WEIGHT
 DEFAULT_WDL_LOSS_WEIGHT = WDL_LOSS_WEIGHT
 DEFAULT_MASKED_TOKEN_LOSS_WEIGHT = MASKED_TOKEN_LOSS_WEIGHT
-DEFAULT_MOVE_WINRATE_LOSS_WEIGHT = MOVE_WINRATE_LOSS_WEIGHT
 
 
 @dataclass
@@ -154,7 +154,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.policy_loss_weight = float(DEFAULT_POLICY_LOSS_WEIGHT)
         self.wdl_loss_weight = float(DEFAULT_WDL_LOSS_WEIGHT)
         self.masked_token_loss_weight = float(DEFAULT_MASKED_TOKEN_LOSS_WEIGHT)
-        self.move_winrate_loss_weight = float(DEFAULT_MOVE_WINRATE_LOSS_WEIGHT)
+        self.legal_move_winrate_loss_weight = float(LEGAL_MOVE_WINRATE_LOSS_WEIGHT)
+        self.illegal_move_winrate_loss_weight = float(ILLEGAL_MOVE_WINRATE_LOSS_WEIGHT)
         self.temperature = float(TEMPERATURE)
 
         # Illegality penalty annealing: start with -10 penalty, anneal to 0 over first 10% of epoch
@@ -374,14 +375,28 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 torch.zeros_like(absolute_winrates)
             )
 
-            # Compute BCE loss on ALL moves (legal + illegal)
-            # Per-sample loss with endgame weighting
+            # Compute BCE loss on ALL moves, then average separately for legal/illegal
             per_move_bce = F.binary_cross_entropy_with_logits(
                 policy_logits, move_winrate_targets, reduction='none'
             )  # [batch, policy_dim]
-            per_sample_winrate_loss = per_move_bce.mean(dim=-1)  # [batch]
-            raw_move_winrate_loss = (per_sample_winrate_loss * endgame_weights).sum() / endgame_weights.sum()
-            move_winrate_loss = self.move_winrate_loss_weight * raw_move_winrate_loss
+
+            # Separate legal and illegal move losses, average per position
+            legal_mask = policy_mask_bool.float()  # [batch, policy_dim]
+            illegal_mask = 1.0 - legal_mask
+
+            # Mean over legal moves per sample (position-level normalization)
+            legal_count_per_sample = legal_mask.sum(dim=-1).clamp(min=1)  # [batch]
+            legal_bce_per_sample = (per_move_bce * legal_mask).sum(dim=-1) / legal_count_per_sample
+
+            # Mean over illegal moves per sample (position-level normalization)
+            illegal_count_per_sample = illegal_mask.sum(dim=-1).clamp(min=1)  # [batch]
+            illegal_bce_per_sample = (per_move_bce * illegal_mask).sum(dim=-1) / illegal_count_per_sample
+
+            # Apply endgame weighting and combine with separate loss weights
+            raw_legal_loss = (legal_bce_per_sample * endgame_weights).sum() / endgame_weights.sum()
+            raw_illegal_loss = (illegal_bce_per_sample * endgame_weights).sum() / endgame_weights.sum()
+            move_winrate_loss = (self.legal_move_winrate_loss_weight * raw_legal_loss +
+                                 self.illegal_move_winrate_loss_weight * raw_illegal_loss)
 
             # MAE metric for win% predictions - ONLY on legal moves for monitoring
             # Use masked mean to avoid boolean indexing (torch.compile graph break)
