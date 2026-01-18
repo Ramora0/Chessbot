@@ -323,9 +323,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # Apply softmax with temperature to get target probability distribution
             target_probs = F.softmax(target_logits / self.temperature, dim=-1)
 
-            # Compute model's move probabilities (softmax over all moves)
-            # Mask illegal moves with large negative logits before softmax
-            masked_logits = policy_logits.clone()
+            # Apply annealing penalty to illegal moves (helps both policy and BCE losses)
+            annealed_logits = policy_logits.clone()
 
             # Annealing: Start by adding -10 penalty to illegal moves, gradually reduce to 0
             # This helps bootstrap learning by making illegal moves obviously bad at the start
@@ -335,18 +334,18 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                     progress = training_step / self.illegality_penalty_annealing_steps  # 0 to 1
                     illegality_penalty = self.illegality_penalty_start * (1.0 - progress)  # -10 to 0
                     # Use torch.where instead of boolean indexing to avoid torch.compile graph break
-                    masked_logits = torch.where(
+                    annealed_logits = torch.where(
                         policy_mask_bool,
-                        masked_logits,
-                        masked_logits + illegality_penalty
+                        annealed_logits,
+                        annealed_logits + illegality_penalty
                     )
 
-            # Always enforce floor at -1e9 for numerical stability in softmax
+            # For softmax: also enforce floor at -1e9 for numerical stability
             # Use torch.where instead of boolean indexing to avoid torch.compile graph break
             masked_logits = torch.where(
                 policy_mask_bool,
-                masked_logits,
-                torch.clamp(masked_logits, max=-1e9)
+                annealed_logits,
+                torch.clamp(annealed_logits, max=-1e9)
             )
 
             model_probs = F.softmax(masked_logits / self.temperature, dim=-1)
@@ -375,17 +374,17 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             )
 
             # Compute BCE loss on ALL moves (legal + illegal)
-            # Per-sample loss with endgame weighting
+            # Uses annealed_logits so illegal moves get penalty during early training
             per_move_bce = F.binary_cross_entropy_with_logits(
-                policy_logits, move_winrate_targets, reduction='none'
+                annealed_logits, move_winrate_targets, reduction='none'
             )  # [batch, policy_dim]
             per_sample_winrate_loss = per_move_bce.mean(dim=-1)  # [batch]
             raw_move_winrate_loss = (per_sample_winrate_loss * endgame_weights).sum() / endgame_weights.sum()
             move_winrate_loss = self.move_winrate_loss_weight * raw_move_winrate_loss
 
             # MAE metric for win% predictions - ONLY on legal moves for monitoring
-            # Use masked mean to avoid boolean indexing (torch.compile graph break)
-            pred_winrates = torch.sigmoid(policy_logits)
+            # Uses annealed_logits for consistency with training loss
+            pred_winrates = torch.sigmoid(annealed_logits)
             mae_per_move = torch.abs(pred_winrates - absolute_winrates)
             legal_count = policy_mask_bool.float().sum()
             move_winrate_mae = (mae_per_move * policy_mask_bool.float()).sum() / legal_count.clamp(min=1)
