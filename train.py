@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import math
 import torch
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -540,7 +541,7 @@ class RegretEvaluationCallback(TrainerCallback):
         return control
 
 
-def train() -> None:
+def train(run_name: Optional[str] = None) -> None:
     print("Starting chess transformer training...")
     os.environ["WANDB_PROJECT"] = "chessformer"
     # Avoid W&B from uploading checkpoints while keeping metric logging enabled.
@@ -662,7 +663,7 @@ def train() -> None:
         logging_strategy="steps",
         logging_steps=schedule.logging_steps,
         report_to=["wandb"],
-        run_name="testz",
+        run_name=run_name if run_name else "testz",
         remove_unused_columns=False,
 
         dataloader_num_workers=10,
@@ -776,4 +777,13 @@ def train() -> None:
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(
+        description="Train chess transformer model")
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Name for the W&B run (default: testz)"
+    )
+    args = parser.parse_args()
+    train(run_name=args.run_name)

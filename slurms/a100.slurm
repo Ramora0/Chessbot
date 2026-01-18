@@ -13,6 +13,10 @@
 
 set -euo pipefail
 
+# Optional: Set RUN_NAME environment variable before submitting
+# export RUN_NAME="my-experiment"
+: ${RUN_NAME:=""}
+
 # Copy code to local storage FIRST (quick, locks in code version)
 CODE_LOCAL="$TMPDIR/Chessbot"
 echo "================================================"
@@ -54,7 +58,11 @@ source .a100/bin/activate
 
 # Run training with local dataset path
 export DATASET_PATH="$DATASET_LOCAL"
-python train.py
+if [ -n "$RUN_NAME" ]; then
+    python train.py --run-name "$RUN_NAME"
+else
+    python train.py
+fi
 
 echo "================================================"
 echo "Training complete. Cleaning up local data..."
