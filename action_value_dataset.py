@@ -29,7 +29,7 @@ from policy_index import policy_index
 from tokenizer import process_fen
 
 
-EXPECTED_SEQ_LEN = 70
+EXPECTED_SEQ_LEN = 72
 NUM_VALUE_BINS = 128
 
 
