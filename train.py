@@ -777,7 +777,8 @@ def train(run_name: Optional[str] = None) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train chess transformer model")
+    parser = argparse.ArgumentParser(
+        description="Train chess transformer model")
     parser.add_argument(
         "--run-name",
         type=str,
