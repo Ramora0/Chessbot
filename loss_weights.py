@@ -15,5 +15,5 @@ TEMPERATURE: float = 0.5
 
 # Endgame upweighting: multiply loss by this factor for endgame positions
 # Endgame defined as both players having <= 13 points of material
-ENDGAME_WEIGHT: float = 3.0
+ENDGAME_WEIGHT: float = 1.0
 ENDGAME_MATERIAL_THRESHOLD: int = 13
