@@ -12,7 +12,7 @@ MASKED_TOKEN_LOSS_WEIGHT: float = 1.0
 
 # Control map prediction - count attackers per square for each side
 # Helps model learn board control and piece activity
-CONTROL_MAP_LOSS_WEIGHT: float = 1.0
+CONTROL_MAP_LOSS_WEIGHT: float = 1.0 / 5.0
 
 # Temperature for softmax loss
 TEMPERATURE: float = 0.5
