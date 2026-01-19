@@ -133,6 +133,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             empty_token_ids_list) if empty_token_ids_list else None
         self.transformer = LlamaModel(config)
         self._disable_causal_mask()
+        self._disable_rope()
         hidden_size = config.hidden_size
 
         # Learned positional embeddings for all tokens
@@ -245,6 +246,15 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
     def _disable_causal_mask(self) -> None:
         for block in self.transformer.layers:
             block.self_attn.is_causal = False
+
+    def _disable_rope(self) -> None:
+        """Disable rotary position embeddings - we use learned positional embeddings instead."""
+        import transformers.models.llama.modeling_llama as llama_module
+
+        def no_op_rotary(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+            return q, k  # Return unchanged
+
+        llama_module.apply_rotary_pos_emb = no_op_rotary
 
     def forward(
         self,
