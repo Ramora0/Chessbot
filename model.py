@@ -15,6 +15,7 @@ from loss_weights import (
     WDL_LOSS_WEIGHT,
     MASKED_TOKEN_LOSS_WEIGHT,
     MOVE_WINRATE_LOSS_WEIGHT,
+    ILLEGALITY_LOSS_WEIGHT,
     CONTROL_MAP_LOSS_WEIGHT,
     TEMPERATURE,
 )
@@ -93,6 +94,7 @@ DEFAULT_POLICY_LOSS_WEIGHT = POLICY_LOSS_WEIGHT
 DEFAULT_WDL_LOSS_WEIGHT = WDL_LOSS_WEIGHT
 DEFAULT_MASKED_TOKEN_LOSS_WEIGHT = MASKED_TOKEN_LOSS_WEIGHT
 DEFAULT_MOVE_WINRATE_LOSS_WEIGHT = MOVE_WINRATE_LOSS_WEIGHT
+DEFAULT_ILLEGALITY_LOSS_WEIGHT = ILLEGALITY_LOSS_WEIGHT
 DEFAULT_CONTROL_MAP_LOSS_WEIGHT = CONTROL_MAP_LOSS_WEIGHT
 
 
@@ -107,7 +109,7 @@ class ChessPolicyValueOutput(ModelOutput):
     policy_loss: Optional[torch.Tensor] = None
     wdl_loss: Optional[torch.Tensor] = None
     control_map_loss: Optional[torch.Tensor] = None
-    illegality_head_loss: Optional[torch.Tensor] = None
+    illegality_loss: Optional[torch.Tensor] = None
     masked_token_loss: Optional[torch.Tensor] = None
     move_winrate_loss: Optional[torch.Tensor] = None
     # Metrics (not losses)
@@ -168,6 +170,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.wdl_loss_weight = float(DEFAULT_WDL_LOSS_WEIGHT)
         self.masked_token_loss_weight = float(DEFAULT_MASKED_TOKEN_LOSS_WEIGHT)
         self.move_winrate_loss_weight = float(DEFAULT_MOVE_WINRATE_LOSS_WEIGHT)
+        self.illegality_loss_weight = float(DEFAULT_ILLEGALITY_LOSS_WEIGHT)
         self.control_map_loss_weight = float(DEFAULT_CONTROL_MAP_LOSS_WEIGHT)
         self.temperature = float(TEMPERATURE)
 
@@ -321,6 +324,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         # Loss 2: Sigmoid-based win% prediction (encourages correct ranking of all moves + illegality detection)
         policy_loss: Optional[torch.Tensor] = None
         move_winrate_loss: Optional[torch.Tensor] = None
+        illegality_loss: Optional[torch.Tensor] = None
         move_winrate_mae: Optional[torch.Tensor] = None
         policy_mask_bool: Optional[torch.Tensor] = None
         model_entropy: Optional[torch.Tensor] = None
@@ -394,35 +398,37 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # Compute policy entropy for monitoring saturation
             model_entropy = -(model_probs * torch.log(model_probs + 1e-10)).sum(dim=-1).mean()
 
-            # Loss 2: Sigmoid-based absolute win% prediction for each move
-            # This now handles BOTH legal move ranking AND illegality prediction:
-            #   - Legal moves: target = their absolute win% (e.g., 0.52, 0.48, etc.)
-            #   - Illegal moves: target = 0.0 (encourages very negative logits)
+            # Loss 2: Sigmoid-based absolute win% prediction for LEGAL moves only
+            # Legal moves: target = their absolute win% (e.g., 0.52, 0.48, etc.)
             # absolute_winrates already computed above in Loss 1
             # Temperature is NOT applied here - sigmoid uses the raw logits
 
-            # Create target win% for ALL moves: legal moves keep their absolute_winrates, illegal moves get 0.0
-            move_winrate_targets = torch.where(
-                policy_mask_bool,
-                absolute_winrates,
-                torch.zeros_like(absolute_winrates)
-            )
-
-            # Compute BCE loss on ALL moves (legal + illegal)
-            # Uses annealed_logits so illegal moves get penalty during early training
+            # Compute BCE loss on LEGAL moves only
+            # Uses annealed_logits for consistency with policy loss
             per_move_bce = F.binary_cross_entropy_with_logits(
-                annealed_logits, move_winrate_targets, reduction='none'
+                annealed_logits, absolute_winrates, reduction='none'
             )  # [batch, policy_dim]
-            per_sample_winrate_loss = per_move_bce.mean(dim=-1)  # [batch]
+            legal_count = policy_mask_bool.float().sum(dim=-1).clamp(min=1)  # [batch]
+            per_sample_winrate_loss = (per_move_bce * policy_mask_bool.float()).sum(dim=-1) / legal_count
             raw_move_winrate_loss = (per_sample_winrate_loss * endgame_weights).sum() / endgame_weights.sum()
             move_winrate_loss = self.move_winrate_loss_weight * raw_move_winrate_loss
 
+            # Loss 3: Hinge loss to push illegal move logits below -margin
+            # This provides explicit illegality signal without drowning out the legal move BCE
+            margin = 5.0
+            illegal_mask = ~policy_mask_bool
+            # relu(logit + margin) = 0 when logit < -margin, linear penalty otherwise
+            per_move_illegality = F.relu(annealed_logits + margin)
+            illegal_count = illegal_mask.float().sum(dim=-1).clamp(min=1)  # [batch]
+            per_sample_illegality_loss = (per_move_illegality * illegal_mask.float()).sum(dim=-1) / illegal_count
+            raw_illegality_loss = (per_sample_illegality_loss * endgame_weights).sum() / endgame_weights.sum()
+            illegality_loss = self.illegality_loss_weight * raw_illegality_loss
+
             # MAE metric for win% predictions - ONLY on legal moves for monitoring
-            # Uses annealed_logits for consistency with training loss
             pred_winrates = torch.sigmoid(annealed_logits)
             mae_per_move = torch.abs(pred_winrates - absolute_winrates)
-            legal_count = policy_mask_bool.float().sum()
-            move_winrate_mae = (mae_per_move * policy_mask_bool.float()).sum() / legal_count.clamp(min=1)
+            total_legal_count = policy_mask_bool.float().sum()
+            move_winrate_mae = (mae_per_move * policy_mask_bool.float()).sum() / total_legal_count.clamp(min=1)
 
         wdl_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None
@@ -575,6 +581,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             for component in (
                 policy_loss,
                 move_winrate_loss,
+                illegality_loss,
                 wdl_loss,
                 control_map_loss,
                 masked_token_loss,
@@ -605,9 +612,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             policy_loss=policy_loss,  # Cross-entropy with softmax target from un-sigmoid'd Stockfish win%
             wdl_loss=wdl_loss,
             control_map_loss=control_map_loss,
-            illegality_head_loss=None,  # Removed - now handled by move_winrate_loss
+            illegality_loss=illegality_loss,  # Hinge loss to push illegal logits below margin
             masked_token_loss=masked_token_loss,
-            move_winrate_loss=move_winrate_loss,  # Now handles BOTH legal move ranking AND illegality prediction
+            move_winrate_loss=move_winrate_loss,  # Sigmoid win% prediction on legal moves only
             # Metrics
             illegality_rate=illegality_rate,
             illegality_head_accuracy=None,  # Removed - illegality now implicit in move_winrate_loss
