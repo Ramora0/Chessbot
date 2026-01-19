@@ -625,8 +625,7 @@ def train(run_name: Optional[str] = None) -> None:
         # Anneal illegality penalty over first 10% of epoch
         # Start with -10 penalty on illegal logits, linearly reduce to 0
         # This helps bootstrap learning by making illegal moves obviously bad at first
-        config.illegality_penalty_annealing_steps = int(
-            schedule.max_steps * 0.1)
+        config.illegality_penalty_annealing_steps = 0
 
         print(f"Model config created - policy dimension: {config.policy_dim}")
         print(
