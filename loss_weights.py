@@ -2,7 +2,7 @@
 
 # Global pooling policy head
 POLICY_LOSS_WEIGHT: float = 0.5 / 3  # Softmax expected regret
-MOVE_WINRATE_LOSS_WEIGHT: float = 0.5 / 0.5  # Sigmoid win% prediction (legal moves only)
+MOVE_WINRATE_LOSS_WEIGHT: float = 0.5 / 2.5  # Sigmoid win% prediction (legal moves only)
 ILLEGALITY_LOSS_WEIGHT: float = 0.02  # Hinge loss to push illegal logits down (~10x less than policy)
 
 # WDL head predicts position value distribution
