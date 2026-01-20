@@ -32,7 +32,7 @@ After preprocessing (action_value_dataset.py), the data is transformed to:
 ```python
 {
     "input_ids": List[int],     # Tokenized position (70 tokens)
-    "policy": Tensor[1858],     # Normalized win% per move: best=0.0, worse<0, illegal=-1.0
+    "policy": Tensor[1968],     # Normalized win% per move: best=0.0, worse<0, illegal=-1.0
     "wdl": Tensor[128],         # Win probability distribution over 128 bins
     "true_value": float,        # Absolute win% of position after best move
 }
@@ -58,9 +58,9 @@ ChessPolicyValueModel (model.py)
 ├── MultiTaskAttentionPooling
 │   ├── Shared K/V projections
 │   └── Task-specific queries & output heads:
-│       ├── Policy head (1858 moves)
+│       ├── Policy head (1968 moves)
 │       ├── WDL head (128 bins)
-│       └── Illegality head (1858 moves)
+│       └── Illegality head (1968 moves)
 └── LM head (masked token prediction)
 ```
 
@@ -102,12 +102,12 @@ Chess positions (FEN) are tokenized into exactly **70 tokens**:
 
 ### Move Policy Indexing (policy_index.py)
 
-All possible chess moves are mapped to **1858 indices**:
+All possible chess moves are mapped to **1968 indices**:
 - Every (from_square, to_square) pair for all 64 squares
 - Includes queen, rook, bishop, and knight underpromotions
 - Index 0 = `a1h8`, index 1 = `a1a8`, etc.
 
-The policy head outputs 1858 logits, one per move. During inference:
+The policy head outputs 1968 logits, one per move. During inference:
 1. Apply legal move mask from python-chess
 2. Softmax over legal moves only
 3. Sample or take argmax
@@ -139,9 +139,9 @@ ChessPolicyValueModel.forward()
     ├→ Add positional embeddings (70 positions)
     ├→ Transformer (20 layers)
     ├→ Multi-task attention pooling
-    │   ├→ Policy logits [batch, 1858]
+    │   ├→ Policy logits [batch, 1968]
     │   ├→ WDL logits [batch, 128]
-    │   └→ Illegality logits [batch, 1858]
+    │   └→ Illegality logits [batch, 1968]
     └→ LM head (if masking enabled) [batch, seq_len, vocab_size]
     ↓
 5 loss components → weighted sum → backward
@@ -156,7 +156,7 @@ Space-delimited tokens
     ↓ (tokenizer.encode)
 input_ids tensor
     ↓ (model.forward)
-policy_logits [1858]
+policy_logits [1968]
     ↓ (apply legal move mask)
 legal_logits subset
     ↓ (softmax → sample/argmax)
@@ -204,7 +204,7 @@ Controlled by `MASKED_TOKEN_LOSS_WEIGHT` in `loss_weights.py`.
 **Core architecture**:
 - `model.py`: Model definition, multi-task pooling, loss computation
 - `tokenizer.py`: FEN → tokens conversion
-- `policy_index.py`: Move → index mapping (1858 moves)
+- `policy_index.py`: Move → index mapping (1968 moves)
 - `loss_weights.py`: Centralized loss weight configuration
 
 **Data handling**:

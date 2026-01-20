@@ -89,6 +89,64 @@ class MultiTaskAttentionPooling(nn.Module):
         return outputs
 
 
+class SpatialAttentionPolicyHead(nn.Module):
+    """Spatial attention policy head where attention[i][j] = logit for move from token i to token j."""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.scale = hidden_size ** -0.5
+        self.query_proj = nn.Linear(hidden_size, hidden_size)
+        self.key_proj = nn.Linear(hidden_size, hidden_size)
+        self.layer_norm = nn.LayerNorm(hidden_size)
+
+        # Register precomputed mapping buffers
+        self._register_mapping_buffers()
+
+    def _register_mapping_buffers(self) -> None:
+        """Build mapping from 1858 policy indices to (from_token, to_token) pairs."""
+        from policy_index import policy_index
+
+        def chess_square_to_token(square: int) -> int:
+            return (7 - square // 8) * 8 + (square % 8)
+
+        from_tokens, to_tokens = [], []
+        for move in policy_index:
+            from_file = ord(move[0]) - ord('a')
+            from_rank = int(move[1]) - 1
+            to_file = ord(move[2]) - ord('a')
+            to_rank = int(move[3]) - 1
+            from_sq = from_rank * 8 + from_file
+            to_sq = to_rank * 8 + to_file
+            from_tokens.append(chess_square_to_token(from_sq))
+            to_tokens.append(chess_square_to_token(to_sq))
+
+        self.register_buffer('from_tokens', torch.tensor(from_tokens, dtype=torch.long))
+        self.register_buffer('to_tokens', torch.tensor(to_tokens, dtype=torch.long))
+
+    def forward(self, board_hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Args: board_hidden_states [batch, 64, hidden_size]
+        Returns: policy_logits [batch, 1858]
+        """
+        batch_size = board_hidden_states.size(0)
+        normalized = self.layer_norm(board_hidden_states)
+
+        Q = self.query_proj(normalized)  # [batch, 64, hidden_size]
+        K = self.key_proj(normalized)    # [batch, 64, hidden_size]
+
+        # Raw attention scores (no softmax - these ARE the logits)
+        attention = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # [batch, 64, 64]
+
+        # Gather logits for each policy index
+        policy_logits = attention[
+            torch.arange(batch_size, device=attention.device).unsqueeze(1),
+            self.from_tokens.unsqueeze(0).expand(batch_size, -1),
+            self.to_tokens.unsqueeze(0).expand(batch_size, -1)
+        ]
+        return policy_logits
+
+
 DEFAULT_POLICY_LOSS_WEIGHT = POLICY_LOSS_WEIGHT
 DEFAULT_WDL_LOSS_WEIGHT = WDL_LOSS_WEIGHT
 DEFAULT_MASKED_TOKEN_LOSS_WEIGHT = MASKED_TOKEN_LOSS_WEIGHT
@@ -144,16 +202,18 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         # Token 71: fullmove number
         self.position_embeddings = nn.Embedding(72, hidden_size)
 
-        # Multi-task attention pooling (shared K/V, task-specific queries)
+        # Multi-task attention pooling for WDL only (policy now handled by spatial attention)
         # WDL head now predicts win% in 128 bins (0.0 to 1.0)
         self.num_value_bins = 128
         self.task_head = MultiTaskAttentionPooling(
             hidden_size=hidden_size,
             task_output_dims={
-                'policy': self.policy_dim,  # Used for both softmax policy loss and sigmoid win% loss (includes illegality)
                 'wdl': self.num_value_bins,  # 128 bins for win probability
             }
         )
+
+        # Spatial attention policy head
+        self.spatial_policy_head = SpatialAttentionPolicyHead(hidden_size=hidden_size)
 
         # Per-square control head: each of the 64 board squares predicts its own attacker counts
         # Applied to hidden states at positions 0-63 (the board tokens)
@@ -281,16 +341,18 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             inputs_embeds=input_embeds, **kwargs)
         hidden_states = transformer_outputs.last_hidden_state
 
-        # Multi-task attention pooling (single forward pass)
+        # Extract board hidden states (first 64 tokens)
+        board_hidden_states = hidden_states[:, :64, :]  # [batch, 64, hidden]
+
+        # Spatial attention policy head
+        policy_logits = self.spatial_policy_head(board_hidden_states)  # [batch, 1858]
+
+        # Multi-task attention pooling for WDL only
         task_outputs = self.task_head(hidden_states)
-        # Used for softmax policy loss, sigmoid win% loss, AND illegality prediction
-        policy_logits = task_outputs['policy']
         wdl_logits = task_outputs['wdl']
 
         # Per-square control prediction: apply control head to each board square's hidden state
-        # hidden_states[:, :64, :] are the 64 board position tokens
         # Output: [batch, 64, 2] -> reshape to [batch, 128] for compatibility
-        board_hidden_states = hidden_states[:, :64, :]  # [batch, 64, hidden]
         control_logits_per_square = self.control_head(board_hidden_states)  # [batch, 64, 2]
         # Reshape to [batch, 128]: first 64 = white counts, last 64 = black counts
         control_logits = torch.cat([
