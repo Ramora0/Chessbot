@@ -146,27 +146,41 @@ def load_ply_data(ply: int) -> Tuple[any, Dict[int, int], Set[int]]:
 
 
 def load_positions_from_ply(
-    dataset, hash_to_idx: Dict[int, int], hashes: Set[int]
+    dataset, hash_to_idx: Dict[int, int], hashes: Set[int], chunk_size: int = 10000
 ) -> Dict[int, dict]:
     """
     Load position data for specific hashes from a ply dataset.
 
     Returns hash -> {fen, moves, p_win, best_p_win}
+
+    Uses chunked batch loading to balance speed and memory usage.
     """
+    # Filter to valid hashes and get their indices
+    valid_hashes = [h for h in hashes if h in hash_to_idx]
+    if not valid_hashes:
+        return {}
+
+    indices = [hash_to_idx[h] for h in valid_hashes]
+
     data = {}
 
-    for h in hashes:
-        if h not in hash_to_idx:
-            continue
-        i = hash_to_idx[h]
-        row = dataset[i]
-        p_wins = list(row["p_win"])
-        data[h] = {
-            "fen": row["fen"],
-            "moves": list(row["moves"]),
-            "p_win": p_wins,
-            "best_p_win": max(p_wins) if p_wins else 0.5,
-        }
+    # Process in chunks to avoid OOM
+    for chunk_start in range(0, len(valid_hashes), chunk_size):
+        chunk_end = min(chunk_start + chunk_size, len(valid_hashes))
+        chunk_hashes = valid_hashes[chunk_start:chunk_end]
+        chunk_indices = indices[chunk_start:chunk_end]
+
+        # Batch fetch this chunk
+        rows = dataset.select(chunk_indices)
+
+        for h, row in zip(chunk_hashes, rows):
+            p_wins = row["p_win"]
+            data[h] = {
+                "fen": row["fen"],
+                "moves": row["moves"],
+                "p_win": p_wins,
+                "best_p_win": max(p_wins) if p_wins else 0.5,
+            }
 
     return data
 
@@ -211,6 +225,22 @@ def load_ply_paths(ply: int) -> Dict[int, List[Tuple[List[str], float, int]]]:
     }
 
 
+def find_last_completed_ply() -> int:
+    """Find the highest ply that has been saved to disk."""
+    if not OUTPUT_DIR.exists():
+        return -1
+
+    completed = []
+    for f in OUTPUT_DIR.glob("ply_*.json"):
+        try:
+            ply = int(f.stem.split("_")[1])
+            completed.append(ply)
+        except (ValueError, IndexError):
+            continue
+
+    return max(completed) if completed else -1
+
+
 # -------------------------------------------------------------------
 # MAIN
 # -------------------------------------------------------------------
@@ -232,20 +262,31 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Initialize ply 0
+    # Check for existing checkpoint
+    last_completed = find_last_completed_ply()
     current_paths: Dict[int, List[Tuple[List[str], float, int]]] = {}
-
-    if 0 in plies:
-        _, hash_to_idx_0, hashes_0 = load_ply_data(0)
-        for h in hashes_0:
-            current_paths[h] = [([], 0.0, None)]
-        save_ply_paths(0, current_paths)
-        print(f"Ply 0: {len(current_paths)} positions initialized")
-
-    # Track what's loaded to avoid reloading
     prev_dataset = None
     prev_hash_to_idx = {}
     prev_hashes = set()
+
+    if last_completed >= 0:
+        print(f"Resuming from checkpoint: ply {last_completed}")
+        current_paths = load_ply_paths(last_completed)
+        prev_dataset, prev_hash_to_idx, prev_hashes = load_ply_data(last_completed)
+        # Filter plies to only process those after the checkpoint
+        plies = [p for p in plies if p > last_completed]
+        if not plies:
+            print("All plies already processed!")
+            return
+        print(f"Remaining plies to process: {len(plies)} ({min(plies)} to {max(plies)})")
+    else:
+        # Initialize ply 0
+        if 0 in plies:
+            _, hash_to_idx_0, hashes_0 = load_ply_data(0)
+            for h in hashes_0:
+                current_paths[h] = [([], 0.0, None)]
+            save_ply_paths(0, current_paths)
+            print(f"Ply 0: {len(current_paths)} positions initialized")
 
     # Forward pass
     for ply in tqdm(plies, desc="Processing plies"):

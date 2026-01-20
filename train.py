@@ -117,6 +117,7 @@ class TrackingTrainer(Trainer):
         self._last_total_loss: Optional[float] = None
         self._last_masked_token_loss: Optional[float] = None
         self._last_move_winrate_loss: Optional[float] = None
+        self._last_illegality_loss: Optional[float] = None
         self._last_illegality_rate: Optional[float] = None
         self._last_masked_token_accuracy: Optional[float] = None
         self._last_top1_agreement: Optional[float] = None
@@ -189,6 +190,19 @@ class TrackingTrainer(Trainer):
             )
         else:
             self._last_move_winrate_loss = None
+
+        illegality_loss = getattr(outputs, "illegality_loss", None)
+        if illegality_loss is not None:
+            illegality_weight = float(
+                getattr(model, "illegality_loss_weight", 0.0))
+            illegality_value = float(illegality_loss.detach().item())
+            self._last_illegality_loss = (
+                illegality_value / illegality_weight
+                if illegality_weight > 0
+                else illegality_value
+            )
+        else:
+            self._last_illegality_loss = None
 
         # NEW: Attention policy head losses
         attention_policy_loss = getattr(outputs, "attention_policy_loss", None)
@@ -267,6 +281,9 @@ class TrackingTrainer(Trainer):
             if self._last_move_winrate_loss is not None:
                 logs.setdefault("move_winrate_loss",
                                 self._last_move_winrate_loss)
+            if self._last_illegality_loss is not None:
+                logs.setdefault("illegality_loss",
+                                self._last_illegality_loss)
             if self._last_attention_policy_loss is not None:
                 logs.setdefault("attention_policy_loss",
                                 self._last_attention_policy_loss)
