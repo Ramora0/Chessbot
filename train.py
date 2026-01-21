@@ -34,7 +34,7 @@ ELO_EVAL_STEPS = 16000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
 BASE_BATCH_SIZE = 256
-BASE_LEARNING_RATE = 2e-5
+BASE_LEARNING_RATE = 4e-5
 BASE_MAX_STEPS = 2_800_000
 BASE_SAVE_STEPS = 10_000
 BASE_LOGGING_STEPS = 200
@@ -583,7 +583,7 @@ def train(run_name: Optional[str] = None) -> None:
         seed=42,
     )
 
-    per_device_batch_size = 512
+    per_device_batch_size = 1024
     schedule = build_training_schedule(per_device_batch_size)
 
     print(f"Training will run for {schedule.max_steps} steps")
