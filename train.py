@@ -25,7 +25,7 @@ from evaluation_regret import evaluate_regret, print_regret_results, NUM_EVAL_PO
 from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 
-OUTPUT_DIR = "test"
+OUTPUT_DIR = "final-run"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 256  # Board tokens: 72
 DATASET_PATH = os.getenv("DATASET_PATH", "fuck")
@@ -34,7 +34,7 @@ ELO_EVAL_STEPS = 16000
 EVAL_BATCH_SIZE = 4096
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
 BASE_BATCH_SIZE = 256
-BASE_LEARNING_RATE = 1.6e-4
+BASE_LEARNING_RATE = 4e-4
 BASE_MAX_STEPS = 2_800_000
 BASE_SAVE_STEPS = 10_000
 BASE_LOGGING_STEPS = 200
