@@ -583,7 +583,7 @@ def train(run_name: Optional[str] = None) -> None:
         seed=42,
     )
 
-    per_device_batch_size = 1024
+    per_device_batch_size = 512
     schedule = build_training_schedule(per_device_batch_size)
 
     print(f"Training will run for {schedule.max_steps} steps")
