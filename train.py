@@ -25,7 +25,7 @@ from evaluation_regret import evaluate_regret, print_regret_results, NUM_EVAL_PO
 from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 
-OUTPUT_DIR = "final-run"
+OUTPUT_DIR = "./final-run"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 256  # Board tokens: 72
 DATASET_PATH = os.getenv("DATASET_PATH", "fuck")
@@ -113,7 +113,7 @@ class TrackingTrainer(Trainer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._last_policy_loss: Optional[float] = None
-        self._last_wdl_loss: Optional[float] = None
+        self._last_winrate_loss: Optional[float] = None
         self._last_total_loss: Optional[float] = None
         self._last_masked_token_loss: Optional[float] = None
         self._last_move_winrate_loss: Optional[float] = None
@@ -155,15 +155,15 @@ class TrackingTrainer(Trainer):
         else:
             self._last_policy_loss = None
 
-        wdl_loss = getattr(outputs, "wdl_loss", None)
-        if wdl_loss is not None:
-            wdl_weight = float(getattr(model, "wdl_loss_weight", 0.0))
-            wdl_value = float(wdl_loss.detach().item())
-            self._last_wdl_loss = (
-                wdl_value / wdl_weight if wdl_weight > 0 else wdl_value
+        winrate_loss = getattr(outputs, "winrate_loss", None)
+        if winrate_loss is not None:
+            winrate_weight = float(getattr(model, "winrate_loss_weight", 0.0))
+            winrate_value = float(winrate_loss.detach().item())
+            self._last_winrate_loss = (
+                winrate_value / winrate_weight if winrate_weight > 0 else winrate_value
             )
         else:
-            self._last_wdl_loss = None
+            self._last_winrate_loss = None
 
         masked_token_loss = getattr(outputs, "masked_token_loss", None)
         if masked_token_loss is not None:
@@ -273,8 +273,8 @@ class TrackingTrainer(Trainer):
                 logs.setdefault("total_loss", self._last_total_loss)
             if self._last_policy_loss is not None:
                 logs.setdefault("policy_loss", self._last_policy_loss)
-            if self._last_wdl_loss is not None:
-                logs.setdefault("wdl_loss", self._last_wdl_loss)
+            if self._last_winrate_loss is not None:
+                logs.setdefault("winrate_loss", self._last_winrate_loss)
             if self._last_masked_token_loss is not None:
                 logs.setdefault("masked_token_loss",
                                 self._last_masked_token_loss)
@@ -640,8 +640,8 @@ def train(run_name: Optional[str] = None) -> None:
         )
         config.policy_dim = len(policy_index)
         # Anneal illegality penalty over first 10% of epoch
-        # Start with -10 penalty on illegal logits, linearly reduce to 0
-        # This helps bootstrap learning by making illegal moves obviously bad at first
+        # Start with -5 penalty on illegal logits, quadratically reduce to 0
+        # Quadratic decay spreads learning evenly (compensates for exp in softmax)
         config.illegality_penalty_annealing_steps = int(
             schedule.max_steps * 0.1)
 

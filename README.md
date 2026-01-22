@@ -24,7 +24,7 @@ This project implements a **searchless chess policy network** inspired by Google
 
 - Custom tokenization scheme for chess positions (FEN notation)
 - Multi-task attention pooling with shared K/V projections
-- Separate prediction heads for policy (1958 moves), WDL (3-way), and move evaluation
+- Separate prediction heads for policy (1968 moves), winrate (128 bins), and move evaluation
 
 **Training Infrastructure:**
 
@@ -291,15 +291,15 @@ python train.py
 
 ### Multi-Task Prediction Heads
 
-1. **Policy Head**: Predicts probability distribution over 1,858 legal chess moves
-2. **Win-Draw-Loss (WDL) Head**: Predicts game outcome (3-way classification)
+1. **Policy Head**: Predicts probability distribution over 1,968 legal chess moves
+2. **Winrate Head**: Predicts win probability distribution over 128 bins
 3. **Move Win Rate Head**: Predicts win probability for each candidate move
 4. **Illegality Head**: Learns to distinguish legal from illegal moves
 
 ### Training Methodology
 
 - **Supervised Learning**: Train against Stockfish policy evaluations
-- **Multi-Task Loss**: Weighted combination of policy, WDL, and value losses
+- **Multi-Task Loss**: Weighted combination of policy, winrate, and value losses
 - **GRPO Fine-Tuning**: Optional reinforcement learning phase for policy optimization
 - **Curriculum Learning**: Dynamic batch scaling with learning rate adjustment
 

@@ -12,7 +12,7 @@ from transformers.models.llama.modeling_llama import LlamaPreTrainedModel
 
 from loss_weights import (
     POLICY_LOSS_WEIGHT,
-    WDL_LOSS_WEIGHT,
+    WINRATE_LOSS_WEIGHT,
     MASKED_TOKEN_LOSS_WEIGHT,
     MOVE_WINRATE_LOSS_WEIGHT,
     ILLEGALITY_LOSS_WEIGHT,
@@ -33,7 +33,7 @@ class MultiTaskAttentionPooling(nn.Module):
         Args:
             hidden_size: Dimension of input hidden states
             task_output_dims: Dict mapping task names to output dimensions
-                             e.g., {'policy': 1958, 'wdl': 3}
+                             e.g., {'policy': 1958, 'winrate': 3}
         """
         super().__init__()
         self.task_names = list(task_output_dims.keys())
@@ -91,7 +91,7 @@ class MultiTaskAttentionPooling(nn.Module):
 
 
 DEFAULT_POLICY_LOSS_WEIGHT = POLICY_LOSS_WEIGHT
-DEFAULT_WDL_LOSS_WEIGHT = WDL_LOSS_WEIGHT
+DEFAULT_WINRATE_LOSS_WEIGHT = WINRATE_LOSS_WEIGHT
 DEFAULT_MASKED_TOKEN_LOSS_WEIGHT = MASKED_TOKEN_LOSS_WEIGHT
 DEFAULT_MOVE_WINRATE_LOSS_WEIGHT = MOVE_WINRATE_LOSS_WEIGHT
 DEFAULT_ILLEGALITY_LOSS_WEIGHT = ILLEGALITY_LOSS_WEIGHT
@@ -102,12 +102,12 @@ DEFAULT_CONTROL_MAP_LOSS_WEIGHT = CONTROL_MAP_LOSS_WEIGHT
 class ChessPolicyValueOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     policy_logits: torch.Tensor = None
-    wdl_logits: torch.Tensor = None
+    winrate_logits: torch.Tensor = None
     control_logits: torch.Tensor = None
     illegality_logits: torch.Tensor = None
     move_winrate_logits: torch.Tensor = None
     policy_loss: Optional[torch.Tensor] = None
-    wdl_loss: Optional[torch.Tensor] = None
+    winrate_loss: Optional[torch.Tensor] = None
     control_map_loss: Optional[torch.Tensor] = None
     illegality_loss: Optional[torch.Tensor] = None
     masked_token_loss: Optional[torch.Tensor] = None
@@ -148,13 +148,13 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.position_embeddings = nn.Embedding(72, hidden_size)
 
         # Multi-task attention pooling (shared K/V, task-specific queries)
-        # WDL head now predicts win% in 128 bins (0.0 to 1.0)
+        # Winrate head predicts win% in 128 bins (0.0 to 1.0)
         self.num_value_bins = 128
         self.task_head = MultiTaskAttentionPooling(
             hidden_size=hidden_size,
             task_output_dims={
                 'policy': self.policy_dim,  # Used for both softmax policy loss and sigmoid win% loss (includes illegality)
-                'wdl': self.num_value_bins,  # 128 bins for win probability
+                'winrate': self.num_value_bins,  # 128 bins for win probability
             }
         )
 
@@ -167,15 +167,16 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.lm_head = nn.Linear(hidden_size, config.vocab_size, bias=False)
 
         self.policy_loss_weight = float(DEFAULT_POLICY_LOSS_WEIGHT)
-        self.wdl_loss_weight = float(DEFAULT_WDL_LOSS_WEIGHT)
+        self.winrate_loss_weight = float(DEFAULT_WINRATE_LOSS_WEIGHT)
         self.masked_token_loss_weight = float(DEFAULT_MASKED_TOKEN_LOSS_WEIGHT)
         self.move_winrate_loss_weight = float(DEFAULT_MOVE_WINRATE_LOSS_WEIGHT)
         self.illegality_loss_weight = float(DEFAULT_ILLEGALITY_LOSS_WEIGHT)
         self.control_map_loss_weight = float(DEFAULT_CONTROL_MAP_LOSS_WEIGHT)
         self.temperature = float(TEMPERATURE)
 
-        # Illegality penalty annealing: start with -10 penalty, anneal to 0 over first 10% of epoch
-        self.illegality_penalty_start = -10.0
+        # Illegality penalty annealing: start with -5 penalty, anneal to 0 over first 10% of epoch
+        # Uses quadratic decay so learning pressure is spread evenly (compensates for exp in softmax)
+        self.illegality_penalty_start = -5.0
         self.illegality_penalty_annealing_steps = getattr(config, 'illegality_penalty_annealing_steps', 0)
 
         self.post_init()
@@ -263,7 +264,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self,
         input_ids: torch.Tensor,
         policy: Optional[torch.Tensor] = None,
-        wdl: Optional[torch.Tensor] = None,
+        winrate: Optional[torch.Tensor] = None,
         control_map: Optional[torch.Tensor] = None,
         true_value: Optional[torch.Tensor] = None,
         masked_positions: Optional[torch.Tensor] = None,
@@ -298,7 +299,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         task_outputs = self.task_head(hidden_states)
         # Used for softmax policy loss, sigmoid win% loss, AND illegality prediction
         policy_logits = task_outputs['policy']
-        wdl_logits = task_outputs['wdl']
+        winrate_logits = task_outputs['winrate']
 
         # Per-square control prediction: apply control head to each board square's hidden state
         # hidden_states[:, :64, :] are the 64 board position tokens
@@ -365,13 +366,13 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # Apply annealing penalty to illegal moves (helps both policy and BCE losses)
             annealed_logits = policy_logits.clone()
 
-            # Annealing: Start by adding -10 penalty to illegal moves, gradually reduce to 0
-            # This helps bootstrap learning by making illegal moves obviously bad at the start
+            # Annealing: Start by adding -5 penalty to illegal moves, gradually reduce to 0
+            # Uses quadratic decay so learning pressure is spread evenly (compensates for exp in softmax)
             if training_step is not None and self.illegality_penalty_annealing_steps > 0:
                 if training_step < self.illegality_penalty_annealing_steps:
-                    # Linear annealing from -10 to 0
+                    # Quadratic annealing from -5 to 0 (penalty drops faster initially)
                     progress = training_step / self.illegality_penalty_annealing_steps  # 0 to 1
-                    illegality_penalty = self.illegality_penalty_start * (1.0 - progress)  # -10 to 0
+                    illegality_penalty = self.illegality_penalty_start * (1.0 - progress) ** 2  # -5 to 0
                     # Use torch.where instead of boolean indexing to avoid torch.compile graph break
                     annealed_logits = torch.where(
                         policy_mask_bool,
@@ -430,38 +431,27 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             total_legal_count = policy_mask_bool.float().sum()
             move_winrate_mae = (mae_per_move * policy_mask_bool.float()).sum() / total_legal_count.clamp(min=1)
 
-        wdl_loss: Optional[torch.Tensor] = None
+        winrate_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None
-        if wdl is not None:
-            # WDL head now predicts win% distribution over 128 bins
-            # Use Huber loss on expected values (smooth, distance-aware)
-            if wdl.device != target_device:
-                wdl = wdl.to(target_device)
+        if winrate is not None:
+            # Winrate head predicts win% distribution over 128 bins
+            # Use cross-entropy loss on smoothed target distribution
+            if winrate.device != target_device:
+                winrate = winrate.to(target_device)
 
-            # Compute predicted win% as weighted average over bins
+            # Cross-entropy: -sum(target * log(pred))
+            # Target (winrate) is already a normalized distribution from preprocessing
+            log_probs = F.log_softmax(winrate_logits, dim=-1)
+            per_sample_winrate_loss = -(winrate * log_probs).sum(dim=-1)  # [batch]
+            raw_winrate_loss = (per_sample_winrate_loss * endgame_weights).sum() / endgame_weights.sum()
+            winrate_loss = self.winrate_loss_weight * raw_winrate_loss
+
+            # MAE metric on expected values for monitoring
             bin_centers = torch.linspace(
                 0, 1, self.num_value_bins, device=target_device)
-            wdl_probs = F.softmax(wdl_logits, dim=-1)
-            predicted_value = (wdl_probs * bin_centers).sum(dim=-1)
-
-            # Use true_value if provided, otherwise fall back to distribution center
-            if true_value is not None:
-                if true_value.device != target_device:
-                    true_value = true_value.to(target_device)
-                target_value = true_value
-            else:
-                # Fallback: compare to center of target distribution
-                target_value = (wdl * bin_centers).sum(dim=-1)
-
-            # Huber loss: smooth L1 that's quadratic for small errors, linear for large
-            # This is smooth AND cares about distance between bins
-            # Per-sample loss with endgame weighting
-            per_sample_wdl_loss = F.huber_loss(
-                predicted_value, target_value, delta=0.1, reduction='none')  # [batch]
-            raw_wdl_loss = (per_sample_wdl_loss * endgame_weights).sum() / endgame_weights.sum()
-            wdl_loss = self.wdl_loss_weight * raw_wdl_loss
-
-            # MAE metric (same as before)
+            winrate_probs = F.softmax(winrate_logits, dim=-1)
+            predicted_value = (winrate_probs * bin_centers).sum(dim=-1)
+            target_value = (winrate * bin_centers).sum(dim=-1)
             value_mae = torch.abs(predicted_value - target_value).mean()
 
         # Control map loss: predict attacker counts per square for each side
@@ -582,7 +572,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 policy_loss,
                 move_winrate_loss,
                 illegality_loss,
-                wdl_loss,
+                winrate_loss,
                 control_map_loss,
                 masked_token_loss,
             )
@@ -595,7 +585,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         if not return_dict:
             outputs = (
                 policy_logits,
-                wdl_logits,
+                winrate_logits,
                 transformer_outputs.hidden_states,
                 transformer_outputs.attentions,
             )
@@ -605,12 +595,12 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             loss=loss,
             # Used for softmax policy loss, sigmoid win% loss, AND illegality prediction
             policy_logits=policy_logits,
-            wdl_logits=wdl_logits,
+            winrate_logits=winrate_logits,
             control_logits=control_logits,
             illegality_logits=policy_logits,  # Now unified with policy_logits - sigmoid predicts both win% and legality
             move_winrate_logits=policy_logits,  # Alias - sigmoid of policy_logits used for win% and legality
             policy_loss=policy_loss,  # Cross-entropy with softmax target from un-sigmoid'd Stockfish win%
-            wdl_loss=wdl_loss,
+            winrate_loss=winrate_loss,
             control_map_loss=control_map_loss,
             illegality_loss=illegality_loss,  # Hinge loss to push illegal logits below margin
             masked_token_loss=masked_token_loss,

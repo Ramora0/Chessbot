@@ -33,7 +33,7 @@ After preprocessing (action_value_dataset.py), the data is transformed to:
 {
     "input_ids": List[int],     # Tokenized position (70 tokens)
     "policy": Tensor[1968],     # Normalized win% per move: best=0.0, worse<0, illegal=-1.0
-    "wdl": Tensor[128],         # Win probability distribution over 128 bins
+    "winrate": Tensor[128],     # Win probability distribution over 128 bins
     "true_value": float,        # Absolute win% of position after best move
 }
 ```
@@ -59,7 +59,7 @@ ChessPolicyValueModel (model.py)
 │   ├── Shared K/V projections
 │   └── Task-specific queries & output heads:
 │       ├── Policy head (1968 moves)
-│       ├── WDL head (128 bins)
+│       ├── Winrate head (128 bins)
 │       └── Illegality head (1968 moves)
 └── LM head (masked token prediction)
 ```
@@ -70,7 +70,7 @@ The model simultaneously optimizes **5 distinct objectives**:
 
 1. **Policy Loss (softmax-based)**: Expected regret from not choosing best move
 2. **Move Win% Loss (sigmoid-based)**: Absolute win% prediction for all legal moves
-3. **WDL Loss**: Position value distribution over 128 bins (Huber loss)
+3. **Winrate Loss**: Position value distribution over 128 bins (cross-entropy)
 4. **Illegality Loss**: Binary classification of legal vs illegal moves
 5. **Masked Token Loss**: Language modeling objective on board tokens
 
@@ -79,7 +79,7 @@ The model simultaneously optimizes **5 distinct objectives**:
 Loss weights are centralized in `loss_weights.py` with careful tuning:
 - Policy: 10.0 (dominant signal)
 - Move win%: 0.7 (ranking all moves)
-- WDL: 30.0 (position understanding)
+- Winrate: 30.0 (position understanding)
 - Illegality: 50.0 (legal move detection)
 - Masked token: 1.0 (representation learning)
 
@@ -117,7 +117,7 @@ The policy head outputs 1968 logits, one per move. During inference:
 Novel pooling mechanism that computes all task outputs efficiently:
 
 1. **Shared computation**: Single K/V projection across all tasks
-2. **Task-specific queries**: Each task (policy, WDL, illegality) has a learnable query vector
+2. **Task-specific queries**: Each task (policy, winrate, illegality) has a learnable query vector
 3. **Attention pooling**: Each query attends to all 70 position tokens
 4. **Output projection**: Task-specific linear layers produce final logits
 
@@ -132,7 +132,7 @@ HuggingFace Dataset (sharded Arrow files)
     ↓ (streaming with shuffle)
 ChessPolicyCollator (data.py)
     ↓ (batch creation, optional masking)
-{input_ids, policy, wdl, true_value} tensors
+{input_ids, policy, winrate, true_value} tensors
     ↓
 ChessPolicyValueModel.forward()
     ├→ Embed tokens (vocab → hidden_size)
@@ -140,7 +140,7 @@ ChessPolicyValueModel.forward()
     ├→ Transformer (20 layers)
     ├→ Multi-task attention pooling
     │   ├→ Policy logits [batch, 1968]
-    │   ├→ WDL logits [batch, 128]
+    │   ├→ Winrate logits [batch, 128]
     │   └→ Illegality logits [batch, 1968]
     └→ LM head (if masking enabled) [batch, seq_len, vocab_size]
     ↓
@@ -173,12 +173,12 @@ The policy head logits are used for **both**:
 
 This dual supervision prevents the model from only learning "best move" while ignoring the quality ranking of alternatives - critical for producing meaningful policy distributions.
 
-### WDL Head: Why 128 Bins?
+### Winrate Head: Why 128 Bins?
 
-Rather than directly regressing win%, the WDL head predicts a distribution over 128 bins [0.0, 0.01, 0.02, ..., 1.0]. This:
+Rather than directly regressing win%, the winrate head predicts a distribution over 128 bins [0.0, 0.01, 0.02, ..., 1.0]. This:
 - Allows the model to express uncertainty (multimodal distributions)
 - Provides richer gradients than regression
-- Uses Huber loss on expected values (smooth, distance-aware)
+- Uses cross-entropy loss on smoothed target distribution
 
 ### Illegality Head: Not Redundant
 

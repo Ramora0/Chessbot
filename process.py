@@ -45,7 +45,7 @@ def main() -> None:
         return {
             "processed_fen": processed_fens,
             "input_ids": input_ids,
-            "wdl": batch["wdl"],
+            "winrate": batch["winrate"],
         }
 
     processed_dataset = dataset.map(

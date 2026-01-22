@@ -66,7 +66,7 @@ class ChessPolicyCollator:
     def __call__(self, batch: Iterable[Dict[str, object]]) -> Dict[str, torch.Tensor]:
         input_ids_list = []
         policy_list = []
-        wdl_list = []
+        winrate_list = []
         legal_move_mask_list = []
         control_map_list = []
 
@@ -82,10 +82,10 @@ class ChessPolicyCollator:
                 policy = torch.tensor(policy, dtype=torch.float32)
             policy_list.append(policy)
 
-            wdl = item["wdl"]
-            if not isinstance(wdl, torch.Tensor):
-                wdl = torch.tensor(wdl, dtype=torch.float32)
-            wdl_list.append(wdl)
+            winrate = item["winrate"]
+            if not isinstance(winrate, torch.Tensor):
+                winrate = torch.tensor(winrate, dtype=torch.float32)
+            winrate_list.append(winrate)
 
             if "legal_move_mask" in item:
                 legal_move_mask = item["legal_move_mask"]
@@ -126,15 +126,15 @@ class ChessPolicyCollator:
                 f"received {policy_values.shape[1]}"
             )
 
-        wdl_values = torch.stack(wdl_list)
-        if wdl_values.dtype != torch.float32:
-            wdl_values = wdl_values.to(dtype=torch.float32)
+        winrate_values = torch.stack(winrate_list)
+        if winrate_values.dtype != torch.float32:
+            winrate_values = winrate_values.to(dtype=torch.float32)
 
         # Expect 128-bin value distribution
-        wdl_width = wdl_values.shape[1]
-        if wdl_width != 128:
+        winrate_width = winrate_values.shape[1]
+        if winrate_width != 128:
             raise ValueError(
-                f"wdl tensor expected width 128, received {wdl_width}"
+                f"winrate tensor expected width 128, received {winrate_width}"
             )
 
         # Apply token prediction loss on all examples (no actual masking)
@@ -163,7 +163,7 @@ class ChessPolicyCollator:
         result = {
             "input_ids": input_ids,
             "policy": policy_values,
-            "wdl": wdl_values,
+            "winrate": winrate_values,
         }
 
         if true_value_list:

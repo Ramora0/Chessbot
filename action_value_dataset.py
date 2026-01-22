@@ -13,7 +13,7 @@ This dataset format stores:
 This handler converts to the format expected by the model:
 - Tokenizes FEN at runtime
 - Converts (move, p_win) pairs to policy distribution using policy_index
-- Converts p_win to WDL format
+- Converts p_win to winrate distribution format
 """
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ def _transform_example(
             * Illegal moves: -1
             * Legal moves: p_win - max_p_win (best move = 0, others negative)
             * Loss directly measures regret (lost win % vs optimal)
-        - wdl: list of smooth distributions over 128 bins (win% from 0.0 to 1.0)
+        - winrate: list of smooth distributions over 128 bins (win% from 0.0 to 1.0)
         - true_value: list of scalar win% of best move (for metrics)
         - legal_move_mask: list of binary masks for legal moves
     """
@@ -119,7 +119,7 @@ def _transform_example(
     # Initialize output lists
     all_input_ids = []
     all_policy = []
-    all_wdl = []
+    all_winrate = []
     all_true_value = []
     all_legal_move_mask = []
     all_control_map = []
@@ -202,7 +202,7 @@ def _transform_example(
         # Add to batch outputs
         all_input_ids.append(input_ids)
         all_policy.append(policy.tolist())
-        all_wdl.append(value_dist.tolist())
+        all_winrate.append(value_dist.tolist())
         all_true_value.append(float(best_win_prob))
         all_legal_move_mask.append(legal_move_mask.tolist())
         all_control_map.append(control_map.tolist())
@@ -210,7 +210,7 @@ def _transform_example(
     return {
         "input_ids": all_input_ids,
         "policy": all_policy,
-        "wdl": all_wdl,
+        "winrate": all_winrate,
         "true_value": all_true_value,
         "legal_move_mask": all_legal_move_mask,
         "control_map": all_control_map,

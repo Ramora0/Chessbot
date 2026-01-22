@@ -66,12 +66,12 @@ def get_model_move_probabilities(
         # Fallback to old head if attention head not available
         policy_logits = outputs.policy_logits[0]
 
-    wdl_logits = outputs.wdl_logits[0]
+    winrate_logits = outputs.winrate_logits[0]
 
-    # Calculate position win% from WDL head (128 bins from 0.0 to 1.0)
+    # Calculate position win% from winrate head (128 bins from 0.0 to 1.0)
     bin_centers = torch.linspace(0, 1, 128, device=device)
-    wdl_probs = F.softmax(wdl_logits, dim=-1)
-    position_winrate = (wdl_probs * bin_centers).sum().item()
+    winrate_probs = F.softmax(winrate_logits, dim=-1)
+    position_winrate = (winrate_probs * bin_centers).sum().item()
 
     # Create legal moves mask
     legal_mask = torch.zeros(
@@ -127,7 +127,7 @@ def get_model_move_probabilities(
 def display_move_probabilities(move_probs: List[Tuple[chess.Move, float, float, float]], entropy: float, illegality_rate: float, top_illegal_move: Optional[Tuple[str, float]] = None, position_winrate: float = 0.0, top_n: int = 10):
     """Display the top N moves and their probabilities in terminal."""
     print("\n" + "=" * 80)
-    print(f"POSITION WIN%: {position_winrate*100:.2f}% (from WDL head)")
+    print(f"POSITION WIN%: {position_winrate*100:.2f}% (from winrate head)")
     print("=" * 80)
     print("\nModel move probabilities:")
     print("-" * 80)

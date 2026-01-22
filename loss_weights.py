@@ -5,8 +5,8 @@ POLICY_LOSS_WEIGHT: float = 0.5 / 3  # Softmax expected regret
 MOVE_WINRATE_LOSS_WEIGHT: float = 0.5 / 0.5  # Sigmoid win% prediction (legal moves only)
 ILLEGALITY_LOSS_WEIGHT: float = 0.02  # Hinge loss to push illegal logits down (~10x less than policy)
 
-# WDL head predicts position value distribution
-WDL_LOSS_WEIGHT: float = 0 / 0.005
+# Winrate head predicts position value distribution
+WINRATE_LOSS_WEIGHT: float = 0.1 / 0.005
 
 # Masked token prediction - helps model learn board state representation
 MASKED_TOKEN_LOSS_WEIGHT: float = 1.0
