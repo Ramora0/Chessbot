@@ -6,7 +6,7 @@ MOVE_WINRATE_LOSS_WEIGHT: float = 0.5 / 0.5  # Sigmoid win% prediction (legal mo
 ILLEGALITY_LOSS_WEIGHT: float = 0.02  # Hinge loss to push illegal logits down (~10x less than policy)
 
 # Winrate head predicts position value distribution
-WINRATE_LOSS_WEIGHT: float = 0.1 / 0.005
+WINRATE_LOSS_WEIGHT: float = 0.1
 
 # Masked token prediction - helps model learn board state representation
 MASKED_TOKEN_LOSS_WEIGHT: float = 1.0
