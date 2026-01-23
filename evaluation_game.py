@@ -836,28 +836,24 @@ def evaluate_model_against_stockfish(
 
 def main():
     """Test script to evaluate model from checkpoint against Stockfish."""
+    import argparse
     import torch
     from model import ChessPolicyValueModel
 
-    # Configuration
-    CHECKPOINT_PATH = "./checkpoints/final/checkpoint-115000"
-    # Adjust path as needed
-    STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
-    NUM_GAMES = 400
-    BATCH_SIZE = 128
-    # TRUE_PERCENT = 1  # 100% random moves for testing
-    TRUE_EVAL = 1350
+    parser = argparse.ArgumentParser(description="Evaluate chess model against Stockfish")
+    parser.add_argument("-m", "--model", required=True, help="Path to model checkpoint")
+    parser.add_argument("--stockfish", default="/users/PAS2836/leedavis/stockfish/src/stockfish",
+                        help="Path to Stockfish executable")
+    parser.add_argument("-n", "--num-games", type=int, default=400, help="Number of games to play")
+    parser.add_argument("-b", "--batch-size", type=int, default=128, help="Batch size for parallel games")
+    parser.add_argument("--elo", type=int, default=1350, help="Stockfish ELO rating")
+    parser.add_argument("--puzzles", default=None, help="Path to puzzles.csv for starting positions")
+    args = parser.parse_args()
 
-    # Set to a path to load starting positions from puzzles.csv
-    # Games will be played in pairs (one from each side) for fairness
-    # Set to None to use standard starting position
-    # PUZZLE_CSV_PATH = "data/puzzles.csv"
-    PUZZLE_CSV_PATH = None  # Use standard starting position
-
-    print("Loading model from checkpoint...")
+    print(f"Loading model from {args.model}...")
 
     # Load model (handles _orig_mod. prefix from torch.compile)
-    model = ChessPolicyValueModel.from_pretrained_compiled(CHECKPOINT_PATH)
+    model = ChessPolicyValueModel.from_pretrained_compiled(args.model)
 
     # Move to GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -866,18 +862,18 @@ def main():
 
     print(f"Model loaded on {device}")
     print(
-        f"Starting evaluation with {NUM_GAMES} games (batch size: {BATCH_SIZE})...")
+        f"Starting evaluation with {args.num_games} games (batch size: {args.batch_size})...")
     print()
 
     # Run evaluation
     estimated_elo, std_error = evaluate_model_against_stockfish(
         model=model,
-        stockfish_path=STOCKFISH_PATH,
-        num_games=NUM_GAMES,
-        batch_size=BATCH_SIZE,
-        opponent_elo=TRUE_EVAL,
+        stockfish_path=args.stockfish,
+        num_games=args.num_games,
+        batch_size=args.batch_size,
+        opponent_elo=args.elo,
         verbose=True,
-        puzzle_csv_path=PUZZLE_CSV_PATH,
+        puzzle_csv_path=args.puzzles,
     )
 
     print()
