@@ -485,6 +485,13 @@ class GameState:
         self.is_complete = False
         self.result = None
         self.moves: List[chess.Move] = []  # Track all moves for PGN export
+        self.draw_reason: Optional[str] = None  # Track draw type
+        self.last_non_50_eval: Optional[float] = None  # Last eval away from 50%
+
+    def record_eval(self, win_pct: float):
+        """Record an evaluation, tracking last non-50% value."""
+        if abs(win_pct - 50.0) > 2.0:  # More than 2% away from 50%
+            self.last_non_50_eval = win_pct
 
     def is_model_turn(self) -> bool:
         """Check if it's the model's turn to move."""
@@ -502,8 +509,24 @@ class GameState:
         outcome = self.board.outcome()
         if outcome is None:
             self.result = ("draw", self.move_count)
+            self.draw_reason = "max_moves"
         elif outcome.winner is None:
             self.result = ("draw", self.move_count)
+            # Determine draw type from termination reason
+            if outcome.termination == chess.Termination.STALEMATE:
+                self.draw_reason = "stalemate"
+            elif outcome.termination == chess.Termination.INSUFFICIENT_MATERIAL:
+                self.draw_reason = "insufficient_material"
+            elif outcome.termination == chess.Termination.FIFTY_MOVES:
+                self.draw_reason = "fifty_moves"
+            elif outcome.termination == chess.Termination.THREEFOLD_REPETITION:
+                self.draw_reason = "threefold_repetition"
+            elif outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
+                self.draw_reason = "fivefold_repetition"
+            elif outcome.termination == chess.Termination.SEVENTY_FIVE_MOVES:
+                self.draw_reason = "seventy_five_moves"
+            else:
+                self.draw_reason = "unknown"
         elif (outcome.winner == chess.WHITE) == self.model_plays_white:
             self.result = ("win", self.move_count)
         else:
@@ -665,6 +688,7 @@ async def play_games_batched(
                                     win_pct = score_to_win_percent(score, game.model_plays_white)
                                     if win_pct is not None:
                                         conversion_tracker.record_eval(game.game_id, win_pct)
+                                        game.record_eval(win_pct)
 
                 # Process Stockfish moves in parallel
                 games_needing_stockfish = [
@@ -811,6 +835,108 @@ def export_games_to_pgn(
         print(f"PGN export complete: {pgn_path}")
 
 
+def print_draw_statistics(game_states: List[GameState]) -> None:
+    """
+    Print detailed statistics about draws including type distribution
+    and last non-50% evaluations.
+    """
+    # Collect draw games
+    draw_games = [g for g in game_states if g.result and g.result[0] == "draw"]
+
+    if not draw_games:
+        print("\n" + "=" * 70)
+        print("DRAW STATISTICS")
+        print("=" * 70)
+        print("No draws occurred.")
+        print("=" * 70)
+        return
+
+    # Count by draw type
+    draw_type_counts: Dict[str, int] = defaultdict(int)
+    draw_type_evals: Dict[str, List[Optional[float]]] = defaultdict(list)
+
+    for game in draw_games:
+        reason = game.draw_reason or "unknown"
+        draw_type_counts[reason] += 1
+        draw_type_evals[reason].append(game.last_non_50_eval)
+
+    total_draws = len(draw_games)
+
+    print("\n" + "=" * 70)
+    print("DRAW STATISTICS")
+    print("=" * 70)
+    print(f"Total draws: {total_draws}")
+    print()
+
+    # Print distribution by type
+    print("Draw Type Distribution:")
+    print("-" * 70)
+    print(f"{'Type':<25} | {'Count':>6} | {'%':>6} | {'Avg Last Eval':>14} | {'Range':>15}")
+    print("-" * 70)
+
+    for draw_type in sorted(draw_type_counts.keys(), key=lambda x: -draw_type_counts[x]):
+        count = draw_type_counts[draw_type]
+        pct = count / total_draws * 100
+        evals = [e for e in draw_type_evals[draw_type] if e is not None]
+
+        if evals:
+            avg_eval = sum(evals) / len(evals)
+            min_eval = min(evals)
+            max_eval = max(evals)
+            eval_str = f"{avg_eval:>6.1f}%"
+            range_str = f"{min_eval:.1f}-{max_eval:.1f}%"
+        else:
+            eval_str = "N/A"
+            range_str = "N/A"
+
+        # Format draw type for display
+        display_type = draw_type.replace("_", " ").title()
+        print(f"{display_type:<25} | {count:>6} | {pct:>5.1f}% | {eval_str:>14} | {range_str:>15}")
+
+    print("-" * 70)
+
+    # Print detailed eval distribution for all draws
+    all_evals = [g.last_non_50_eval for g in draw_games if g.last_non_50_eval is not None]
+    if all_evals:
+        print()
+        print("Last Non-50% Evaluation Distribution (all draws):")
+        print("-" * 70)
+
+        # Create buckets: 0-10, 10-20, ..., 90-100
+        eval_buckets = [(i, i + 10) for i in range(0, 100, 10)]
+        bucket_counts = [0] * len(eval_buckets)
+
+        for eval_pct in all_evals:
+            bucket_idx = min(int(eval_pct // 10), 9)
+            bucket_counts[bucket_idx] += 1
+
+        max_count = max(bucket_counts) if bucket_counts else 1
+        bar_width = 30
+
+        for i, (low, high) in enumerate(eval_buckets):
+            count = bucket_counts[i]
+            bar_len = int(count / max_count * bar_width) if max_count > 0 else 0
+            bar = "█" * bar_len
+            pct = count / len(all_evals) * 100 if all_evals else 0
+            print(f"{low:>3}-{high:<3}% | {bar:<{bar_width}} | {count:>4} ({pct:>5.1f}%)")
+
+        print("-" * 70)
+        print(f"Draws with eval data: {len(all_evals)}/{total_draws}")
+        print(f"Average last non-50% eval: {sum(all_evals)/len(all_evals):.1f}%")
+        print(f"Median: {sorted(all_evals)[len(all_evals)//2]:.1f}%")
+
+        # Show how many were winning vs losing
+        model_winning = sum(1 for e in all_evals if e > 50)
+        model_losing = sum(1 for e in all_evals if e < 50)
+        print(f"Model was winning: {model_winning} ({model_winning/len(all_evals)*100:.1f}%)")
+        print(f"Model was losing: {model_losing} ({model_losing/len(all_evals)*100:.1f}%)")
+    else:
+        print()
+        print("No evaluation data available for draws.")
+
+    print("=" * 70)
+
+
 def evaluate_model_against_stockfish(
     model: torch.nn.Module,
     stockfish_path: str,
@@ -912,6 +1038,9 @@ def evaluate_model_against_stockfish(
 
         # Print conversion statistics
         conversion_tracker.print_stats()
+
+        # Print draw statistics
+        print_draw_statistics(game_states)
 
     return (estimated_elo, standard_error)
 
