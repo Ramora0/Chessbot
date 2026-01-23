@@ -57,7 +57,7 @@ BASE_GAME_EVAL_STEPS = GAME_EVAL_STEPS
 # Set to None to start from scratch
 # RESUME_FROM_CHECKPOINT = "./outputs/checkpoint-90000"
 # RESUME_FROM_CHECKPOINT = "./checkpoints/final/checkpoint-197500"
-RESUME_FROM_CHECKPOINT = "./final-model/checkpoint-122500"
+RESUME_FROM_CHECKPOINT = "./final-model/checkpoint-185000"
 
 
 torch.backends.cuda.enable_flash_sdp(True)
