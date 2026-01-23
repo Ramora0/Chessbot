@@ -1,5 +1,6 @@
 """Interactive script to play against the chess model with a pygame GUI."""
 
+import argparse
 import torch
 import torch.nn.functional as F
 import chess
@@ -254,11 +255,17 @@ def draw_board(screen: pygame.Surface, board: chess.Board, piece_images: dict,
 
 
 def main():
-    # Configuration
-    CHECKPOINT_PATH = "./checkpoints/final/checkpoint-120000"  # Adjust path as needed
+    parser = argparse.ArgumentParser(description="Play chess against the model")
+    parser.add_argument(
+        "--model", "-m",
+        type=str,
+        default="./checkpoints/final/checkpoint-120000",
+        help="Path to the model checkpoint (default: ./checkpoints/final/checkpoint-120000)"
+    )
+    args = parser.parse_args()
 
-    print("Loading model from checkpoint...")
-    model = ChessPolicyValueModel.from_pretrained_compiled(CHECKPOINT_PATH)
+    print(f"Loading model from checkpoint: {args.model}")
+    model = ChessPolicyValueModel.from_pretrained_compiled(args.model)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
