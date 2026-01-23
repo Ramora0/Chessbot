@@ -7,6 +7,7 @@ import csv
 import math
 import os
 import random
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -23,7 +24,137 @@ from tokenizer import process_fen
 
 # Stockfish configuration
 STOCKFISH_ELO = 1350
-ENGINE_TIME_LIMIT = 1  # Time limit in seconds for Stockfish moves
+ENGINE_TIME_LIMIT = 0.1  # Time limit in seconds for Stockfish moves
+EVAL_TIME_LIMIT = 0.1    # Time limit for full-strength position evaluation
+
+# Win% bucket configuration for conversion tracking
+WIN_PERCENT_BUCKETS = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50),
+                       (50, 60), (60, 70), (70, 80), (80, 90), (90, 100)]
+
+
+def score_to_win_percent(score: chess.engine.Score, model_is_white: bool) -> Optional[float]:
+    """Convert a Stockfish score to win percentage from model's perspective.
+
+    Returns None if score is unavailable.
+    """
+    if score is None:
+        return None
+
+    # Get the score from white's perspective
+    pov_score = score.white()
+
+    if pov_score.is_mate():
+        # Mate in N moves
+        mate_in = pov_score.mate()
+        if mate_in > 0:
+            win_pct = 100.0  # White is winning
+        else:
+            win_pct = 0.0    # White is losing
+    else:
+        # Convert centipawns to win probability using standard formula
+        # win_prob = 1 / (1 + 10^(-cp/400))
+        cp = pov_score.score()
+        if cp is None:
+            return None
+        win_pct = 100.0 / (1.0 + 10.0 ** (-cp / 400.0))
+
+    # Flip if model is black
+    if not model_is_white:
+        win_pct = 100.0 - win_pct
+
+    return win_pct
+
+
+def get_bucket_index(win_pct: float) -> int:
+    """Get the bucket index for a win percentage."""
+    for i, (low, high) in enumerate(WIN_PERCENT_BUCKETS):
+        if low <= win_pct < high:
+            return i
+    # Handle 100% edge case
+    return len(WIN_PERCENT_BUCKETS) - 1
+
+
+class ConversionTracker:
+    """Tracks win/draw/loss rates from different Stockfish evaluation buckets."""
+
+    def __init__(self):
+        # For each bucket, track (wins, draws, losses)
+        self.bucket_outcomes: Dict[int, List[int]] = defaultdict(lambda: [0, 0, 0])
+        # Track all evals seen in each game: game_id -> list of bucket indices
+        self.game_evals: Dict[int, List[int]] = defaultdict(list)
+
+    def record_eval(self, game_id: int, win_pct: float):
+        """Record an evaluation during a game."""
+        bucket = get_bucket_index(win_pct)
+        self.game_evals[game_id].append(bucket)
+
+    def finalize_game(self, game_id: int, result: str):
+        """Record final outcome for all positions seen in a game."""
+        result_idx = {"win": 0, "draw": 1, "loss": 2}[result]
+
+        # Attribute outcome to each unique bucket seen in the game
+        buckets_seen = set(self.game_evals[game_id])
+        for bucket in buckets_seen:
+            self.bucket_outcomes[bucket][result_idx] += 1
+
+        # Clean up game data
+        del self.game_evals[game_id]
+
+    def get_stats(self) -> Dict[Tuple[int, int], Dict[str, float]]:
+        """Get conversion statistics for each bucket.
+
+        Returns dict mapping bucket range to stats dict with:
+            - positions: number of unique game-buckets
+            - actual_win_rate: actual win rate from those positions
+            - expected_win_rate: midpoint of bucket (what Stockfish predicted)
+        """
+        stats = {}
+        for i, (low, high) in enumerate(WIN_PERCENT_BUCKETS):
+            outcomes = self.bucket_outcomes[i]
+            total = sum(outcomes)
+            if total == 0:
+                continue
+
+            wins, draws, losses = outcomes
+            actual_win_rate = (wins + 0.5 * draws) / total * 100
+            expected_win_rate = (low + high) / 2
+
+            stats[(low, high)] = {
+                "positions": total,
+                "wins": wins,
+                "draws": draws,
+                "losses": losses,
+                "actual_win_rate": actual_win_rate,
+                "expected_win_rate": expected_win_rate,
+            }
+
+        return stats
+
+    def print_stats(self):
+        """Print a formatted table of conversion statistics."""
+        stats = self.get_stats()
+        if not stats:
+            print("No conversion data collected.")
+            return
+
+        print("\n" + "=" * 70)
+        print("CONVERSION STATISTICS (Stockfish Eval vs Actual Win Rate)")
+        print("=" * 70)
+        print(f"{'Eval Range':>12} | {'Games':>6} | {'W-D-L':>12} | {'Expected':>8} | {'Actual':>8} | {'Diff':>7}")
+        print("-" * 70)
+
+        total_positions = 0
+        for (low, high), data in sorted(stats.items()):
+            total_positions += data["positions"]
+            wdl = f"{data['wins']}-{data['draws']}-{data['losses']}"
+            diff = data["actual_win_rate"] - data["expected_win_rate"]
+            diff_str = f"{diff:+.1f}%"
+            print(f"{low:>5}-{high:<5}% | {data['positions']:>6} | {wdl:>12} | "
+                  f"{data['expected_win_rate']:>7.1f}% | {data['actual_win_rate']:>7.1f}% | {diff_str:>7}")
+
+        print("-" * 70)
+        print(f"Total game-buckets tracked: {total_positions}")
+        print("=" * 70)
 
 # Batching configuration
 DEFAULT_BATCH_SIZE = 32  # Number of games to run in parallel
@@ -388,13 +519,15 @@ async def play_games_batched(
     stockfish_elo: int = STOCKFISH_ELO,
     verbose: bool = True,
     starting_positions: Optional[List[Tuple[str, bool]]] = None,
-) -> Tuple[int, int, int, int]:
+    conversion_tracker: Optional[ConversionTracker] = None,
+) -> Tuple[int, int, int, int, float, int]:
     """
     Play multiple games in parallel with batched model inference.
 
     Args:
         stockfish_elo: ELO rating to configure Stockfish to play at
         starting_positions: Optional list of (fen, model_plays_white) tuples
+        conversion_tracker: Optional tracker for eval-to-outcome conversion stats
 
     Returns:
         Tuple of (wins, draws, losses, total_moves, total_illegality, illegality_count)
@@ -410,26 +543,44 @@ async def play_games_batched(
                 GameState(i, model_plays_white=random.random() < 0.5))
 
     # Initialize batch_size engines in parallel (reuse them across games)
-    async def init_engine():
+    async def init_play_engine():
         transport, engine = await chess.engine.popen_uci(stockfish_path)
         await engine.configure({"UCI_LimitStrength": True, "UCI_Elo": stockfish_elo})
         return (transport, engine)
 
+    async def init_eval_engine():
+        transport, engine = await chess.engine.popen_uci(stockfish_path)
+        # Full strength for accurate position evaluation
+        return (transport, engine)
+
     num_engines = min(batch_size, num_games)
+    # Use fewer eval engines since analyse() is fast
+    num_eval_engines = min(8, num_engines) if conversion_tracker else 0
 
     if verbose:
-        with tqdm(total=num_engines, desc="Initializing engines", unit=" engines") as pbar:
-            # Initialize engines in batches to update progress
+        total_engines = num_engines + num_eval_engines
+        with tqdm(total=total_engines, desc="Initializing engines", unit=" engines") as pbar:
+            # Initialize play engines in batches
             engines = []
-            batch_init_size = 8  # Initialize 8 at a time to show progress
+            batch_init_size = 8
             for i in range(0, num_engines, batch_init_size):
                 batch_count = min(batch_init_size, num_engines - i)
-                batch_engines = await asyncio.gather(*[init_engine() for _ in range(batch_count)])
+                batch_engines = await asyncio.gather(*[init_play_engine() for _ in range(batch_count)])
                 engines.extend(batch_engines)
                 pbar.update(batch_count)
+
+            # Initialize eval engines
+            eval_engines = []
+            if num_eval_engines > 0:
+                eval_engines = await asyncio.gather(*[init_eval_engine() for _ in range(num_eval_engines)])
+                pbar.update(num_eval_engines)
+
         print("All engines initialized. Starting games...\n")
     else:
-        engines = await asyncio.gather(*[init_engine() for _ in range(num_engines)])
+        engines = await asyncio.gather(*[init_play_engine() for _ in range(num_engines)])
+        eval_engines = []
+        if num_eval_engines > 0:
+            eval_engines = await asyncio.gather(*[init_eval_engine() for _ in range(num_eval_engines)])
 
     # Track which games are currently using which engines
     available_engines = list(range(num_engines))
@@ -476,6 +627,9 @@ async def play_games_batched(
                     total_illegality += avg_illegality * len(boards)
                     illegality_count += len(boards)
 
+                    # Games that will have moves applied (for eval tracking)
+                    games_with_moves = []
+
                     for game, move in zip(games_needing_model, moves):
                         if move is None or move not in game.board.legal_moves:
                             game.is_complete = True
@@ -484,6 +638,28 @@ async def play_games_batched(
                             game.board.push(move)
                             game.move_count += 1
                             pbar.update(1)
+                            games_with_moves.append(game)
+
+                    # Evaluate positions after model moves (full-strength Stockfish)
+                    if conversion_tracker and eval_engines and games_with_moves:
+                        # Batch evaluate using available eval engines
+                        eval_tasks = []
+                        for i, game in enumerate(games_with_moves):
+                            eval_engine = eval_engines[i % len(eval_engines)][1]
+                            eval_tasks.append(
+                                eval_engine.analyse(
+                                    game.board,
+                                    chess.engine.Limit(time=EVAL_TIME_LIMIT)
+                                )
+                            )
+                        eval_results = await asyncio.gather(*eval_tasks)
+
+                        for game, info in zip(games_with_moves, eval_results):
+                            score = info.get("score")
+                            if score:
+                                win_pct = score_to_win_percent(score, game.model_plays_white)
+                                if win_pct is not None:
+                                    conversion_tracker.record_eval(game.game_id, win_pct)
 
                 # Process Stockfish moves in parallel
                 games_needing_stockfish = [
@@ -522,6 +698,10 @@ async def play_games_batched(
                         else:
                             losses += 1
 
+                        # Record conversion stats
+                        if conversion_tracker:
+                            conversion_tracker.finalize_game(game_id, result_str)
+
                         # Free up the engine
                         engine_idx = game_to_engine.pop(game_id)
 
@@ -545,8 +725,11 @@ async def play_games_batched(
                             f"Completed {completed_count}/{num_games} | Score: {score_pct:.1f}% ({wins}W-{draws}D-{losses}L)")
 
     finally:
-        # Clean up engines
+        # Clean up play engines
         for _, engine in engines:
+            await engine.quit()
+        # Clean up eval engines
+        for _, engine in eval_engines:
             await engine.quit()
 
     return (wins, draws, losses, total_moves, total_illegality, illegality_count)
@@ -605,6 +788,9 @@ def evaluate_model_against_stockfish(
         print(f"  Batch size: {batch_size} (parallel games)")
         print()
 
+    # Create conversion tracker for eval-to-outcome stats
+    conversion_tracker = ConversionTracker()
+
     # Run batched games
     wins, draws, losses, total_moves, total_illegality, illegality_count = asyncio.run(
         play_games_batched(
@@ -617,6 +803,7 @@ def evaluate_model_against_stockfish(
             stockfish_elo=opponent_elo,
             verbose=verbose,
             starting_positions=starting_positions,
+            conversion_tracker=conversion_tracker,
         )
     )
 
@@ -640,6 +827,9 @@ def evaluate_model_against_stockfish(
         print()
         print(f"Estimated ELO: {estimated_elo:.0f} ± {standard_error:.0f}")
         print("=" * 60)
+
+        # Print conversion statistics
+        conversion_tracker.print_stats()
 
     return (estimated_elo, standard_error)
 
