@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 import chess
 import chess.engine
+import chess.pgn
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -474,6 +475,7 @@ class GameState:
 
     def __init__(self, game_id: int, model_plays_white: bool, starting_fen: Optional[str] = None):
         self.game_id = game_id
+        self.starting_fen = starting_fen
         self.board = chess.Board(
             starting_fen) if starting_fen else chess.Board()
         self.model_plays_white = model_plays_white
@@ -482,6 +484,7 @@ class GameState:
         self.engine = None
         self.is_complete = False
         self.result = None
+        self.moves: List[chess.Move] = []  # Track all moves for PGN export
 
     def is_model_turn(self) -> bool:
         """Check if it's the model's turn to move."""
@@ -520,7 +523,7 @@ async def play_games_batched(
     verbose: bool = True,
     starting_positions: Optional[List[Tuple[str, bool]]] = None,
     conversion_tracker: Optional[ConversionTracker] = None,
-) -> Tuple[int, int, int, int, float, int]:
+) -> Tuple[int, int, int, int, float, int, List[GameState]]:
     """
     Play multiple games in parallel with batched model inference.
 
@@ -530,7 +533,7 @@ async def play_games_batched(
         conversion_tracker: Optional tracker for eval-to-outcome conversion stats
 
     Returns:
-        Tuple of (wins, draws, losses, total_moves, total_illegality, illegality_count)
+        Tuple of (wins, draws, losses, total_moves, total_illegality, illegality_count, game_states)
     """
     # Create game states with random color assignment or from starting positions
     game_states = []
@@ -635,6 +638,7 @@ async def play_games_batched(
                             game.is_complete = True
                             game.result = ("loss", game.move_count)
                         else:
+                            game.moves.append(move)
                             game.board.push(move)
                             game.move_count += 1
                             pbar.update(1)
@@ -679,6 +683,7 @@ async def play_games_batched(
 
                     # Apply moves to all games
                     for game, result in zip(games_needing_stockfish, stockfish_results):
+                        game.moves.append(result.move)
                         game.board.push(result.move)
                         game.move_count += 1
                         pbar.update(1)
@@ -733,7 +738,77 @@ async def play_games_batched(
         for _, engine in eval_engines:
             await engine.quit()
 
-    return (wins, draws, losses, total_moves, total_illegality, illegality_count)
+    return (wins, draws, losses, total_moves, total_illegality, illegality_count, game_states)
+
+
+def export_games_to_pgn(
+    game_states: List[GameState],
+    pgn_path: str | Path,
+    opponent_elo: int,
+    verbose: bool = True,
+) -> None:
+    """
+    Export completed games to a PGN file.
+
+    Args:
+        game_states: List of completed GameState objects
+        pgn_path: Path to write the PGN file
+        opponent_elo: ELO rating of Stockfish opponent (for headers)
+        verbose: Whether to print progress
+    """
+    from datetime import datetime
+
+    if verbose:
+        print(f"\nExporting {len(game_states)} games to {pgn_path}...")
+
+    with open(pgn_path, 'w') as f:
+        for i, game_state in enumerate(game_states):
+            game = chess.pgn.Game()
+
+            # Set headers
+            game.headers["Event"] = "Model Evaluation"
+            game.headers["Site"] = "Local"
+            game.headers["Date"] = datetime.now().strftime("%Y.%m.%d")
+            game.headers["Round"] = str(i + 1)
+
+            if game_state.model_plays_white:
+                game.headers["White"] = "Model"
+                game.headers["Black"] = f"Stockfish ({opponent_elo})"
+            else:
+                game.headers["White"] = f"Stockfish ({opponent_elo})"
+                game.headers["Black"] = "Model"
+
+            # Set result
+            result_str, _ = game_state.get_result()
+            if result_str == "win":
+                if game_state.model_plays_white:
+                    game.headers["Result"] = "1-0"
+                else:
+                    game.headers["Result"] = "0-1"
+            elif result_str == "loss":
+                if game_state.model_plays_white:
+                    game.headers["Result"] = "0-1"
+                else:
+                    game.headers["Result"] = "1-0"
+            else:
+                game.headers["Result"] = "1/2-1/2"
+
+            # Set FEN if non-standard starting position
+            if game_state.starting_fen:
+                game.headers["FEN"] = game_state.starting_fen
+                game.headers["SetUp"] = "1"
+
+            # Add moves
+            node = game
+            board = chess.Board(game_state.starting_fen) if game_state.starting_fen else chess.Board()
+            for move in game_state.moves:
+                node = node.add_variation(move)
+
+            # Write game to file
+            print(game, file=f, end="\n\n")
+
+    if verbose:
+        print(f"PGN export complete: {pgn_path}")
 
 
 def evaluate_model_against_stockfish(
@@ -745,6 +820,7 @@ def evaluate_model_against_stockfish(
     opponent_elo: int = STOCKFISH_ELO,
     verbose: bool = True,
     puzzle_csv_path: Optional[str | Path] = None,
+    pgn_path: Optional[str | Path] = None,
 ) -> Tuple[float, float]:
     """
     Evaluate a model by playing multiple games against Stockfish with batched inference.
@@ -759,6 +835,7 @@ def evaluate_model_against_stockfish(
         verbose: Whether to print progress updates
         puzzle_csv_path: Optional path to puzzles.csv to load starting positions.
                         Games will be played in pairs from each position for fairness.
+        pgn_path: Optional path to export all games as PGN file.
 
     Returns:
         Tuple of (estimated_elo, standard_error)
@@ -793,7 +870,7 @@ def evaluate_model_against_stockfish(
     conversion_tracker = ConversionTracker()
 
     # Run batched games
-    wins, draws, losses, total_moves, total_illegality, illegality_count = asyncio.run(
+    wins, draws, losses, total_moves, total_illegality, illegality_count, game_states = asyncio.run(
         play_games_batched(
             model=model,
             stockfish_path=stockfish_path,
@@ -807,6 +884,10 @@ def evaluate_model_against_stockfish(
             conversion_tracker=conversion_tracker,
         )
     )
+
+    # Export PGN if requested
+    if pgn_path:
+        export_games_to_pgn(game_states, pgn_path, opponent_elo, verbose)
 
     # Final ELO calculation
     estimated_elo, standard_error = estimate_elo_from_scores(
@@ -849,6 +930,7 @@ def main():
     parser.add_argument("-b", "--batch-size", type=int, default=128, help="Batch size for parallel games")
     parser.add_argument("--elo", type=int, default=1350, help="Stockfish ELO rating")
     parser.add_argument("--puzzles", default=None, help="Path to puzzles.csv for starting positions")
+    parser.add_argument("--pgn", default=None, help="Path to export games as PGN file")
     args = parser.parse_args()
 
     print(f"Loading model from {args.model}...")
@@ -875,6 +957,7 @@ def main():
         opponent_elo=args.elo,
         verbose=True,
         puzzle_csv_path=args.puzzles,
+        pgn_path=args.pgn,
     )
 
     print()
