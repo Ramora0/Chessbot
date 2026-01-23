@@ -642,24 +642,25 @@ async def play_games_batched(
 
                     # Evaluate positions after model moves (full-strength Stockfish)
                     if conversion_tracker and eval_engines and games_with_moves:
-                        # Batch evaluate using available eval engines
-                        eval_tasks = []
-                        for i, game in enumerate(games_with_moves):
-                            eval_engine = eval_engines[i % len(eval_engines)][1]
-                            eval_tasks.append(
-                                eval_engine.analyse(
+                        # Process in batches - each engine handles one position per batch
+                        num_eval = len(eval_engines)
+                        for batch_start in range(0, len(games_with_moves), num_eval):
+                            batch_games = games_with_moves[batch_start:batch_start + num_eval]
+                            eval_tasks = [
+                                eval_engines[i][1].analyse(
                                     game.board,
                                     chess.engine.Limit(time=EVAL_TIME_LIMIT)
                                 )
-                            )
-                        eval_results = await asyncio.gather(*eval_tasks)
+                                for i, game in enumerate(batch_games)
+                            ]
+                            eval_results = await asyncio.gather(*eval_tasks)
 
-                        for game, info in zip(games_with_moves, eval_results):
-                            score = info.get("score")
-                            if score:
-                                win_pct = score_to_win_percent(score, game.model_plays_white)
-                                if win_pct is not None:
-                                    conversion_tracker.record_eval(game.game_id, win_pct)
+                            for game, info in zip(batch_games, eval_results):
+                                score = info.get("score")
+                                if score:
+                                    win_pct = score_to_win_percent(score, game.model_plays_white)
+                                    if win_pct is not None:
+                                        conversion_tracker.record_eval(game.game_id, win_pct)
 
                 # Process Stockfish moves in parallel
                 games_needing_stockfish = [
