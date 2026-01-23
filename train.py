@@ -47,7 +47,7 @@ BASE_REGRET_EVAL_STEPS = REGRET_EVAL_STEPS
 # Game-based evaluation configuration
 # Base steps between game evaluations (30k at batch_size=1024)
 GAME_EVAL_STEPS = 120000
-GAME_EVAL_NUM_GAMES = 400            # Number of games to play per evaluation
+GAME_EVAL_NUM_GAMES = 250            # Number of games to play per evaluation
 GAME_EVAL_BATCH_SIZE = 128           # Parallel games during evaluation
 GAME_EVAL_OPPONENT_ELO = 1350        # Stockfish ELO level
 GAME_EVAL_STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
@@ -57,7 +57,7 @@ BASE_GAME_EVAL_STEPS = GAME_EVAL_STEPS
 # Set to None to start from scratch
 # RESUME_FROM_CHECKPOINT = "./outputs/checkpoint-90000"
 # RESUME_FROM_CHECKPOINT = "./checkpoints/final/checkpoint-197500"
-RESUME_FROM_CHECKPOINT = None
+RESUME_FROM_CHECKPOINT = "./final-model/checkpoint-122500"
 
 
 torch.backends.cuda.enable_flash_sdp(True)
