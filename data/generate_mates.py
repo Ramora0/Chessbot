@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import shutil
 from collections import defaultdict
 from pathlib import Path
@@ -88,7 +87,7 @@ async def analyze_position_for_mate(
     engine: chess.engine.UciProtocol,
     board: chess.Board,
     move_uci: str,
-    time_limit: float = MATE_SEARCH_TIME,
+    time_limit: float,
     depth_limit: int = MATE_SEARCH_DEPTH,
 ) -> Optional[Tuple[bool, int]]:
     """
@@ -150,6 +149,7 @@ async def process_batch_async(
     positions: List[Dict],
     engines: List[Tuple[object, chess.engine.UciProtocol]],
     stats: Dict[str, int],
+    time_limit: float,
 ) -> List[Dict]:
     """
     Process a batch of positions, refining mate win percentages.
@@ -189,7 +189,7 @@ async def process_batch_async(
         for idx, move, is_winning_move in moves_to_check:
             # Cycle through available engines
             engine = engines[len(tasks) % len(engines)][1]
-            tasks.append(analyze_position_for_mate(engine, board.copy(), move))
+            tasks.append(analyze_position_for_mate(engine, board.copy(), move, time_limit))
 
         # Run all analyses in parallel
         mate_results = await asyncio.gather(*tasks)
@@ -224,6 +224,7 @@ async def process_dataset_async(
     stockfish_path: str,
     batch_size: int = 100,
     num_engines: int = MAX_CONCURRENT_ENGINES,
+    time_limit: float = MATE_SEARCH_TIME,
 ) -> Tuple[List[Dict], Dict[str, int]]:
     """
     Process the entire dataset asynchronously with multiple Stockfish engines.
@@ -247,14 +248,12 @@ async def process_dataset_async(
 
     try:
         # Process in batches
-        num_batches = (len(dataset) + batch_size - 1) // batch_size
-
         with tqdm(total=len(dataset), desc="Processing positions") as pbar:
             for batch_start in range(0, len(dataset), batch_size):
                 batch_end = min(batch_start + batch_size, len(dataset))
                 batch = [dataset[i] for i in range(batch_start, batch_end)]
 
-                batch_results = await process_batch_async(batch, engines, stats)
+                batch_results = await process_batch_async(batch, engines, stats, time_limit)
                 all_results.extend(batch_results)
                 pbar.update(len(batch))
 
@@ -366,10 +365,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Update global time limit if specified
-    global MATE_SEARCH_TIME
-    MATE_SEARCH_TIME = args.time_limit
-
     print("=" * 60)
     print("MATE-REFINED DATASET GENERATION")
     print("=" * 60)
@@ -410,6 +405,7 @@ def main():
             args.stockfish,
             batch_size=args.batch_size,
             num_engines=args.num_engines,
+            time_limit=args.time_limit,
         )
     )
 
