@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=chessformer
 #SBATCH --partition=nextgen
-#SBATCH --time=5:00:00
+#SBATCH --time=6:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=10
