@@ -183,16 +183,22 @@ async def process_batch_async(
         stats["positions_with_mates"] += 1
         stats["total_mate_moves"] += len(moves_to_check)
 
-        # Create tasks for all moves needing analysis
+        # Process moves in chunks to avoid engine conflicts
+        # Each engine can only handle one analysis at a time
         board = chess.Board(fen)
-        tasks = []
-        for idx, move, is_winning_move in moves_to_check:
-            # Cycle through available engines
-            engine = engines[len(tasks) % len(engines)][1]
-            tasks.append(analyze_position_for_mate(engine, board.copy(), move, time_limit))
+        num_engines = len(engines)
+        mate_results = []
 
-        # Run all analyses in parallel
-        mate_results = await asyncio.gather(*tasks)
+        for chunk_start in range(0, len(moves_to_check), num_engines):
+            chunk = moves_to_check[chunk_start:chunk_start + num_engines]
+            tasks = []
+            for i, (idx, move, is_winning_move) in enumerate(chunk):
+                engine = engines[i][1]
+                tasks.append(analyze_position_for_mate(engine, board.copy(), move, time_limit))
+
+            # Run this chunk in parallel, then wait before next chunk
+            chunk_results = await asyncio.gather(*tasks)
+            mate_results.extend(chunk_results)
 
         # Update p_win values based on results
         new_p_wins = list(p_wins)
