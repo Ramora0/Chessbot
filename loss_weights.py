@@ -16,7 +16,7 @@ MASKED_TOKEN_LOSS_WEIGHT: float = 1.0
 CONTROL_MAP_LOSS_WEIGHT: float = 1.0 / 5.0
 
 # Temperature for softmax loss
-TEMPERATURE: float = 0.5
+TEMPERATURE: float = 0.25
 
 # Endgame upweighting: multiply loss by this factor for endgame positions
 # Endgame defined as both players having <= 13 points of material
