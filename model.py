@@ -399,18 +399,18 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # Compute policy entropy for monitoring saturation
             model_entropy = -(model_probs * torch.log(model_probs + 1e-10)).sum(dim=-1).mean()
 
-            # Loss 2: Sigmoid-based absolute win% prediction for LEGAL moves only
-            # Legal moves: target = their absolute win% (e.g., 0.52, 0.48, etc.)
-            # absolute_winrates already computed above in Loss 1
-            # Temperature is NOT applied here - sigmoid uses the raw logits
+            # Loss 2: Huber loss on raw logits for LEGAL moves only
+            # Target: logit-space win% (un-sigmoid'd absolute winrates)
+            # This avoids the sigmoid and operates directly in logit space
+            # target_logits already computed above in Loss 1
 
-            # Compute BCE loss on LEGAL moves only
+            # Compute Huber loss on LEGAL moves only
             # Uses annealed_logits for consistency with policy loss
-            per_move_bce = F.binary_cross_entropy_with_logits(
-                annealed_logits, absolute_winrates, reduction='none'
+            per_move_huber = F.huber_loss(
+                annealed_logits, target_logits, delta=1.0, reduction='none'
             )  # [batch, policy_dim]
             legal_count = policy_mask_bool.float().sum(dim=-1).clamp(min=1)  # [batch]
-            per_sample_winrate_loss = (per_move_bce * policy_mask_bool.float()).sum(dim=-1) / legal_count
+            per_sample_winrate_loss = (per_move_huber * policy_mask_bool.float()).sum(dim=-1) / legal_count
             raw_move_winrate_loss = (per_sample_winrate_loss * endgame_weights).sum() / endgame_weights.sum()
             move_winrate_loss = self.move_winrate_loss_weight * raw_move_winrate_loss
 
