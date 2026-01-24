@@ -19,6 +19,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import os
+
 import chess
 import chess.engine
 import numpy as np
@@ -42,7 +44,7 @@ DEFAULT_SEED = 42
 # Short time limit but enough to find reasonable mates
 MATE_SEARCH_TIME = 0.05  # 50ms per move - fast but usually finds mates
 MATE_SEARCH_DEPTH = 20   # Max depth to search (mates beyond this are rare)
-MAX_CONCURRENT_ENGINES = 32  # Number of parallel Stockfish processes
+MAX_CONCURRENT_ENGINES = os.cpu_count() or 8  # Default to number of cores
 
 # Winrate thresholds to detect mate positions
 WIN_THRESHOLD = 0.9999  # Consider 1.0 as winning/mating
@@ -304,22 +306,30 @@ async def process_dataset_async(
     stats = defaultdict(int)
     stats["total_positions"] = len(dataset)
 
-    # Initialize engines
+    # Initialize engines (single-threaded for maximum throughput on short searches)
     print(f"Initializing {num_engines} Stockfish engines...")
     engines = []
     for _ in tqdm(range(num_engines), desc="Starting engines"):
         transport, engine = await chess.engine.popen_uci(stockfish_path)
+        # Single thread per engine - for short searches, more engines beats fewer multi-threaded ones
+        await engine.configure({"Threads": 1})
         engines.append((transport, engine))
     print("All engines ready.\n")
 
     all_results = []
 
+    # Load entire dataset into memory - MUCH faster than repeated dataset[i] lookups
+    # This is fine since we've already sampled down to a manageable size (e.g., 2M positions)
+    print("Loading dataset into memory...")
+    positions_list = dataset.to_list()
+    print(f"Loaded {len(positions_list):,} positions into memory.\n")
+
     try:
         # Process in batches
-        with tqdm(total=len(dataset), desc="Processing positions") as pbar:
-            for batch_start in range(0, len(dataset), batch_size):
-                batch_end = min(batch_start + batch_size, len(dataset))
-                batch = [dataset[i] for i in range(batch_start, batch_end)]
+        with tqdm(total=len(positions_list), desc="Processing positions") as pbar:
+            for batch_start in range(0, len(positions_list), batch_size):
+                batch_end = min(batch_start + batch_size, len(positions_list))
+                batch = positions_list[batch_start:batch_end]
 
                 batch_results = await process_batch_async(batch, engines, stats, time_limit)
                 all_results.extend(batch_results)
@@ -422,7 +432,7 @@ def main():
         "--num-engines",
         type=int,
         default=MAX_CONCURRENT_ENGINES,
-        help=f"Number of parallel Stockfish engines (default: {MAX_CONCURRENT_ENGINES})",
+        help=f"Number of parallel Stockfish engines (default: cpu_count={MAX_CONCURRENT_ENGINES})",
     )
     parser.add_argument(
         "--time-limit",
