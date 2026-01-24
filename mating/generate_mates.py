@@ -194,11 +194,11 @@ def main():
         print(f"Sampling {args.num_positions:,} positions (seed={args.seed})...")
         dataset = dataset.shuffle(seed=args.seed).select(range(args.num_positions))
 
-    # Convert to plain Python lists (all in memory)
+    # Convert to plain Python lists (actually in memory, not lazy)
     print("Loading into memory...")
-    fens = dataset["fen"]
-    moves_list = dataset["moves"]
-    p_wins_list = dataset["p_win"]
+    fens = list(dataset["fen"])
+    moves_list = list(dataset["moves"])
+    p_wins_list = list(dataset["p_win"])
     num_positions = len(fens)
     print(f"Loaded {num_positions:,} positions into memory\n")
 
