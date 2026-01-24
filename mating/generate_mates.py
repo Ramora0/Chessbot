@@ -2,12 +2,11 @@
 """
 Generate a smaller dataset (2M positions) with refined mate-in-n win percentages.
 
-The original dataset assigns 100% win rate to any mating move and 0% to getting mated.
-This script re-runs Stockfish to find the actual mate-in-n depth and assigns:
-- Mating moves: 98% + 2%/n (so mate-in-1 = 100%, mate-in-2 = 99%, etc.)
-- Getting mated: 2% - 2%/n (so mate-in-1 = 0%, mate-in-2 = 1%, etc.)
+Two-phase approach for speed:
+1. Fast pass: Identify positions with mate candidates, remap non-mate positions (no Stockfish)
+2. Slow pass: Run Stockfish only on positions with mate-candidate moves
 
-This helps the model learn to distinguish between immediate mates and longer forced mates.
+This is much faster than running Stockfish analysis on every position.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from typing import Optional, Tuple
 
 import chess
 import chess.engine
-from datasets import Dataset, load_from_disk
+from datasets import Dataset, concatenate_datasets, load_from_disk
 from tqdm import tqdm
 
 # -------------------------------------------------------------------
@@ -44,6 +43,35 @@ WIN_THRESHOLD = 0.9999
 LOSS_THRESHOLD = 0.0001
 
 
+# -------------------------------------------------------------------
+# PHASE 1: Fast filtering and remapping (no Stockfish)
+# -------------------------------------------------------------------
+
+def has_mate_candidate(example: dict) -> bool:
+    """Check if position has any mate-candidate moves."""
+    for p_win in example["p_win"]:
+        if p_win >= WIN_THRESHOLD or p_win <= LOSS_THRESHOLD:
+            return True
+    return False
+
+
+def remap_non_mate_batch(batch: dict) -> dict:
+    """Remap all win percentages for positions without mate candidates."""
+    new_p_wins = []
+    for p_win_list in batch["p_win"]:
+        # Linear map: 0 -> 0.02, 1 -> 0.98
+        new_p_wins.append([0.02 + p * 0.96 for p in p_win_list])
+    return {
+        "fen": batch["fen"],
+        "moves": batch["moves"],
+        "p_win": new_p_wins,
+    }
+
+
+# -------------------------------------------------------------------
+# PHASE 2: Stockfish analysis for mate positions
+# -------------------------------------------------------------------
+
 def compute_mate_winrate(mate_in_n: int, is_winning: bool) -> float:
     """Compute refined win rate based on mate depth."""
     if mate_in_n <= 0:
@@ -54,18 +82,8 @@ def compute_mate_winrate(mate_in_n: int, is_winning: bool) -> float:
         return 0.02 - 0.02 / mate_in_n
 
 
-def remap_non_mate_winrate(p_win: float) -> float:
-    """Remap non-mate win percentages from (0, 1) to (0.02, 0.98)."""
-    return 0.02 + p_win * 0.96
-
-
 class EngineWorker(threading.Thread):
-    """
-    Worker thread that owns a single Stockfish engine.
-
-    Each engine lives in its own thread to avoid thread-safety issues
-    with python-chess's async internals.
-    """
+    """Worker thread that owns a single Stockfish engine."""
 
     def __init__(self, stockfish_path: str, work_queue: queue.Queue, results: dict, lock: threading.Lock):
         super().__init__(daemon=True)
@@ -76,13 +94,12 @@ class EngineWorker(threading.Thread):
         self.engine: Optional[chess.engine.SimpleEngine] = None
 
     def run(self):
-        # Initialize engine in this thread
         self.engine = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
         self.engine.configure({"Threads": 1})
 
         while True:
             item = self.work_queue.get()
-            if item is None:  # Shutdown signal
+            if item is None:
                 self.work_queue.task_done()
                 break
 
@@ -144,11 +161,9 @@ class EnginePool:
         print(f"All {num_engines} engines ready.\n")
 
     def submit(self, key: tuple, fen: str, move_uci: str):
-        """Submit a move for analysis."""
         self.work_queue.put((key, fen, move_uci))
 
     def wait_and_get_results(self) -> dict:
-        """Wait for all pending work to complete and return results."""
         self.work_queue.join()
         with self.lock:
             results = dict(self.results)
@@ -156,7 +171,6 @@ class EnginePool:
         return results
 
     def shutdown(self):
-        """Shutdown all workers."""
         for _ in self.workers:
             self.work_queue.put(None)
         for worker in self.workers:
@@ -169,14 +183,11 @@ class EnginePool:
         self.shutdown()
 
 
-def process_batch(pool: EnginePool, batch: dict) -> list[dict]:
-    """Process a batch of positions, analyzing mate moves in parallel."""
+def process_mate_batch(pool: EnginePool, batch: dict) -> list[dict]:
+    """Process a batch of positions that have mate candidates."""
     batch_size = len(batch["fen"])
+    mate_info: dict[tuple, bool] = {}
 
-    # Track which moves are mate candidates and their original win status
-    mate_info: dict[tuple, bool] = {}  # key -> is_winning_move
-
-    # Submit all mate-candidate moves for analysis
     for pos_idx in range(batch_size):
         for move_idx, (move, p_win) in enumerate(
             zip(batch["moves"][pos_idx], batch["p_win"][pos_idx])
@@ -186,10 +197,8 @@ def process_batch(pool: EnginePool, batch: dict) -> list[dict]:
                 mate_info[key] = p_win >= WIN_THRESHOLD
                 pool.submit(key, batch["fen"][pos_idx], move)
 
-    # Wait for all analysis to complete
     analysis_results = pool.wait_and_get_results()
 
-    # Build output for each position
     results = []
     for pos_idx in range(batch_size):
         new_p_wins = []
@@ -204,7 +213,8 @@ def process_batch(pool: EnginePool, batch: dict) -> list[dict]:
                 else:
                     new_p_wins.append(0.98 if is_winning_move else 0.02)
             else:
-                new_p_wins.append(remap_non_mate_winrate(p_win))
+                # Non-mate move in a position that has some mate moves
+                new_p_wins.append(0.02 + p_win * 0.96)
 
         results.append({
             "fen": batch["fen"][pos_idx],
@@ -215,34 +225,20 @@ def process_batch(pool: EnginePool, batch: dict) -> list[dict]:
     return results
 
 
+# -------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate dataset with refined mate-in-n win percentages"
     )
-    parser.add_argument(
-        "--output", type=Path, default=DEFAULT_OUTPUT_PATH,
-        help=f"Output dataset path (default: {DEFAULT_OUTPUT_PATH})",
-    )
-    parser.add_argument(
-        "--stockfish", type=str, default=DEFAULT_STOCKFISH_PATH,
-        help=f"Stockfish executable path (default: {DEFAULT_STOCKFISH_PATH})",
-    )
-    parser.add_argument(
-        "--num-positions", type=int, default=DEFAULT_NUM_POSITIONS,
-        help=f"Number of positions to sample (default: {DEFAULT_NUM_POSITIONS:,})",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=DEFAULT_SEED,
-        help=f"Random seed for sampling (default: {DEFAULT_SEED})",
-    )
-    parser.add_argument(
-        "--num-engines", type=int, default=DEFAULT_NUM_ENGINES,
-        help=f"Number of Stockfish engines (default: {DEFAULT_NUM_ENGINES})",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
-        help=f"Batch size for processing (default: {DEFAULT_BATCH_SIZE:,})",
-    )
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument("--stockfish", type=str, default=DEFAULT_STOCKFISH_PATH)
+    parser.add_argument("--num-positions", type=int, default=DEFAULT_NUM_POSITIONS)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--num-engines", type=int, default=DEFAULT_NUM_ENGINES)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
 
     args = parser.parse_args()
 
@@ -253,14 +249,13 @@ def main():
     input_path = Path(input_path)
 
     print("=" * 60)
-    print("MATE-REFINED DATASET GENERATION")
+    print("MATE-REFINED DATASET GENERATION (Two-Phase)")
     print("=" * 60)
     print(f"Input: {input_path}")
     print(f"Output: {args.output}")
     print(f"Stockfish: {args.stockfish}")
     print(f"Positions: {args.num_positions:,}")
     print(f"Engines: {args.num_engines}")
-    print(f"Batch size: {args.batch_size:,}")
     print("=" * 60 + "\n")
 
     if not Path(args.stockfish).exists():
@@ -277,27 +272,69 @@ def main():
         dataset = dataset.shuffle(seed=args.seed).select(range(args.num_positions))
     print()
 
-    # Process in batches
-    all_results = []
+    # =========================================================
+    # PHASE 1: Split dataset and process non-mate positions fast
+    # =========================================================
+    print("Phase 1: Filtering positions...")
+
+    # Split into mate vs non-mate positions
+    mate_positions = dataset.filter(has_mate_candidate, desc="Finding mate positions")
+    non_mate_positions = dataset.filter(
+        lambda x: not has_mate_candidate(x),
+        desc="Finding non-mate positions"
+    )
+
+    print(f"  Positions with mate candidates: {len(mate_positions):,}")
+    print(f"  Positions without mates: {len(non_mate_positions):,}")
+    print(f"  Mate ratio: {len(mate_positions) / len(dataset) * 100:.1f}%")
+    print()
+
+    # Fast remap for non-mate positions (no Stockfish needed)
+    print("Phase 1: Remapping non-mate positions (fast)...")
+    non_mate_processed = non_mate_positions.map(
+        remap_non_mate_batch,
+        batched=True,
+        batch_size=10_000,
+        desc="Remapping non-mate",
+    )
+    print()
+
+    # =========================================================
+    # PHASE 2: Stockfish analysis for mate positions only
+    # =========================================================
+    print("Phase 2: Analyzing mate positions with Stockfish...")
+
+    mate_results = []
     with EnginePool(args.stockfish, args.num_engines) as pool:
         for start in tqdm(
-            range(0, len(dataset), args.batch_size),
-            desc="Processing batches",
+            range(0, len(mate_positions), args.batch_size),
+            desc="Processing mate batches",
         ):
-            end = min(start + args.batch_size, len(dataset))
-            batch = dataset[start:end]
-            batch_results = process_batch(pool, batch)
-            all_results.extend(batch_results)
+            end = min(start + args.batch_size, len(mate_positions))
+            batch = mate_positions[start:end]
+            batch_results = process_mate_batch(pool, batch)
+            mate_results.extend(batch_results)
 
-    # Save output
+    mate_processed = Dataset.from_list(mate_results)
+    print()
+
+    # =========================================================
+    # PHASE 3: Combine and save
+    # =========================================================
+    print("Phase 3: Combining results...")
+
+    # Concatenate both datasets
+    final_dataset = concatenate_datasets([non_mate_processed, mate_processed])
+    print(f"Final dataset: {len(final_dataset):,} positions")
+
+    # Save
     if args.output.exists():
         print(f"Removing existing output at {args.output}")
         shutil.rmtree(args.output)
 
-    print(f"Saving {len(all_results):,} positions to {args.output}...")
-    output_dataset = Dataset.from_list(all_results)
+    print(f"Saving to {args.output}...")
     args.output.mkdir(parents=True, exist_ok=True)
-    output_dataset.save_to_disk(str(args.output))
+    final_dataset.save_to_disk(str(args.output))
 
     print("\nDone!")
     return 0
