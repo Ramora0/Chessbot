@@ -145,6 +145,50 @@ async def analyze_position_for_mate(
         return None
 
 
+async def engine_worker(
+    engine: chess.engine.UciProtocol,
+    work_queue: asyncio.Queue,
+    results_dict: Dict,
+    stats: Dict[str, int],
+    time_limit: float,
+) -> None:
+    """
+    Worker coroutine that continuously pulls work from the queue.
+
+    Each worker owns one Stockfish engine and processes items until
+    the queue is empty (None sentinel received).
+
+    Note: No locking needed - asyncio is cooperative multitasking, so only
+    one coroutine runs at a time. Stats updates between awaits are atomic.
+    """
+    while True:
+        item = await work_queue.get()
+
+        # None is the shutdown sentinel
+        if item is None:
+            work_queue.task_done()
+            break
+
+        pos_idx, move_idx, move_uci, is_winning_move, board = item
+
+        try:
+            result = await analyze_position_for_mate(engine, board, move_uci, time_limit)
+            results_dict[(pos_idx, move_idx)] = (result, is_winning_move)
+
+            if result is not None:
+                _, mate_in_n = result
+                stats["mates_found"] += 1
+                stats[f"mate_depth_{min(mate_in_n, 10)}"] += 1
+            else:
+                stats["mates_not_found"] += 1
+        except Exception:
+            # On error, store None result
+            results_dict[(pos_idx, move_idx)] = (None, is_winning_move)
+            stats["mates_not_found"] += 1
+
+        work_queue.task_done()
+
+
 async def process_batch_async(
     positions: List[Dict],
     engines: List[Tuple[object, chess.engine.UciProtocol]],
@@ -152,77 +196,95 @@ async def process_batch_async(
     time_limit: float,
 ) -> List[Dict]:
     """
-    Process a batch of positions, refining mate win percentages.
+    Process a batch of positions using a worker pool pattern.
+
+    All engines are kept constantly busy by pulling from a shared work queue.
+    This is much more efficient than the previous approach which would leave
+    engines idle if a position had fewer mate-ish moves than available engines.
 
     Args:
         positions: List of position dicts with fen, moves, p_win
         engines: List of (transport, engine) tuples
         stats: Statistics dict to update
+        time_limit: Time limit for each Stockfish analysis
 
     Returns:
         List of processed position dicts with updated p_win values
     """
-    results = []
+    # Collect all work items across all positions
+    work_queue = asyncio.Queue()
+    positions_with_mates = set()
 
-    for pos in positions:
+    for pos_idx, pos in enumerate(positions):
         fen = pos["fen"]
-        moves = list(pos["moves"])
-        p_wins = list(pos["p_win"])
+        board = chess.Board(fen)
 
-        # Find moves that need mate analysis
-        moves_to_check = []
-        for i, (move, p_win) in enumerate(zip(moves, p_wins)):
+        for move_idx, (move, p_win) in enumerate(zip(pos["moves"], pos["p_win"])):
             if p_win >= WIN_THRESHOLD or p_win <= LOSS_THRESHOLD:
-                moves_to_check.append((i, move, p_win >= WIN_THRESHOLD))
+                # Queue work item: (pos_idx, move_idx, move_uci, is_winning_move, board_copy)
+                work_queue.put_nowait((
+                    pos_idx,
+                    move_idx,
+                    move,
+                    p_win >= WIN_THRESHOLD,
+                    board.copy()
+                ))
+                positions_with_mates.add(pos_idx)
+                stats["total_mate_moves"] += 1
 
-        if not moves_to_check:
+    stats["positions_with_mates"] += len(positions_with_mates)
+
+    # If no work to do, return positions as-is
+    if work_queue.empty():
+        return list(positions)
+
+    # Add shutdown sentinels (one per worker)
+    num_workers = len(engines)
+    for _ in range(num_workers):
+        work_queue.put_nowait(None)
+
+    # Shared results dict (no lock needed - asyncio is single-threaded cooperative multitasking)
+    results_dict: Dict[Tuple[int, int], Tuple[Optional[Tuple[bool, int]], bool]] = {}
+
+    # Start all workers - they'll continuously pull from queue until sentinel
+    workers = [
+        asyncio.create_task(
+            engine_worker(engines[i][1], work_queue, results_dict, stats, time_limit)
+        )
+        for i in range(num_workers)
+    ]
+
+    # Wait for all work to complete
+    await asyncio.gather(*workers)
+
+    # Reassemble results back into positions
+    output = []
+    for pos_idx, pos in enumerate(positions):
+        if pos_idx not in positions_with_mates:
             # No mate-ish moves, keep as-is
-            results.append(pos)
+            output.append(pos)
             continue
 
-        stats["positions_with_mates"] += 1
-        stats["total_mate_moves"] += len(moves_to_check)
+        new_p_wins = list(pos["p_win"])
 
-        # Process moves in chunks to avoid engine conflicts
-        # Each engine can only handle one analysis at a time
-        board = chess.Board(fen)
-        num_engines = len(engines)
-        mate_results = []
-
-        for chunk_start in range(0, len(moves_to_check), num_engines):
-            chunk = moves_to_check[chunk_start:chunk_start + num_engines]
-            tasks = []
-            for i, (idx, move, is_winning_move) in enumerate(chunk):
-                engine = engines[i][1]
-                tasks.append(analyze_position_for_mate(engine, board.copy(), move, time_limit))
-
-            # Run this chunk in parallel, then wait before next chunk
-            chunk_results = await asyncio.gather(*tasks)
-            mate_results.extend(chunk_results)
-
-        # Update p_win values based on results
-        new_p_wins = list(p_wins)
-        for (idx, move, is_winning_move), mate_result in zip(moves_to_check, mate_results):
-            if mate_result is not None:
-                is_winning, mate_in_n = mate_result
-                new_p_wins[idx] = compute_mate_winrate(mate_in_n, is_winning)
-                stats["mates_found"] += 1
-                stats[f"mate_depth_{min(mate_in_n, 10)}"] += 1
-            else:
-                # Couldn't find mate, assign default deep mate value
-                stats["mates_not_found"] += 1
-                if is_winning_move:
-                    new_p_wins[idx] = 0.98  # Assume very long mate
+        for move_idx in range(len(new_p_wins)):
+            key = (pos_idx, move_idx)
+            if key in results_dict:
+                result, is_winning_move = results_dict[key]
+                if result is not None:
+                    is_winning, mate_in_n = result
+                    new_p_wins[move_idx] = compute_mate_winrate(mate_in_n, is_winning)
                 else:
-                    new_p_wins[idx] = 0.02  # Assume very long getting mated
+                    # Couldn't find mate, assign default deep mate value
+                    new_p_wins[move_idx] = 0.98 if is_winning_move else 0.02
 
-        results.append({
-            "fen": fen,
-            "moves": moves,
+        output.append({
+            "fen": pos["fen"],
+            "moves": list(pos["moves"]),
             "p_win": np.asarray(new_p_wins, dtype=np.float32).tolist(),
         })
 
-    return results
+    return output
 
 
 async def process_dataset_async(
