@@ -15,61 +15,38 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Tuple
 
 import chess
 import chess.engine
-from datasets import load_from_disk
+from datasets import Dataset, load_from_disk
+from tqdm import tqdm
 
 # -------------------------------------------------------------------
 # CONFIG
 # -------------------------------------------------------------------
 
-# Default paths (can be overridden via environment variables or CLI)
 DEFAULT_OUTPUT_PATH = Path("/fs/scratch/PAS2836/lees_stuff/action_value_mates")
 DEFAULT_STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
 
-# Dataset configuration
 DEFAULT_NUM_POSITIONS = 2_000_000
 DEFAULT_SEED = 42
+DEFAULT_NUM_ENGINES = 40
+DEFAULT_BATCH_SIZE = 10_000
 
-# Stockfish configuration for mate detection
-MATE_SEARCH_TIME = 0.05  # 50ms per move - fast but usually finds mates
-MATE_SEARCH_DEPTH = 20   # Max depth to search (mates beyond this are rare)
-NUM_PROC = os.cpu_count() or 8  # Number of parallel worker processes
+MATE_SEARCH_TIME = 0.05
+MATE_SEARCH_DEPTH = 20
 
-# Winrate thresholds to detect mate positions
-WIN_THRESHOLD = 0.9999  # Consider 1.0 as winning/mating
-LOSS_THRESHOLD = 0.0001  # Consider 0.0 as losing/getting mated
-
-# Global engine instance (one per worker process, lazily initialized)
-_engine: Optional[chess.engine.SimpleEngine] = None
-
-# Environment variable used to pass stockfish path to worker processes
-STOCKFISH_ENV_VAR = "CHESSBOT_STOCKFISH_PATH"
-
-
-def get_engine() -> chess.engine.SimpleEngine:
-    """Get or initialize the Stockfish engine for this worker process."""
-    global _engine
-    if _engine is None:
-        stockfish_path = os.environ.get(STOCKFISH_ENV_VAR, DEFAULT_STOCKFISH_PATH)
-        _engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-        _engine.configure({"Threads": 1})
-    return _engine
+WIN_THRESHOLD = 0.9999
+LOSS_THRESHOLD = 0.0001
 
 
 def compute_mate_winrate(mate_in_n: int, is_winning: bool) -> float:
-    """
-    Compute refined win rate based on mate depth.
-
-    For winning (mating):  98% + 2%/n  -> mate-in-1 = 100%, mate-in-2 = 99%
-    For losing (mated):    2% - 2%/n   -> mate-in-1 = 0%, mate-in-2 = 1%
-    """
+    """Compute refined win rate based on mate depth."""
     if mate_in_n <= 0:
         mate_in_n = 1
-
     if is_winning:
         return 0.98 + 0.02 / mate_in_n
     else:
@@ -77,37 +54,27 @@ def compute_mate_winrate(mate_in_n: int, is_winning: bool) -> float:
 
 
 def remap_non_mate_winrate(p_win: float) -> float:
-    """
-    Remap non-mate win percentages from (0, 1) to (0.02, 0.98).
-
-    Reserves 0-2% for getting mated, 98-100% for delivering mate.
-    """
+    """Remap non-mate win percentages from (0, 1) to (0.02, 0.98)."""
     return 0.02 + p_win * 0.96
 
 
-def analyze_move_for_mate(
-    board: chess.Board,
+def analyze_move(
+    engine: chess.engine.SimpleEngine,
+    fen: str,
     move_uci: str,
 ) -> Optional[Tuple[bool, int]]:
-    """
-    Analyze a position after a move to detect if it's a forced mate.
-
-    Returns:
-        None if no mate found
-        (is_winning, mate_in_n) if mate detected
-    """
+    """Analyze a move to detect if it leads to forced mate."""
     try:
+        board = chess.Board(fen)
         move = chess.Move.from_uci(move_uci)
         if move not in board.legal_moves:
             return None
 
         board.push(move)
-        engine = get_engine()
         info = engine.analyse(
             board,
             chess.engine.Limit(time=MATE_SEARCH_TIME, depth=MATE_SEARCH_DEPTH)
         )
-        board.pop()
 
         score = info.get("score")
         if score is None:
@@ -117,55 +84,100 @@ def analyze_move_for_mate(
         if pov_score.is_mate():
             mate_in = pov_score.mate()
             if mate_in is not None:
-                # mate_in < 0: opponent is getting mated -> we are winning
-                # mate_in > 0: opponent can mate us -> we are losing
                 if mate_in < 0:
                     return (True, abs(mate_in))
                 else:
                     return (False, mate_in)
-
         return None
-
     except Exception:
-        try:
-            if len(board.move_stack) > 0:
-                board.pop()
-        except Exception:
-            pass
         return None
 
 
-def process_position(example: dict) -> dict:
-    """
-    Process a single position: analyze mate moves and remap win percentages.
+class EnginePool:
+    """Pool of Stockfish engines for parallel analysis."""
 
-    This function is called by Dataset.map() in parallel worker processes.
-    """
-    board = chess.Board(example["fen"])
-    new_p_wins = []
+    def __init__(self, stockfish_path: str, num_engines: int):
+        self.engines: list[chess.engine.SimpleEngine] = []
+        print(f"Starting {num_engines} Stockfish engines...")
+        for _ in tqdm(range(num_engines), desc="Initializing engines"):
+            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            engine.configure({"Threads": 1})
+            self.engines.append(engine)
+        print(f"All {num_engines} engines ready.\n")
 
-    for move, p_win in zip(example["moves"], example["p_win"]):
-        is_mate_candidate = p_win >= WIN_THRESHOLD or p_win <= LOSS_THRESHOLD
+    def close(self):
+        for engine in self.engines:
+            engine.quit()
 
-        if is_mate_candidate:
-            is_winning_move = p_win >= WIN_THRESHOLD
-            result = analyze_move_for_mate(board, move)
+    def __enter__(self):
+        return self
 
-            if result is not None:
-                is_winning, mate_in_n = result
-                new_p_wins.append(compute_mate_winrate(mate_in_n, is_winning))
+    def __exit__(self, *args):
+        self.close()
+
+
+def process_batch(
+    pool: EnginePool,
+    batch: dict,
+    executor: ThreadPoolExecutor,
+) -> list[dict]:
+    """Process a batch of positions, analyzing mate moves in parallel."""
+    results = []
+    batch_size = len(batch["fen"])
+
+    # Collect all mate-candidate moves that need analysis
+    work_items = []  # (pos_idx, move_idx, fen, move, is_winning_move)
+    for pos_idx in range(batch_size):
+        for move_idx, (move, p_win) in enumerate(
+            zip(batch["moves"][pos_idx], batch["p_win"][pos_idx])
+        ):
+            if p_win >= WIN_THRESHOLD or p_win <= LOSS_THRESHOLD:
+                work_items.append((
+                    pos_idx,
+                    move_idx,
+                    batch["fen"][pos_idx],
+                    move,
+                    p_win >= WIN_THRESHOLD,
+                ))
+
+    # Analyze all mate candidates in parallel using thread pool
+    analysis_results = {}  # (pos_idx, move_idx) -> (is_winning, mate_in_n) or None
+
+    if work_items:
+        # Round-robin assign work to engines
+        futures = {}
+        for i, (pos_idx, move_idx, fen, move, is_winning) in enumerate(work_items):
+            engine = pool.engines[i % len(pool.engines)]
+            future = executor.submit(analyze_move, engine, fen, move)
+            futures[future] = (pos_idx, move_idx, is_winning)
+
+        for future in as_completed(futures):
+            pos_idx, move_idx, is_winning_move = futures[future]
+            result = future.result()
+            analysis_results[(pos_idx, move_idx)] = (result, is_winning_move)
+
+    # Build output for each position
+    for pos_idx in range(batch_size):
+        new_p_wins = []
+        for move_idx, p_win in enumerate(batch["p_win"][pos_idx]):
+            key = (pos_idx, move_idx)
+            if key in analysis_results:
+                result, is_winning_move = analysis_results[key]
+                if result is not None:
+                    is_winning, mate_in_n = result
+                    new_p_wins.append(compute_mate_winrate(mate_in_n, is_winning))
+                else:
+                    new_p_wins.append(0.98 if is_winning_move else 0.02)
             else:
-                # Couldn't confirm mate, assign default deep mate value
-                new_p_wins.append(0.98 if is_winning_move else 0.02)
-        else:
-            # Non-mate move: remap from (0,1) to (0.02, 0.98)
-            new_p_wins.append(remap_non_mate_winrate(p_win))
+                new_p_wins.append(remap_non_mate_winrate(p_win))
 
-    return {
-        "fen": example["fen"],
-        "moves": list(example["moves"]),
-        "p_win": new_p_wins,
-    }
+        results.append({
+            "fen": batch["fen"][pos_idx],
+            "moves": list(batch["moves"][pos_idx]),
+            "p_win": new_p_wins,
+        })
+
+    return results
 
 
 def main():
@@ -173,39 +185,32 @@ def main():
         description="Generate dataset with refined mate-in-n win percentages"
     )
     parser.add_argument(
-        "--output",
-        type=Path,
-        default=DEFAULT_OUTPUT_PATH,
-        help=f"Path for output dataset (default: {DEFAULT_OUTPUT_PATH})",
+        "--output", type=Path, default=DEFAULT_OUTPUT_PATH,
+        help=f"Output dataset path (default: {DEFAULT_OUTPUT_PATH})",
     )
     parser.add_argument(
-        "--stockfish",
-        type=str,
-        default=DEFAULT_STOCKFISH_PATH,
-        help=f"Path to Stockfish executable (default: {DEFAULT_STOCKFISH_PATH})",
+        "--stockfish", type=str, default=DEFAULT_STOCKFISH_PATH,
+        help=f"Stockfish executable path (default: {DEFAULT_STOCKFISH_PATH})",
     )
     parser.add_argument(
-        "--num-positions",
-        type=int,
-        default=DEFAULT_NUM_POSITIONS,
+        "--num-positions", type=int, default=DEFAULT_NUM_POSITIONS,
         help=f"Number of positions to sample (default: {DEFAULT_NUM_POSITIONS:,})",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=DEFAULT_SEED,
+        "--seed", type=int, default=DEFAULT_SEED,
         help=f"Random seed for sampling (default: {DEFAULT_SEED})",
     )
     parser.add_argument(
-        "--num-proc",
-        type=int,
-        default=NUM_PROC,
-        help=f"Number of parallel worker processes (default: {NUM_PROC})",
+        "--num-engines", type=int, default=DEFAULT_NUM_ENGINES,
+        help=f"Number of Stockfish engines (default: {DEFAULT_NUM_ENGINES})",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+        help=f"Batch size for processing (default: {DEFAULT_BATCH_SIZE:,})",
     )
 
     args = parser.parse_args()
 
-    # Get input path from environment variable
     input_path = os.environ.get("DATASET_PATH")
     if not input_path:
         print("ERROR: DATASET_PATH environment variable not set")
@@ -215,59 +220,52 @@ def main():
     print("=" * 60)
     print("MATE-REFINED DATASET GENERATION")
     print("=" * 60)
-    print(f"Input dataset: {input_path}")
-    print(f"Output dataset: {args.output}")
-    print(f"Stockfish path: {args.stockfish}")
-    print(f"Target positions: {args.num_positions:,}")
-    print(f"Random seed: {args.seed}")
-    print(f"Worker processes: {args.num_proc}")
-    print("=" * 60)
-    print()
+    print(f"Input: {input_path}")
+    print(f"Output: {args.output}")
+    print(f"Stockfish: {args.stockfish}")
+    print(f"Positions: {args.num_positions:,}")
+    print(f"Engines: {args.num_engines}")
+    print(f"Batch size: {args.batch_size:,}")
+    print("=" * 60 + "\n")
 
-    # Verify stockfish exists
     if not Path(args.stockfish).exists():
         print(f"ERROR: Stockfish not found at {args.stockfish}")
         return 1
 
-    # Set stockfish path in environment for worker processes to inherit
-    os.environ[STOCKFISH_ENV_VAR] = args.stockfish
-
-    # Load and sample dataset
+    # Load dataset
     print(f"Loading dataset from {input_path}...")
     dataset = load_from_disk(str(input_path))
     print(f"Loaded {len(dataset):,} positions")
 
-    # Sample if dataset is larger than target
     if len(dataset) > args.num_positions:
-        print(f"Randomly sampling {args.num_positions:,} positions (seed={args.seed})...")
+        print(f"Sampling {args.num_positions:,} positions (seed={args.seed})...")
         dataset = dataset.shuffle(seed=args.seed).select(range(args.num_positions))
-        print(f"Sampled {len(dataset):,} positions")
-    else:
-        print(f"Dataset size ({len(dataset):,}) <= target, using all positions")
     print()
 
-    # Process dataset using HuggingFace's parallel map
-    print("Processing positions with mate refinement...")
-    processed_dataset = dataset.map(
-        process_position,
-        num_proc=args.num_proc,
-        desc="Refining mate positions",
-    )
+    # Process in batches
+    all_results = []
+    with EnginePool(args.stockfish, args.num_engines) as pool:
+        with ThreadPoolExecutor(max_workers=args.num_engines) as executor:
+            for start in tqdm(
+                range(0, len(dataset), args.batch_size),
+                desc="Processing batches",
+            ):
+                end = min(start + args.batch_size, len(dataset))
+                batch = dataset[start:end]
+                batch_results = process_batch(pool, batch, executor)
+                all_results.extend(batch_results)
 
-    # Remove existing output if it exists
+    # Save output
     if args.output.exists():
         print(f"Removing existing output at {args.output}")
         shutil.rmtree(args.output)
 
-    # Save dataset
-    print(f"Saving to {args.output}...")
+    print(f"Saving {len(all_results):,} positions to {args.output}...")
+    output_dataset = Dataset.from_list(all_results)
     args.output.mkdir(parents=True, exist_ok=True)
-    processed_dataset.save_to_disk(str(args.output))
+    output_dataset.save_to_disk(str(args.output))
 
     print("\nDone!")
-    print(f"Output dataset saved to: {args.output}")
-    print(f"Total positions: {len(processed_dataset):,}")
-
     return 0
 
 
