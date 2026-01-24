@@ -85,6 +85,26 @@ def compute_mate_winrate(mate_in_n: int, is_winning: bool) -> float:
         return 0.02 - 0.02 / mate_in_n
 
 
+def remap_non_mate_winrate(p_win: float) -> float:
+    """
+    Remap non-mate win percentages from (0, 1) to (0.02, 0.98).
+
+    This reserves the 0-2% and 98-100% ranges exclusively for mate positions,
+    creating a clean separation:
+      - 0-2%: Getting mated (depth determines exact value)
+      - 2-98%: Normal positions (no forced mate)
+      - 98-100%: Delivering mate (depth determines exact value)
+
+    Args:
+        p_win: Original win percentage [0.0, 1.0]
+
+    Returns:
+        Remapped win percentage [0.02, 0.98]
+    """
+    # Linear map: 0 -> 0.02, 1 -> 0.98
+    return 0.02 + p_win * 0.96
+
+
 async def analyze_position_for_mate(
     engine: chess.engine.UciProtocol,
     board: chess.Board,
@@ -260,25 +280,26 @@ async def process_batch_async(
     await asyncio.gather(*workers)
 
     # Reassemble results back into positions
+    # All non-mate win% get remapped from (0,1) to (0.02, 0.98)
+    # Mate positions get values in 0-2% (getting mated) or 98-100% (mating)
     output = []
     for pos_idx, pos in enumerate(positions):
-        if pos_idx not in positions_with_mates:
-            # No mate-ish moves, keep as-is
-            output.append(pos)
-            continue
+        new_p_wins = []
 
-        new_p_wins = list(pos["p_win"])
-
-        for move_idx in range(len(new_p_wins)):
+        for move_idx, p_win in enumerate(pos["p_win"]):
             key = (pos_idx, move_idx)
             if key in results_dict:
+                # This was a mate-ish move that we analyzed
                 result, is_winning_move = results_dict[key]
                 if result is not None:
                     is_winning, mate_in_n = result
-                    new_p_wins[move_idx] = compute_mate_winrate(mate_in_n, is_winning)
+                    new_p_wins.append(compute_mate_winrate(mate_in_n, is_winning))
                 else:
                     # Couldn't find mate, assign default deep mate value
-                    new_p_wins[move_idx] = 0.98 if is_winning_move else 0.02
+                    new_p_wins.append(0.98 if is_winning_move else 0.02)
+            else:
+                # Non-mate move: remap from (0,1) to (0.02, 0.98)
+                new_p_wins.append(remap_non_mate_winrate(p_win))
 
         output.append({
             "fen": pos["fen"],
@@ -292,7 +313,7 @@ async def process_batch_async(
 async def process_dataset_async(
     dataset: Dataset,
     stockfish_path: str,
-    batch_size: int = 100,
+    batch_size: int = 1000,
     num_engines: int = MAX_CONCURRENT_ENGINES,
     time_limit: float = MATE_SEARCH_TIME,
 ) -> Tuple[List[Dict], Dict[str, int]]:
@@ -317,19 +338,22 @@ async def process_dataset_async(
     print("All engines ready.\n")
 
     all_results = []
-
-    # Load entire dataset into memory - MUCH faster than repeated dataset[i] lookups
-    # This is fine since we've already sampled down to a manageable size (e.g., 2M positions)
-    print("Loading dataset into memory...")
-    positions_list = dataset.to_list()
-    print(f"Loaded {len(positions_list):,} positions into memory.\n")
+    total_positions = len(dataset)
 
     try:
-        # Process in batches
-        with tqdm(total=len(positions_list), desc="Processing positions") as pbar:
-            for batch_start in range(0, len(positions_list), batch_size):
-                batch_end = min(batch_start + batch_size, len(positions_list))
-                batch = positions_list[batch_start:batch_end]
+        # Process in batches using sliced access (much faster than individual lookups)
+        with tqdm(total=total_positions, desc="Processing positions") as pbar:
+            for batch_start in range(0, total_positions, batch_size):
+                batch_end = min(batch_start + batch_size, total_positions)
+
+                # Slice access returns columnar dict: {"fen": [...], "moves": [...], "p_win": [...]}
+                batch_cols = dataset[batch_start:batch_end]
+
+                # Convert to list of dicts for processing
+                batch = [
+                    {"fen": batch_cols["fen"][i], "moves": batch_cols["moves"][i], "p_win": batch_cols["p_win"][i]}
+                    for i in range(len(batch_cols["fen"]))
+                ]
 
                 batch_results = await process_batch_async(batch, engines, stats, time_limit)
                 all_results.extend(batch_results)
@@ -425,8 +449,8 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=100,
-        help="Batch size for processing (default: 100)",
+        default=1000,
+        help="Batch size for processing (default: 1000)",
     )
     parser.add_argument(
         "--num-engines",
