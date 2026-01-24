@@ -194,17 +194,20 @@ def main():
         print(f"Sampling {args.num_positions:,} positions (seed={args.seed})...")
         dataset = dataset.shuffle(seed=args.seed).select(range(args.num_positions))
 
-    # Convert to plain Python lists (actually in memory, not lazy)
+    # Convert to plain Python lists (batch loading for speed)
     print("Loading into memory...")
     num_positions = len(dataset)
     fens = []
     moves_list = []
     p_wins_list = []
 
-    for row in tqdm(dataset, total=num_positions, desc="Loading to RAM"):
-        fens.append(row["fen"])
-        moves_list.append(row["moves"])
-        p_wins_list.append(row["p_win"])
+    batch_size = 50_000
+    for start in tqdm(range(0, num_positions, batch_size), desc="Loading to RAM"):
+        end = min(start + batch_size, num_positions)
+        batch = dataset[start:end]
+        fens.extend(batch["fen"])
+        moves_list.extend(batch["moves"])
+        p_wins_list.extend(batch["p_win"])
 
     print(f"Loaded {num_positions:,} positions into memory\n")
 
