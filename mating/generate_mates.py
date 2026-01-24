@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -58,111 +59,145 @@ def remap_non_mate_winrate(p_win: float) -> float:
     return 0.02 + p_win * 0.96
 
 
-def analyze_move(
-    engine: chess.engine.SimpleEngine,
-    fen: str,
-    move_uci: str,
-) -> Optional[Tuple[bool, int]]:
-    """Analyze a move to detect if it leads to forced mate."""
-    try:
-        board = chess.Board(fen)
-        move = chess.Move.from_uci(move_uci)
-        if move not in board.legal_moves:
+class EngineWorker(threading.Thread):
+    """
+    Worker thread that owns a single Stockfish engine.
+
+    Each engine lives in its own thread to avoid thread-safety issues
+    with python-chess's async internals.
+    """
+
+    def __init__(self, stockfish_path: str, work_queue: queue.Queue, results: dict, lock: threading.Lock):
+        super().__init__(daemon=True)
+        self.stockfish_path = stockfish_path
+        self.work_queue = work_queue
+        self.results = results
+        self.lock = lock
+        self.engine: Optional[chess.engine.SimpleEngine] = None
+
+    def run(self):
+        # Initialize engine in this thread
+        self.engine = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
+        self.engine.configure({"Threads": 1})
+
+        while True:
+            item = self.work_queue.get()
+            if item is None:  # Shutdown signal
+                self.work_queue.task_done()
+                break
+
+            key, fen, move_uci = item
+            result = self._analyze_move(fen, move_uci)
+
+            with self.lock:
+                self.results[key] = result
+
+            self.work_queue.task_done()
+
+        self.engine.quit()
+
+    def _analyze_move(self, fen: str, move_uci: str) -> Optional[Tuple[bool, int]]:
+        """Analyze a move to detect if it leads to forced mate."""
+        try:
+            board = chess.Board(fen)
+            move = chess.Move.from_uci(move_uci)
+            if move not in board.legal_moves:
+                return None
+
+            board.push(move)
+            info = self.engine.analyse(
+                board,
+                chess.engine.Limit(time=MATE_SEARCH_TIME, depth=MATE_SEARCH_DEPTH)
+            )
+
+            score = info.get("score")
+            if score is None:
+                return None
+
+            pov_score = score.relative
+            if pov_score.is_mate():
+                mate_in = pov_score.mate()
+                if mate_in is not None:
+                    if mate_in < 0:
+                        return (True, abs(mate_in))
+                    else:
+                        return (False, mate_in)
             return None
-
-        board.push(move)
-        info = engine.analyse(
-            board,
-            chess.engine.Limit(time=MATE_SEARCH_TIME, depth=MATE_SEARCH_DEPTH)
-        )
-
-        score = info.get("score")
-        if score is None:
+        except Exception:
             return None
-
-        pov_score = score.relative
-        if pov_score.is_mate():
-            mate_in = pov_score.mate()
-            if mate_in is not None:
-                if mate_in < 0:
-                    return (True, abs(mate_in))
-                else:
-                    return (False, mate_in)
-        return None
-    except Exception:
-        return None
 
 
 class EnginePool:
-    """Pool of Stockfish engines for parallel analysis."""
+    """Pool of Stockfish engine workers."""
 
     def __init__(self, stockfish_path: str, num_engines: int):
-        self.engines: list[chess.engine.SimpleEngine] = []
+        self.work_queue: queue.Queue = queue.Queue()
+        self.results: dict = {}
+        self.lock = threading.Lock()
+        self.workers: list[EngineWorker] = []
+
         print(f"Starting {num_engines} Stockfish engines...")
         for _ in tqdm(range(num_engines), desc="Initializing engines"):
-            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-            engine.configure({"Threads": 1})
-            self.engines.append(engine)
+            worker = EngineWorker(stockfish_path, self.work_queue, self.results, self.lock)
+            worker.start()
+            self.workers.append(worker)
         print(f"All {num_engines} engines ready.\n")
 
-    def close(self):
-        for engine in self.engines:
-            engine.quit()
+    def submit(self, key: tuple, fen: str, move_uci: str):
+        """Submit a move for analysis."""
+        self.work_queue.put((key, fen, move_uci))
+
+    def wait_and_get_results(self) -> dict:
+        """Wait for all pending work to complete and return results."""
+        self.work_queue.join()
+        with self.lock:
+            results = dict(self.results)
+            self.results.clear()
+        return results
+
+    def shutdown(self):
+        """Shutdown all workers."""
+        for _ in self.workers:
+            self.work_queue.put(None)
+        for worker in self.workers:
+            worker.join()
 
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
-        self.close()
+        self.shutdown()
 
 
-def process_batch(
-    pool: EnginePool,
-    batch: dict,
-    executor: ThreadPoolExecutor,
-) -> list[dict]:
+def process_batch(pool: EnginePool, batch: dict) -> list[dict]:
     """Process a batch of positions, analyzing mate moves in parallel."""
-    results = []
     batch_size = len(batch["fen"])
 
-    # Collect all mate-candidate moves that need analysis
-    work_items = []  # (pos_idx, move_idx, fen, move, is_winning_move)
+    # Track which moves are mate candidates and their original win status
+    mate_info: dict[tuple, bool] = {}  # key -> is_winning_move
+
+    # Submit all mate-candidate moves for analysis
     for pos_idx in range(batch_size):
         for move_idx, (move, p_win) in enumerate(
             zip(batch["moves"][pos_idx], batch["p_win"][pos_idx])
         ):
             if p_win >= WIN_THRESHOLD or p_win <= LOSS_THRESHOLD:
-                work_items.append((
-                    pos_idx,
-                    move_idx,
-                    batch["fen"][pos_idx],
-                    move,
-                    p_win >= WIN_THRESHOLD,
-                ))
+                key = (pos_idx, move_idx)
+                mate_info[key] = p_win >= WIN_THRESHOLD
+                pool.submit(key, batch["fen"][pos_idx], move)
 
-    # Analyze all mate candidates in parallel using thread pool
-    analysis_results = {}  # (pos_idx, move_idx) -> (is_winning, mate_in_n) or None
-
-    if work_items:
-        # Round-robin assign work to engines
-        futures = {}
-        for i, (pos_idx, move_idx, fen, move, is_winning) in enumerate(work_items):
-            engine = pool.engines[i % len(pool.engines)]
-            future = executor.submit(analyze_move, engine, fen, move)
-            futures[future] = (pos_idx, move_idx, is_winning)
-
-        for future in as_completed(futures):
-            pos_idx, move_idx, is_winning_move = futures[future]
-            result = future.result()
-            analysis_results[(pos_idx, move_idx)] = (result, is_winning_move)
+    # Wait for all analysis to complete
+    analysis_results = pool.wait_and_get_results()
 
     # Build output for each position
+    results = []
     for pos_idx in range(batch_size):
         new_p_wins = []
         for move_idx, p_win in enumerate(batch["p_win"][pos_idx]):
             key = (pos_idx, move_idx)
-            if key in analysis_results:
-                result, is_winning_move = analysis_results[key]
+            if key in mate_info:
+                is_winning_move = mate_info[key]
+                result = analysis_results.get(key)
                 if result is not None:
                     is_winning, mate_in_n = result
                     new_p_wins.append(compute_mate_winrate(mate_in_n, is_winning))
@@ -245,15 +280,14 @@ def main():
     # Process in batches
     all_results = []
     with EnginePool(args.stockfish, args.num_engines) as pool:
-        with ThreadPoolExecutor(max_workers=args.num_engines) as executor:
-            for start in tqdm(
-                range(0, len(dataset), args.batch_size),
-                desc="Processing batches",
-            ):
-                end = min(start + args.batch_size, len(dataset))
-                batch = dataset[start:end]
-                batch_results = process_batch(pool, batch, executor)
-                all_results.extend(batch_results)
+        for start in tqdm(
+            range(0, len(dataset), args.batch_size),
+            desc="Processing batches",
+        ):
+            end = min(start + args.batch_size, len(dataset))
+            batch = dataset[start:end]
+            batch_results = process_batch(pool, batch)
+            all_results.extend(batch_results)
 
     # Save output
     if args.output.exists():
