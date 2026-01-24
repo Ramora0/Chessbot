@@ -196,10 +196,16 @@ def main():
 
     # Convert to plain Python lists (actually in memory, not lazy)
     print("Loading into memory...")
-    fens = list(dataset["fen"])
-    moves_list = list(dataset["moves"])
-    p_wins_list = list(dataset["p_win"])
-    num_positions = len(fens)
+    num_positions = len(dataset)
+    fens = []
+    moves_list = []
+    p_wins_list = []
+
+    for row in tqdm(dataset, total=num_positions, desc="Loading to RAM"):
+        fens.append(row["fen"])
+        moves_list.append(row["moves"])
+        p_wins_list.append(row["p_win"])
+
     print(f"Loaded {num_positions:,} positions into memory\n")
 
     # =========================================================
