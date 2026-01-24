@@ -54,12 +54,13 @@ def compute_mate_winrate(mate_in_n: int, is_winning: bool) -> float:
 class EngineWorker(threading.Thread):
     """Worker thread that owns a single Stockfish engine."""
 
-    def __init__(self, stockfish_path: str, work_queue: queue.Queue, results: dict, lock: threading.Lock):
+    def __init__(self, stockfish_path: str, work_queue: queue.Queue, results: dict, lock: threading.Lock, pool: "EnginePool"):
         super().__init__(daemon=True)
         self.stockfish_path = stockfish_path
         self.work_queue = work_queue
         self.results = results
         self.lock = lock
+        self.pool = pool
         self.engine: Optional[chess.engine.SimpleEngine] = None
 
     def run(self):
@@ -77,6 +78,8 @@ class EngineWorker(threading.Thread):
 
             with self.lock:
                 self.results[key] = result
+            with self.pool.count_lock:
+                self.pool.completed_count += 1
 
             self.work_queue.task_done()
 
@@ -120,11 +123,13 @@ class EnginePool:
         self.work_queue: queue.Queue = queue.Queue()
         self.results: dict = {}
         self.lock = threading.Lock()
+        self.completed_count = 0
+        self.count_lock = threading.Lock()
         self.workers: list[EngineWorker] = []
 
         print(f"Starting {num_engines} Stockfish engines...")
         for _ in tqdm(range(num_engines), desc="Initializing engines"):
-            worker = EngineWorker(stockfish_path, self.work_queue, self.results, self.lock)
+            worker = EngineWorker(stockfish_path, self.work_queue, self.results, self.lock, self)
             worker.start()
             self.workers.append(worker)
         print(f"All {num_engines} engines ready.\n")
@@ -133,8 +138,8 @@ class EnginePool:
         self.work_queue.put((key, fen, move_uci))
 
     def get_completed_count(self) -> int:
-        with self.lock:
-            return len(self.results)
+        with self.count_lock:
+            return self.completed_count
 
     def wait_and_get_results(self) -> dict:
         self.work_queue.join()
