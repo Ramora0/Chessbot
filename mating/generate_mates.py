@@ -14,6 +14,7 @@ import os
 import queue
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -130,6 +131,10 @@ class EnginePool:
 
     def submit(self, key: tuple, fen: str, move_uci: str):
         self.work_queue.put((key, fen, move_uci))
+
+    def get_completed_count(self) -> int:
+        with self.lock:
+            return len(self.results)
 
     def wait_and_get_results(self) -> dict:
         self.work_queue.join()
@@ -262,12 +267,21 @@ def main():
 
         print(f"  Total moves to analyze: {len(work_items):,}")
 
-        # Submit all work
+        # Submit all work and show progress
         with EnginePool(args.stockfish, args.num_engines) as pool:
-            for key, fen, move_uci in tqdm(work_items, desc="Submitting work"):
+            for key, fen, move_uci in work_items:
                 pool.submit(key, fen, move_uci)
 
-            print("  Waiting for analysis to complete...")
+            total_work = len(work_items)
+            with tqdm(total=total_work, desc="Analyzing moves") as pbar:
+                while True:
+                    completed = pool.get_completed_count()
+                    pbar.n = completed
+                    pbar.refresh()
+                    if completed >= total_work:
+                        break
+                    time.sleep(0.1)
+
             analysis_results = pool.wait_and_get_results()
 
         print("  Building results...")
