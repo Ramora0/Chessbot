@@ -26,8 +26,7 @@ from datasets import load_from_disk
 # CONFIG
 # -------------------------------------------------------------------
 
-# Default paths (can be overridden via CLI)
-DEFAULT_INPUT_PATH = Path("/fs/scratch/PAS2836/lees_stuff/action_value")
+# Default paths (can be overridden via environment variables or CLI)
 DEFAULT_OUTPUT_PATH = Path("/fs/scratch/PAS2836/lees_stuff/action_value_mates")
 DEFAULT_STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
 
@@ -174,12 +173,6 @@ def main():
         description="Generate dataset with refined mate-in-n win percentages"
     )
     parser.add_argument(
-        "--input",
-        type=Path,
-        default=DEFAULT_INPUT_PATH,
-        help=f"Path to input action_value dataset (default: {DEFAULT_INPUT_PATH})",
-    )
-    parser.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_OUTPUT_PATH,
@@ -212,10 +205,17 @@ def main():
 
     args = parser.parse_args()
 
+    # Get input path from environment variable
+    input_path = os.environ.get("DATASET_PATH")
+    if not input_path:
+        print("ERROR: DATASET_PATH environment variable not set")
+        return 1
+    input_path = Path(input_path)
+
     print("=" * 60)
     print("MATE-REFINED DATASET GENERATION")
     print("=" * 60)
-    print(f"Input dataset: {args.input}")
+    print(f"Input dataset: {input_path}")
     print(f"Output dataset: {args.output}")
     print(f"Stockfish path: {args.stockfish}")
     print(f"Target positions: {args.num_positions:,}")
@@ -233,8 +233,8 @@ def main():
     os.environ[STOCKFISH_ENV_VAR] = args.stockfish
 
     # Load and sample dataset
-    print(f"Loading dataset from {args.input}...")
-    dataset = load_from_disk(str(args.input))
+    print(f"Loading dataset from {input_path}...")
+    dataset = load_from_disk(str(input_path))
     print(f"Loaded {len(dataset):,} positions")
 
     # Sample if dataset is larger than target
