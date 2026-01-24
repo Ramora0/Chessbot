@@ -167,6 +167,61 @@ async def analyze_position_for_mate(
         return None
 
 
+async def data_producer(
+    dataset: Dataset,
+    work_queue: asyncio.Queue,
+    positions_out: List[Dict],
+    mate_move_keys: set,
+    stats: Dict[str, int],
+    batch_size: int,
+) -> None:
+    """
+    Producer coroutine that reads dataset batches and feeds work items to queue.
+
+    Runs concurrently with workers - bounded queue prevents memory blowup.
+    Also stores all positions for later result assembly.
+    """
+    total_positions = len(dataset)
+    global_pos_idx = 0
+
+    for batch_start in range(0, total_positions, batch_size):
+        batch_end = min(batch_start + batch_size, total_positions)
+
+        # Efficient batch read from Arrow
+        batch_cols = dataset[batch_start:batch_end]
+        batch_len = len(batch_cols["fen"])
+
+        for i in range(batch_len):
+            pos = {
+                "fen": batch_cols["fen"][i],
+                "moves": batch_cols["moves"][i],
+                "p_win": batch_cols["p_win"][i],
+            }
+            positions_out.append(pos)
+
+            board = chess.Board(pos["fen"])
+            has_mate_move = False
+
+            for move_idx, (move, p_win) in enumerate(zip(pos["moves"], pos["p_win"])):
+                if p_win >= WIN_THRESHOLD or p_win <= LOSS_THRESHOLD:
+                    # Queue work item for Stockfish analysis
+                    await work_queue.put((
+                        global_pos_idx,
+                        move_idx,
+                        move,
+                        p_win >= WIN_THRESHOLD,
+                        board.copy(),
+                    ))
+                    mate_move_keys.add((global_pos_idx, move_idx))
+                    stats["total_mate_moves"] += 1
+                    has_mate_move = True
+
+            if has_mate_move:
+                stats["positions_with_mates"] += 1
+
+            global_pos_idx += 1
+
+
 async def engine_worker(
     engine: chess.engine.UciProtocol,
     work_queue: asyncio.Queue,
@@ -178,7 +233,7 @@ async def engine_worker(
     Worker coroutine that continuously pulls work from the queue.
 
     Each worker owns one Stockfish engine and processes items until
-    the queue is empty (None sentinel received).
+    shutdown sentinel (None) is received.
 
     Note: No locking needed - asyncio is cooperative multitasking, so only
     one coroutine runs at a time. Stats updates between awaits are atomic.
@@ -211,104 +266,6 @@ async def engine_worker(
         work_queue.task_done()
 
 
-async def process_batch_async(
-    positions: List[Dict],
-    engines: List[Tuple[object, chess.engine.UciProtocol]],
-    stats: Dict[str, int],
-    time_limit: float,
-) -> List[Dict]:
-    """
-    Process a batch of positions using a worker pool pattern.
-
-    All engines are kept constantly busy by pulling from a shared work queue.
-    This is much more efficient than the previous approach which would leave
-    engines idle if a position had fewer mate-ish moves than available engines.
-
-    Args:
-        positions: List of position dicts with fen, moves, p_win
-        engines: List of (transport, engine) tuples
-        stats: Statistics dict to update
-        time_limit: Time limit for each Stockfish analysis
-
-    Returns:
-        List of processed position dicts with updated p_win values
-    """
-    # Collect all work items across all positions
-    work_queue = asyncio.Queue()
-    positions_with_mates = set()
-
-    for pos_idx, pos in enumerate(positions):
-        fen = pos["fen"]
-        board = chess.Board(fen)
-
-        for move_idx, (move, p_win) in enumerate(zip(pos["moves"], pos["p_win"])):
-            if p_win >= WIN_THRESHOLD or p_win <= LOSS_THRESHOLD:
-                # Queue work item: (pos_idx, move_idx, move_uci, is_winning_move, board_copy)
-                work_queue.put_nowait((
-                    pos_idx,
-                    move_idx,
-                    move,
-                    p_win >= WIN_THRESHOLD,
-                    board.copy()
-                ))
-                positions_with_mates.add(pos_idx)
-                stats["total_mate_moves"] += 1
-
-    stats["positions_with_mates"] += len(positions_with_mates)
-
-    # If no work to do, return positions as-is
-    if work_queue.empty():
-        return list(positions)
-
-    # Add shutdown sentinels (one per worker)
-    num_workers = len(engines)
-    for _ in range(num_workers):
-        work_queue.put_nowait(None)
-
-    # Shared results dict (no lock needed - asyncio is single-threaded cooperative multitasking)
-    results_dict: Dict[Tuple[int, int], Tuple[Optional[Tuple[bool, int]], bool]] = {}
-
-    # Start all workers - they'll continuously pull from queue until sentinel
-    workers = [
-        asyncio.create_task(
-            engine_worker(engines[i][1], work_queue, results_dict, stats, time_limit)
-        )
-        for i in range(num_workers)
-    ]
-
-    # Wait for all work to complete
-    await asyncio.gather(*workers)
-
-    # Reassemble results back into positions
-    # All non-mate win% get remapped from (0,1) to (0.02, 0.98)
-    # Mate positions get values in 0-2% (getting mated) or 98-100% (mating)
-    output = []
-    for pos_idx, pos in enumerate(positions):
-        new_p_wins = []
-
-        for move_idx, p_win in enumerate(pos["p_win"]):
-            key = (pos_idx, move_idx)
-            if key in results_dict:
-                # This was a mate-ish move that we analyzed
-                result, is_winning_move = results_dict[key]
-                if result is not None:
-                    is_winning, mate_in_n = result
-                    new_p_wins.append(compute_mate_winrate(mate_in_n, is_winning))
-                else:
-                    # Couldn't find mate, assign default deep mate value
-                    new_p_wins.append(0.98 if is_winning_move else 0.02)
-            else:
-                # Non-mate move: remap from (0,1) to (0.02, 0.98)
-                new_p_wins.append(remap_non_mate_winrate(p_win))
-
-        output.append({
-            "fen": pos["fen"],
-            "moves": list(pos["moves"]),
-            "p_win": np.asarray(new_p_wins, dtype=np.float32).tolist(),
-        })
-
-    return output
-
 
 async def process_dataset_async(
     dataset: Dataset,
@@ -316,9 +273,15 @@ async def process_dataset_async(
     batch_size: int = 1000,
     num_engines: int = MAX_CONCURRENT_ENGINES,
     time_limit: float = MATE_SEARCH_TIME,
+    queue_size: int = 10000,
 ) -> Tuple[List[Dict], Dict[str, int]]:
     """
     Process the entire dataset asynchronously with multiple Stockfish engines.
+
+    Uses a producer-consumer pattern:
+    - Producer reads dataset batches and feeds work items to a bounded queue
+    - Workers (engines) pull from queue continuously
+    - Bounded queue prevents memory blowup while keeping engines fed
 
     Returns:
         Tuple of (processed_positions, statistics)
@@ -337,42 +300,90 @@ async def process_dataset_async(
         engines.append((transport, engine))
     print("All engines ready.\n")
 
-    all_results = []
-    total_positions = len(dataset)
+    # Bounded queue - producer blocks when full, preventing memory blowup
+    work_queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
+
+    # Shared state
+    positions_list: List[Dict] = []  # All positions (for result assembly)
+    mate_move_keys: set = set()  # Track which (pos_idx, move_idx) are mate moves
+    results_dict: Dict[Tuple[int, int], Tuple[Optional[Tuple[bool, int]], bool]] = {}
 
     try:
-        # Process in batches using sliced access (much faster than individual lookups)
-        with tqdm(total=total_positions, desc="Processing positions") as pbar:
-            for batch_start in range(0, total_positions, batch_size):
-                batch_end = min(batch_start + batch_size, total_positions)
+        # Start producer (reads dataset, feeds queue)
+        producer = asyncio.create_task(
+            data_producer(dataset, work_queue, positions_list, mate_move_keys, stats, batch_size)
+        )
 
-                # Slice access returns columnar dict: {"fen": [...], "moves": [...], "p_win": [...]}
-                batch_cols = dataset[batch_start:batch_end]
+        # Start workers (pull from queue, analyze with Stockfish)
+        workers = [
+            asyncio.create_task(
+                engine_worker(engines[i][1], work_queue, results_dict, stats, time_limit)
+            )
+            for i in range(num_engines)
+        ]
 
-                # Convert to list of dicts for processing
-                batch = [
-                    {"fen": batch_cols["fen"][i], "moves": batch_cols["moves"][i], "p_win": batch_cols["p_win"][i]}
-                    for i in range(len(batch_cols["fen"]))
-                ]
-
-                batch_results = await process_batch_async(batch, engines, stats, time_limit)
-                all_results.extend(batch_results)
-                pbar.update(len(batch))
+        # Progress monitoring - wait for producer to finish while showing progress
+        with tqdm(total=len(dataset), desc="Processing positions") as pbar:
+            last_count = 0
+            while not producer.done() or not work_queue.empty():
+                await asyncio.sleep(0.5)
+                current_count = len(positions_list)
+                pbar.update(current_count - last_count)
+                last_count = current_count
 
                 # Update progress description with stats
                 if stats["total_mate_moves"] > 0:
                     found_rate = stats["mates_found"] / stats["total_mate_moves"] * 100
-                    not_found_rate = stats["mates_not_found"] / stats["total_mate_moves"] * 100
                     pbar.set_postfix({
+                        "queue": work_queue.qsize(),
                         "found": f"{found_rate:.1f}%",
-                        "not_found": f"{not_found_rate:.1f}%"
                     })
+
+            # Final update
+            pbar.update(len(positions_list) - last_count)
+
+        # Wait for producer to fully complete
+        await producer
+
+        # Send shutdown sentinels to workers
+        for _ in range(num_engines):
+            await work_queue.put(None)
+
+        # Wait for all workers to finish
+        await asyncio.gather(*workers)
 
     finally:
         # Clean up engines
         print("\nShutting down engines...")
         for _, engine in engines:
             await engine.quit()
+
+    # Assemble final results - remap all win percentages
+    print("Assembling results...")
+    all_results = []
+    for pos_idx, pos in enumerate(positions_list):
+        new_p_wins = []
+
+        for move_idx, p_win in enumerate(pos["p_win"]):
+            key = (pos_idx, move_idx)
+            if key in results_dict:
+                # This was a mate-ish move that we analyzed
+                result, is_winning_move = results_dict[key]
+                if result is not None:
+                    is_winning, mate_in_n = result
+                    new_p_wins.append(compute_mate_winrate(mate_in_n, is_winning))
+                else:
+                    # Couldn't find mate, assign default deep mate value
+                    new_p_wins.append(0.98 if is_winning_move else 0.02)
+            else:
+                # Non-mate move: remap from (0,1) to (0.02, 0.98)
+                new_p_wins.append(remap_non_mate_winrate(p_win))
+
+        all_results.append({
+            "fen": pos["fen"],
+            "moves": list(pos["moves"]),
+            "p_win": np.asarray(new_p_wins, dtype=np.float32).tolist(),
+        })
 
     return all_results, dict(stats)
 
