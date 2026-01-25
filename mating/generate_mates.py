@@ -94,6 +94,11 @@ class EngineWorker(threading.Thread):
                 return None
 
             board.push(move)
+
+            # Immediate checkmate - no need to call Stockfish
+            if board.is_checkmate():
+                return (True, 1)
+
             info = self.engine.analyse(
                 board,
                 chess.engine.Limit(time=MATE_SEARCH_TIME, depth=MATE_SEARCH_DEPTH)
@@ -274,11 +279,16 @@ def main():
 
         # Submit all work and show progress
         with EnginePool(args.stockfish, args.num_engines) as pool:
-            for key, fen, move_uci in work_items:
-                pool.submit(key, fen, move_uci)
-
             total_work = len(work_items)
             with tqdm(total=total_work, desc="Analyzing moves") as pbar:
+                # Submit work, updating progress periodically
+                for i, (key, fen, move_uci) in enumerate(work_items):
+                    pool.submit(key, fen, move_uci)
+                    if i % 1000 == 0:
+                        pbar.n = pool.get_completed_count()
+                        pbar.refresh()
+
+                # Wait for remaining work
                 while True:
                     completed = pool.get_completed_count()
                     pbar.n = completed
@@ -294,18 +304,31 @@ def main():
         # Fill in mate positions
         for mate_pos_idx, pos_idx in enumerate(tqdm(mate_positions, desc="Assembling")):
             p_wins = p_wins_list[pos_idx]
-            mate_move_info = {m[0]: m[2] for m in mate_moves[mate_pos_idx]}  # move_idx -> is_winning
+            fen = fens[pos_idx]
+            mate_move_info = {m[0]: (m[1], m[2]) for m in mate_moves[mate_pos_idx]}  # move_idx -> (move_uci, is_winning)
 
             new_p_wins = []
             for move_idx, p_win in enumerate(p_wins):
                 if move_idx in mate_move_info:
-                    is_winning_move = mate_move_info[move_idx]
+                    move_uci, is_winning_move = mate_move_info[move_idx]
                     result = analysis_results.get((mate_pos_idx, move_idx))
                     if result is not None:
                         is_winning, mate_in_n = result
-                        new_p_wins.append(compute_mate_winrate(mate_in_n, is_winning))
+                        new_winrate = compute_mate_winrate(mate_in_n, is_winning)
                     else:
-                        new_p_wins.append(0.98 if is_winning_move else 0.02)
+                        new_winrate = 0.98 if is_winning_move else 0.02
+
+                    # Sanity check: new winrate should be on same side of 50% as original
+                    original_above_50 = p_win >= 0.5
+                    new_above_50 = new_winrate >= 0.5
+                    if original_above_50 != new_above_50:
+                        raise ValueError(
+                            f"Win rate crossed 50% boundary! "
+                            f"FEN: {fen}, Move: {move_uci}, "
+                            f"Original: {p_win:.4f}, New: {new_winrate:.4f}"
+                        )
+
+                    new_p_wins.append(new_winrate)
                 else:
                     new_p_wins.append(0.02 + p_win * 0.96)
 
