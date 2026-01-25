@@ -30,7 +30,7 @@ MATE_DATASET_PATH = os.getenv(
 )
 PRETRAINED_MODEL_PATH = os.getenv(
     "PRETRAINED_MODEL_PATH",
-    "./final-model/checkpoint-477500"
+    "./final-model/checkpoint-515268"
 )
 OUTPUT_DIR = "./mating-finetuned"
 
