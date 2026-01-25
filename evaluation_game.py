@@ -278,6 +278,21 @@ def _select_moves_from_model_batch(
         try:
             move = chess.Move.from_uci(move_uci)
             if move in board.legal_moves:
+                # Check if this move would cause 3-fold repetition
+                test_board = board.copy()
+                test_board.push(move)
+                if test_board.is_repetition(3):
+                    # Get second-best move's logit
+                    sorted_logits, sorted_indices = torch.sort(masked_logits, descending=True)
+                    second_logit = sorted_logits[1].item()
+                    if second_logit > 0:
+                        # Use second-best move instead
+                        second_move_idx = sorted_indices[1].item()
+                        second_move_uci = policy_index[second_move_idx]
+                        second_move = chess.Move.from_uci(second_move_uci)
+                        if second_move in board.legal_moves:
+                            move = second_move
+                    # Otherwise keep top move and accept the draw
                 moves.append(move)
             else:
                 # Fallback to random legal move
