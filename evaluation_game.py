@@ -25,7 +25,10 @@ from tokenizer import process_fen
 
 # Stockfish configuration
 STOCKFISH_ELO = 1350
-ENGINE_TIME_LIMIT = 0.1  # Time limit in seconds for Stockfish moves
+STOCKFISH_ELO_MIN = 1320
+STOCKFISH_ELO_MAX = 3190
+ENGINE_TIME_LIMIT = 0.1  # Time limit in seconds for Stockfish moves (limited mode)
+ENGINE_TIME_LIMIT_FULL = 0.05  # Time limit for full-strength Stockfish
 EVAL_TIME_LIMIT = 0.1    # Time limit for full-strength position evaluation
 
 # Win% bucket configuration for conversion tracking
@@ -561,14 +564,16 @@ async def play_games_batched(
     verbose: bool = True,
     starting_positions: Optional[List[Tuple[str, bool]]] = None,
     conversion_tracker: Optional[ConversionTracker] = None,
+    full_strength: bool = False,
 ) -> Tuple[int, int, int, int, float, int, List[GameState]]:
     """
     Play multiple games in parallel with batched model inference.
 
     Args:
-        stockfish_elo: ELO rating to configure Stockfish to play at
+        stockfish_elo: ELO rating to configure Stockfish to play at (1320-3190)
         starting_positions: Optional list of (fen, model_plays_white) tuples
         conversion_tracker: Optional tracker for eval-to-outcome conversion stats
+        full_strength: If True, play against full-strength Stockfish (no ELO limit)
 
     Returns:
         Tuple of (wins, draws, losses, total_moves, total_illegality, illegality_count, game_states)
@@ -583,10 +588,15 @@ async def play_games_batched(
             game_states.append(
                 GameState(i, model_plays_white=random.random() < 0.5))
 
+    # Determine time limit based on mode
+    play_time_limit = ENGINE_TIME_LIMIT_FULL if full_strength else ENGINE_TIME_LIMIT
+
     # Initialize batch_size engines in parallel (reuse them across games)
     async def init_play_engine():
         transport, engine = await chess.engine.popen_uci(stockfish_path)
-        await engine.configure({"UCI_LimitStrength": True, "UCI_Elo": stockfish_elo})
+        if not full_strength:
+            await engine.configure({"UCI_LimitStrength": True, "UCI_Elo": stockfish_elo})
+        # Full strength: no configuration needed, Stockfish plays at maximum strength
         return (transport, engine)
 
     async def init_eval_engine():
@@ -715,7 +725,7 @@ async def play_games_batched(
                     # Run Stockfish for all games needing opponent moves
                     stockfish_tasks = [
                         engines[game_to_engine[game.game_id]][1].play(
-                            game.board, chess.engine.Limit(time=ENGINE_TIME_LIMIT))
+                            game.board, chess.engine.Limit(time=play_time_limit))
                         for game in games_needing_stockfish
                     ]
                     stockfish_results = await asyncio.gather(*stockfish_tasks)
@@ -962,6 +972,7 @@ def evaluate_model_against_stockfish(
     verbose: bool = True,
     puzzle_csv_path: Optional[str | Path] = None,
     pgn_path: Optional[str | Path] = None,
+    full_strength: bool = False,
 ) -> Tuple[float, float]:
     """
     Evaluate a model by playing multiple games against Stockfish with batched inference.
@@ -972,11 +983,12 @@ def evaluate_model_against_stockfish(
         num_games: Number of games to play (model plays random color each game)
         tokenizer: Tokenizer for processing FEN strings
         batch_size: Number of games to run in parallel
-        opponent_elo: ELO rating to configure Stockfish and use for estimation
+        opponent_elo: ELO rating to configure Stockfish and use for estimation (1320-3190)
         verbose: Whether to print progress updates
         puzzle_csv_path: Optional path to puzzles.csv to load starting positions.
                         Games will be played in pairs from each position for fairness.
         pgn_path: Optional path to export all games as PGN file.
+        full_strength: If True, play against full-strength Stockfish (no ELO limit, 0.05s/move)
 
     Returns:
         Tuple of (estimated_elo, standard_error)
@@ -998,8 +1010,10 @@ def evaluate_model_against_stockfish(
                 f"Loaded {len(starting_positions)} positions (each played from both sides)\n")
 
     if verbose:
-        print(
-            f"Playing {num_games} games against Stockfish (ELO {opponent_elo})...")
+        if full_strength:
+            print(f"Playing {num_games} games against full-strength Stockfish ({ENGINE_TIME_LIMIT_FULL}s/move)...")
+        else:
+            print(f"Playing {num_games} games against Stockfish (ELO {opponent_elo})...")
         if starting_positions:
             print(f"  Using puzzle positions from CSV")
         else:
@@ -1023,6 +1037,7 @@ def evaluate_model_against_stockfish(
             verbose=verbose,
             starting_positions=starting_positions,
             conversion_tracker=conversion_tracker,
+            full_strength=full_strength,
         )
     )
 
@@ -1072,10 +1087,17 @@ def main():
                         help="Path to Stockfish executable")
     parser.add_argument("-n", "--num-games", type=int, default=400, help="Number of games to play")
     parser.add_argument("-b", "--batch-size", type=int, default=128, help="Batch size for parallel games")
-    parser.add_argument("--elo", type=int, default=1350, help="Stockfish ELO rating")
+    parser.add_argument("--elo", type=int, default=1350,
+                        help=f"Stockfish ELO rating ({STOCKFISH_ELO_MIN}-{STOCKFISH_ELO_MAX})")
+    parser.add_argument("--full-strength", action="store_true",
+                        help="Play against full-strength Stockfish (no ELO limit, 0.05s/move)")
     parser.add_argument("--puzzles", default=None, help="Path to puzzles.csv for starting positions")
     parser.add_argument("--pgn", default=None, help="Path to export games as PGN file")
     args = parser.parse_args()
+
+    # Validate ELO range
+    if not args.full_strength and not (STOCKFISH_ELO_MIN <= args.elo <= STOCKFISH_ELO_MAX):
+        parser.error(f"ELO must be between {STOCKFISH_ELO_MIN} and {STOCKFISH_ELO_MAX}")
 
     print(f"Loading model from {args.model}...")
 
@@ -1088,8 +1110,10 @@ def main():
     model.eval()
 
     print(f"Model loaded on {device}")
-    print(
-        f"Starting evaluation with {args.num_games} games (batch size: {args.batch_size})...")
+    if args.full_strength:
+        print(f"Starting evaluation with {args.num_games} games against full-strength Stockfish...")
+    else:
+        print(f"Starting evaluation with {args.num_games} games (batch size: {args.batch_size})...")
     print()
 
     # Run evaluation
@@ -1102,6 +1126,7 @@ def main():
         verbose=True,
         puzzle_csv_path=args.puzzles,
         pgn_path=args.pgn,
+        full_strength=args.full_strength,
     )
 
     print()
