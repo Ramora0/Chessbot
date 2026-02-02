@@ -615,6 +615,8 @@ async def play_games_batched(
     conversion_tracker: Optional[ConversionTracker] = None,
     full_strength: bool = False,
     avoid_stalemate: bool = False,
+    stockfish_depth: Optional[int] = None,
+    stockfish_time: Optional[float] = None,
 ) -> Tuple[int, int, int, int, float, int, List[GameState]]:
     """
     Play multiple games in parallel with batched model inference.
@@ -624,6 +626,8 @@ async def play_games_batched(
         starting_positions: Optional list of (fen, model_plays_white) tuples
         conversion_tracker: Optional tracker for eval-to-outcome conversion stats
         full_strength: If True, play against full-strength Stockfish (no ELO limit)
+        stockfish_depth: If set, limit Stockfish by search depth instead of ELO
+        stockfish_time: If set, limit Stockfish by time per move instead of ELO
 
     Returns:
         Tuple of (wins, draws, losses, total_moves, total_illegality, illegality_count, game_states)
@@ -638,15 +642,26 @@ async def play_games_batched(
             game_states.append(
                 GameState(i, model_plays_white=random.random() < 0.5))
 
-    # Determine time limit based on mode
-    play_time_limit = ENGINE_TIME_LIMIT_FULL if full_strength else ENGINE_TIME_LIMIT
+    # Determine if using depth/time limits (alternative to ELO)
+    use_depth_or_time = stockfish_depth is not None or stockfish_time is not None
+
+    # Determine play limits based on mode
+    if stockfish_depth is not None:
+        play_limit = chess.engine.Limit(depth=stockfish_depth)
+    elif stockfish_time is not None:
+        play_limit = chess.engine.Limit(time=stockfish_time)
+    elif full_strength:
+        play_limit = chess.engine.Limit(time=ENGINE_TIME_LIMIT_FULL)
+    else:
+        play_limit = chess.engine.Limit(time=ENGINE_TIME_LIMIT)
 
     # Initialize batch_size engines in parallel (reuse them across games)
     async def init_play_engine():
         transport, engine = await chess.engine.popen_uci(stockfish_path)
-        if not full_strength:
+        # Only configure ELO limits when not using depth/time limits
+        if not full_strength and not use_depth_or_time:
             await engine.configure({"UCI_LimitStrength": True, "UCI_Elo": stockfish_elo})
-        # Full strength: no configuration needed, Stockfish plays at maximum strength
+        # Full strength or depth/time: no ELO configuration needed
         return (transport, engine)
 
     async def init_eval_engine():
@@ -775,7 +790,7 @@ async def play_games_batched(
                     # Run Stockfish for all games needing opponent moves
                     stockfish_tasks = [
                         engines[game_to_engine[game.game_id]][1].play(
-                            game.board, chess.engine.Limit(time=play_time_limit))
+                            game.board, play_limit)
                         for game in games_needing_stockfish
                     ]
                     stockfish_results = await asyncio.gather(*stockfish_tasks)
@@ -1026,6 +1041,8 @@ def evaluate_model_against_stockfish(
     avoid_stalemate: bool = False,
     use_openings: bool = True,
     openings_path: Optional[str | Path] = None,
+    stockfish_depth: Optional[int] = None,
+    stockfish_time: Optional[float] = None,
 ) -> Tuple[float, float]:
     """
     Evaluate a model by playing multiple games against Stockfish with batched inference.
@@ -1042,9 +1059,12 @@ def evaluate_model_against_stockfish(
                         Games will be played in pairs from each position for fairness.
         pgn_path: Optional path to export all games as PGN file.
         full_strength: If True, play against full-strength Stockfish (no ELO limit, 0.05s/move)
+        stockfish_depth: If set, limit Stockfish by search depth instead of ELO
+        stockfish_time: If set, limit Stockfish by time per move instead of ELO
 
     Returns:
-        Tuple of (estimated_elo, standard_error)
+        Tuple of (estimated_elo, standard_error). When using depth/time limits,
+        returns (nan, nan) since absolute ELO cannot be estimated.
     """
     device = next(model.parameters()).device
 
@@ -1076,9 +1096,16 @@ def evaluate_model_against_stockfish(
         elif verbose:
             print(f"Warning: openings.txt not found at {openings_path}, starting from initial position\n")
 
+    # Determine if using depth/time limits (alternative to ELO)
+    use_depth_or_time = stockfish_depth is not None or stockfish_time is not None
+
     if verbose:
         if full_strength:
             print(f"Playing {num_games} games against full-strength Stockfish ({ENGINE_TIME_LIMIT_FULL}s/move)...")
+        elif stockfish_depth is not None:
+            print(f"Playing {num_games} games against Stockfish (depth {stockfish_depth})...")
+        elif stockfish_time is not None:
+            print(f"Playing {num_games} games against Stockfish ({stockfish_time}s/move)...")
         else:
             print(f"Playing {num_games} games against Stockfish (ELO {opponent_elo})...")
         if starting_positions:
@@ -1109,6 +1136,8 @@ def evaluate_model_against_stockfish(
             conversion_tracker=conversion_tracker,
             full_strength=full_strength,
             avoid_stalemate=avoid_stalemate,
+            stockfish_depth=stockfish_depth,
+            stockfish_time=stockfish_time,
         )
     )
 
@@ -1116,10 +1145,14 @@ def evaluate_model_against_stockfish(
     if pgn_path:
         export_games_to_pgn(game_states, pgn_path, opponent_elo, verbose)
 
-    # Final ELO calculation
-    estimated_elo, standard_error = estimate_elo_from_scores(
-        wins, draws, losses, opponent_elo=opponent_elo
-    )
+    # Final ELO calculation - only meaningful when using ELO-limited Stockfish
+    if use_depth_or_time:
+        # Cannot estimate absolute ELO when using depth/time limits
+        estimated_elo, standard_error = float("nan"), float("nan")
+    else:
+        estimated_elo, standard_error = estimate_elo_from_scores(
+            wins, draws, losses, opponent_elo=opponent_elo
+        )
 
     if verbose:
         print("=" * 60)
@@ -1127,14 +1160,27 @@ def evaluate_model_against_stockfish(
         print("=" * 60)
         print(f"Games played: {num_games}")
         print(f"Record: {wins}W-{draws}D-{losses}L")
-        print(
-            f"Score: {wins + 0.5 * draws}/{num_games} ({(wins + 0.5 * draws)/num_games:.1%})")
+        score = wins + 0.5 * draws
+        score_pct = score / num_games
+        print(f"Score: {score}/{num_games} ({score_pct:.1%})")
         print(f"Average game length: {total_moves/num_games:.1f} moves")
         if illegality_count > 0:
             avg_illegality = total_illegality / illegality_count
             print(f"Average illegality rate: {avg_illegality:.2%}")
         print()
-        print(f"Estimated ELO: {estimated_elo:.0f} ± {standard_error:.0f}")
+
+        if use_depth_or_time:
+            # Calculate relative ELO (performance difference from 50%)
+            # Using the formula: ELO_diff = 400 * log10(score / (1 - score))
+            if 0 < score_pct < 1:
+                relative_elo = 400 * math.log10(score_pct / (1 - score_pct))
+                print(f"Relative ELO: {relative_elo:+.0f} (vs Stockfish at this setting)")
+                print("  (Positive = model stronger, negative = Stockfish stronger)")
+            else:
+                print(f"Relative ELO: {'dominant win' if score_pct == 1 else 'dominant loss'}")
+            print("  Note: Absolute ELO cannot be estimated with depth/time limits")
+        else:
+            print(f"Estimated ELO: {estimated_elo:.0f} ± {standard_error:.0f}")
         print("=" * 60)
 
         # Print conversion statistics
@@ -1158,8 +1204,12 @@ def main():
                         help="Path to Stockfish executable")
     parser.add_argument("-n", "--num-games", type=int, default=400, help="Number of games to play")
     parser.add_argument("-b", "--batch-size", type=int, default=128, help="Batch size for parallel games")
-    parser.add_argument("--elo", type=int, default=1350,
-                        help=f"Stockfish ELO rating ({STOCKFISH_ELO_MIN}-{STOCKFISH_ELO_MAX})")
+    parser.add_argument("--elo", type=int, default=None,
+                        help=f"Stockfish ELO rating ({STOCKFISH_ELO_MIN}-{STOCKFISH_ELO_MAX}). Default: {STOCKFISH_ELO}")
+    parser.add_argument("--depth", type=int, default=None,
+                        help="Limit Stockfish by search depth (alternative to --elo)")
+    parser.add_argument("--time", type=float, default=None,
+                        help="Limit Stockfish by time per move in seconds (alternative to --elo)")
     parser.add_argument("--full-strength", action="store_true",
                         help="Play against full-strength Stockfish (no ELO limit, 0.05s/move)")
     parser.add_argument("--avoid-stalemate", action="store_true",
@@ -1172,9 +1222,25 @@ def main():
     parser.add_argument("--pgn", default=None, help="Path to export games as PGN file")
     args = parser.parse_args()
 
-    # Validate ELO range
-    if not args.full_strength and not (STOCKFISH_ELO_MIN <= args.elo <= STOCKFISH_ELO_MAX):
-        parser.error(f"ELO must be between {STOCKFISH_ELO_MIN} and {STOCKFISH_ELO_MAX}")
+    # Determine Stockfish mode and validate arguments
+    use_depth_or_time = args.depth is not None or args.time is not None
+
+    # Set default ELO if not specified and not using depth/time
+    if args.elo is None:
+        args.elo = STOCKFISH_ELO
+
+    # Validate ELO range (only when using ELO mode)
+    if not args.full_strength and not use_depth_or_time:
+        if not (STOCKFISH_ELO_MIN <= args.elo <= STOCKFISH_ELO_MAX):
+            parser.error(f"ELO must be between {STOCKFISH_ELO_MIN} and {STOCKFISH_ELO_MAX}")
+
+    # Warn if both depth and time are specified
+    if args.depth is not None and args.time is not None:
+        parser.error("Cannot specify both --depth and --time. Choose one.")
+
+    # Warn if ELO is specified along with depth/time
+    if use_depth_or_time and args.elo != STOCKFISH_ELO:
+        print(f"Warning: --elo is ignored when using --depth or --time")
 
     print(f"Loading model from {args.model}...")
 
@@ -1189,6 +1255,10 @@ def main():
     print(f"Model loaded on {device}")
     if args.full_strength:
         print(f"Starting evaluation with {args.num_games} games against full-strength Stockfish...")
+    elif args.depth is not None:
+        print(f"Starting evaluation with {args.num_games} games against Stockfish (depth {args.depth})...")
+    elif args.time is not None:
+        print(f"Starting evaluation with {args.num_games} games against Stockfish ({args.time}s/move)...")
     else:
         print(f"Starting evaluation with {args.num_games} games (batch size: {args.batch_size})...")
     print()
@@ -1207,13 +1277,18 @@ def main():
         avoid_stalemate=args.avoid_stalemate,
         use_openings=not args.no_openings,
         openings_path=args.openings_path,
+        stockfish_depth=args.depth,
+        stockfish_time=args.time,
     )
 
     print()
     print("=" * 60)
     print("EVALUATION COMPLETE")
     print("=" * 60)
-    print(f"Estimated ELO: {estimated_elo:.0f} ± {std_error:.0f}")
+    if use_depth_or_time:
+        print("Relative performance shown above (absolute ELO not available)")
+    else:
+        print(f"Estimated ELO: {estimated_elo:.0f} ± {std_error:.0f}")
     print("=" * 60)
 
 
