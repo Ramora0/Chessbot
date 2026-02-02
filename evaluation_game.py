@@ -799,11 +799,8 @@ async def play_games_batched(
 
                 if games_needing_stockfish:
                     # Clear hash before each move for fair comparison (model has no cache)
-                    clear_tasks = [
-                        engines[game_to_engine[game.game_id]][1].protocol.send_line("ucinewgame")
-                        for game in games_needing_stockfish
-                    ]
-                    await asyncio.gather(*clear_tasks)
+                    for game in games_needing_stockfish:
+                        engines[game_to_engine[game.game_id]][1].send_line("ucinewgame")
 
                     # Run Stockfish for all games needing opponent moves
                     stockfish_tasks = [
