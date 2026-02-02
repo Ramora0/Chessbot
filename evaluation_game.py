@@ -221,6 +221,7 @@ def _select_moves_from_model_batch(
     boards: List[chess.Board],
     device: torch.device,
     tokenizer,
+    avoid_stalemate: bool = False,
 ) -> Tuple[List[Optional[chess.Move]], float]:
     """
     Use the model to select moves for a batch of positions.
@@ -296,6 +297,29 @@ def _select_moves_from_model_batch(
                         if second_move in board.legal_moves:
                             move = second_move
                     # Otherwise keep top move and accept the draw
+
+                # Check if this move would cause stalemate
+                if avoid_stalemate:
+                    test_board = board.copy()
+                    test_board.push(move)
+                    if test_board.is_stalemate():
+                        # Find the best non-stalemate move
+                        sorted_logits, sorted_indices = torch.sort(masked_logits, descending=True)
+                        for idx in range(len(sorted_indices)):
+                            candidate_idx = sorted_indices[idx].item()
+                            candidate_uci = policy_index[candidate_idx]
+                            try:
+                                candidate_move = chess.Move.from_uci(candidate_uci)
+                                if candidate_move in board.legal_moves:
+                                    candidate_board = board.copy()
+                                    candidate_board.push(candidate_move)
+                                    if not candidate_board.is_stalemate():
+                                        move = candidate_move
+                                        break
+                            except ValueError:
+                                continue
+                        # If all moves cause stalemate, keep original move
+
                 moves.append(move)
             else:
                 # Fallback to random legal move
@@ -316,10 +340,11 @@ def _select_move_from_model(
     board: chess.Board,
     device: torch.device,
     tokenizer,
+    avoid_stalemate: bool = False,
 ) -> Optional[chess.Move]:
     """Use the model to select a move from the current position (single position)."""
     moves, _ = _select_moves_from_model_batch(
-        model, [board], device, tokenizer)
+        model, [board], device, tokenizer, avoid_stalemate=avoid_stalemate)
     return moves[0]
 
 
@@ -565,6 +590,7 @@ async def play_games_batched(
     starting_positions: Optional[List[Tuple[str, bool]]] = None,
     conversion_tracker: Optional[ConversionTracker] = None,
     full_strength: bool = False,
+    avoid_stalemate: bool = False,
 ) -> Tuple[int, int, int, int, float, int, List[GameState]]:
     """
     Play multiple games in parallel with batched model inference.
@@ -672,7 +698,7 @@ async def play_games_batched(
                 if games_needing_model:
                     boards = [game.board for game in games_needing_model]
                     moves, avg_illegality = _select_moves_from_model_batch(
-                        model, boards, device, tokenizer)
+                        model, boards, device, tokenizer, avoid_stalemate=avoid_stalemate)
 
                     # Track illegality
                     total_illegality += avg_illegality * len(boards)
@@ -973,6 +999,7 @@ def evaluate_model_against_stockfish(
     puzzle_csv_path: Optional[str | Path] = None,
     pgn_path: Optional[str | Path] = None,
     full_strength: bool = False,
+    avoid_stalemate: bool = False,
 ) -> Tuple[float, float]:
     """
     Evaluate a model by playing multiple games against Stockfish with batched inference.
@@ -1038,6 +1065,7 @@ def evaluate_model_against_stockfish(
             starting_positions=starting_positions,
             conversion_tracker=conversion_tracker,
             full_strength=full_strength,
+            avoid_stalemate=avoid_stalemate,
         )
     )
 
@@ -1091,6 +1119,8 @@ def main():
                         help=f"Stockfish ELO rating ({STOCKFISH_ELO_MIN}-{STOCKFISH_ELO_MAX})")
     parser.add_argument("--full-strength", action="store_true",
                         help="Play against full-strength Stockfish (no ELO limit, 0.05s/move)")
+    parser.add_argument("--avoid-stalemate", action="store_true",
+                        help="Avoid moves that cause stalemate (pick next best move instead)")
     parser.add_argument("--puzzles", default=None, help="Path to puzzles.csv for starting positions")
     parser.add_argument("--pgn", default=None, help="Path to export games as PGN file")
     args = parser.parse_args()
@@ -1127,6 +1157,7 @@ def main():
         puzzle_csv_path=args.puzzles,
         pgn_path=args.pgn,
         full_strength=args.full_strength,
+        avoid_stalemate=args.avoid_stalemate,
     )
 
     print()

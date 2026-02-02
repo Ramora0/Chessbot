@@ -332,9 +332,24 @@ def main():
 
             if move_probs:
                 best_move, best_prob, best_logit, best_move_winrate = move_probs[0]
+                chosen_move = best_move
+
+                # Check if this move would cause threefold repetition
+                test_board = board.copy()
+                test_board.push(best_move)
+                if test_board.is_repetition(3) and len(move_probs) > 1:
+                    # Get second-best move's logit
+                    second_move, second_prob, second_logit, second_move_winrate = move_probs[1]
+                    if second_logit > 0:
+                        # Use second-best move instead
+                        if second_move in board.legal_moves:
+                            chosen_move = second_move
+                            print(f"\nAvoiding threefold repetition: {best_move.uci()} -> {second_move.uci()}")
+                    # Otherwise keep top move and accept the draw
+
                 print(
-                    f"\nModel plays: {best_move.uci()} (prob: {best_prob*100:.2f}%, win%: {best_move_winrate*100:.2f}%)")
-                board.push(best_move)
+                    f"\nModel plays: {chosen_move.uci()} (prob: {best_prob*100:.2f}%, win%: {best_move_winrate*100:.2f}%)")
+                board.push(chosen_move)
                 ai_thinking = False
             else:
                 print("Model has no legal moves!")

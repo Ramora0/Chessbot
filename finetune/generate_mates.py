@@ -27,7 +27,7 @@ from tqdm import tqdm
 # CONFIG
 # -------------------------------------------------------------------
 
-DEFAULT_OUTPUT_PATH = Path("/fs/scratch/PAS2836/lees_stuff/action_value_mates")
+DEFAULT_OUTPUT_PATH = Path("/fs/scratch/PAS2836/lees_stuff/searchless_mates")
 DEFAULT_STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
 
 DEFAULT_NUM_POSITIONS = 2_000_000
