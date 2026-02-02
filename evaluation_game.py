@@ -168,6 +168,30 @@ LOG10 = float(np.log(10.0))
 ELO_K = LOG10 / 400.0
 
 
+def load_opening_positions(txt_path: str | Path, num_positions: int) -> List[Tuple[str, bool]]:
+    """Load random FEN positions from openings.txt.
+
+    Returns pairs of the same position for fairness (model plays both sides).
+    Each element is (fen, model_plays_white).
+    """
+    with open(txt_path, 'r') as f:
+        all_fens = [line.strip() for line in f if line.strip()]
+
+    # Sample half the positions (we'll play each from both sides)
+    num_unique = (num_positions + 1) // 2
+    selected_fens = random.sample(all_fens, min(num_unique, len(all_fens)))
+
+    # Create pairs - same position, different colors
+    positions = []
+    for fen in selected_fens:
+        positions.append((fen, True))   # Model plays white
+        positions.append((fen, False))  # Model plays black
+
+    # Shuffle the pairs and trim to exact count
+    random.shuffle(positions)
+    return positions[:num_positions]
+
+
 def load_puzzle_positions(csv_path: str | Path, num_positions: int) -> List[Tuple[str, bool]]:
     """Load random FEN positions from puzzles.csv.
 
@@ -1000,6 +1024,8 @@ def evaluate_model_against_stockfish(
     pgn_path: Optional[str | Path] = None,
     full_strength: bool = False,
     avoid_stalemate: bool = False,
+    use_openings: bool = True,
+    openings_path: Optional[str | Path] = None,
 ) -> Tuple[float, float]:
     """
     Evaluate a model by playing multiple games against Stockfish with batched inference.
@@ -1035,6 +1061,20 @@ def evaluate_model_against_stockfish(
         if verbose:
             print(
                 f"Loaded {len(starting_positions)} positions (each played from both sides)\n")
+    elif use_openings:
+        # Use openings.txt by default
+        if openings_path is None:
+            # Default to openings.txt in the same directory as this file
+            openings_path = Path(__file__).parent / "openings.txt"
+        if Path(openings_path).exists():
+            if verbose:
+                print(f"Loading opening positions from {openings_path}...")
+            starting_positions = load_opening_positions(openings_path, num_games)
+            if verbose:
+                print(
+                    f"Loaded {len(starting_positions)} positions (each played from both sides)\n")
+        elif verbose:
+            print(f"Warning: openings.txt not found at {openings_path}, starting from initial position\n")
 
     if verbose:
         if full_strength:
@@ -1042,7 +1082,10 @@ def evaluate_model_against_stockfish(
         else:
             print(f"Playing {num_games} games against Stockfish (ELO {opponent_elo})...")
         if starting_positions:
-            print(f"  Using puzzle positions from CSV")
+            if puzzle_csv_path:
+                print(f"  Using puzzle positions from CSV")
+            else:
+                print(f"  Using opening positions from openings.txt")
         else:
             print(f"  Model plays random color each game")
         print(f"  Batch size: {batch_size} (parallel games)")
@@ -1121,6 +1164,10 @@ def main():
                         help="Play against full-strength Stockfish (no ELO limit, 0.05s/move)")
     parser.add_argument("--avoid-stalemate", action="store_true",
                         help="Avoid moves that cause stalemate (pick next best move instead)")
+    parser.add_argument("--no-openings", action="store_true",
+                        help="Don't use opening positions from openings.txt (start from initial position)")
+    parser.add_argument("--openings-path", default=None,
+                        help="Path to openings file (default: openings.txt in script directory)")
     parser.add_argument("--puzzles", default=None, help="Path to puzzles.csv for starting positions")
     parser.add_argument("--pgn", default=None, help="Path to export games as PGN file")
     args = parser.parse_args()
@@ -1158,6 +1205,8 @@ def main():
         pgn_path=args.pgn,
         full_strength=args.full_strength,
         avoid_stalemate=args.avoid_stalemate,
+        use_openings=not args.no_openings,
+        openings_path=args.openings_path,
     )
 
     print()
