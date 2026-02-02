@@ -662,10 +662,13 @@ async def play_games_batched(
     # Initialize batch_size engines in parallel (reuse them across games)
     async def init_play_engine():
         transport, engine = await chess.engine.popen_uci(stockfish_path)
+        # Use small hash size since engines are reused across unrelated games
+        config = {"Hash": 16}  # 16 MB - small but sufficient for single game
         # Only configure ELO limits when not using custom limits
         if not full_strength and not use_custom_limit:
-            await engine.configure({"UCI_LimitStrength": True, "UCI_Elo": stockfish_elo})
-        # Full strength or custom limits: no ELO configuration needed
+            config["UCI_LimitStrength"] = True
+            config["UCI_Elo"] = stockfish_elo
+        await engine.configure(config)
         return (transport, engine)
 
     async def init_eval_engine():
@@ -673,11 +676,15 @@ async def play_games_batched(
         # Full strength for accurate position evaluation
         return (transport, engine)
 
-    num_engines = min(batch_size, num_games)
+    # Limit engines based on CPU count to avoid oversubscription
+    cpu_count = os.cpu_count() or 8
+    max_engines = cpu_count * 2  # 2x CPU count is reasonable for I/O-bound work
+    num_engines = min(batch_size, num_games, max_engines)
     # Use fewer eval engines since analyse() is fast
     num_eval_engines = min(8, num_engines) if conversion_tracker else 0
 
     if verbose:
+        print(f"Using {num_engines} Stockfish engines ({cpu_count} CPUs detected, max {max_engines})")
         total_engines = num_engines + num_eval_engines
         with tqdm(total=total_engines, desc="Initializing engines", unit=" engines") as pbar:
             # Initialize play engines in batches
@@ -791,6 +798,13 @@ async def play_games_batched(
                 ]
 
                 if games_needing_stockfish:
+                    # Clear hash before each move for fair comparison (model has no cache)
+                    clear_tasks = [
+                        engines[game_to_engine[game.game_id]][1].protocol.send_line("ucinewgame")
+                        for game in games_needing_stockfish
+                    ]
+                    await asyncio.gather(*clear_tasks)
+
                     # Run Stockfish for all games needing opponent moves
                     stockfish_tasks = [
                         engines[game_to_engine[game.game_id]][1].play(
