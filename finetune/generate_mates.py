@@ -1,10 +1,16 @@
 #!/usr/bin/env python
 """
-Generate a smaller dataset (2M positions) with refined mate-in-n win percentages.
+Generate dataset with mate-in-n information for extreme win probability moves.
 
-Loads everything into memory for speed, then:
-1. Fast pass: Remap non-mate positions (pure Python, no Stockfish)
-2. Slow pass: Run Stockfish only on positions with mate-candidate moves
+Keeps original win percentages unchanged and adds mate depth information:
+- mate[i] > 0: Move leads to mate in N moves (winning)
+- mate[i] < 0: Move leads to getting mated in N moves (losing)
+- mate[i] = 0: Not a forced mate (or not analyzed)
+
+Only moves with p_win >= 0.9999 or p_win <= 0.0001 are analyzed for mate depth.
+
+The model classifies into 5 classes: no_mate, mate_in_1, mate_in_2, mate_in_3, mate_in_4_plus.
+Depth 6 search is sufficient since mate_in_4+ is our coarsest bucket.
 """
 
 from __future__ import annotations
@@ -34,21 +40,12 @@ DEFAULT_NUM_POSITIONS = 2_000_000
 DEFAULT_SEED = 42
 DEFAULT_NUM_ENGINES = 40
 
-MATE_SEARCH_TIME = 0.05
-MATE_SEARCH_DEPTH = 20
+# Depth 6 is sufficient to detect mate-in-4 (8 plies after our move = 6 plies remaining)
+# Since we classify mate_in_4_plus as a single bucket, no need for deeper search
+MATE_SEARCH_DEPTH = 6
 
 WIN_THRESHOLD = 0.9999
 LOSS_THRESHOLD = 0.0001
-
-
-def compute_mate_winrate(mate_in_n: int, is_winning: bool) -> float:
-    """Compute refined win rate based on mate depth."""
-    if mate_in_n <= 0:
-        mate_in_n = 1
-    if is_winning:
-        return 0.98 + 0.02 / mate_in_n
-    else:
-        return 0.02 - 0.02 / mate_in_n
 
 
 class EngineWorker(threading.Thread):
@@ -73,8 +70,8 @@ class EngineWorker(threading.Thread):
                 self.work_queue.task_done()
                 break
 
-            key, fen, move_uci = item
-            result = self._analyze_move(fen, move_uci)
+            key, fen, move_uci, is_winning_move = item
+            result = self._analyze_move(fen, move_uci, is_winning_move)
 
             with self.lock:
                 self.results[key] = result
@@ -85,40 +82,55 @@ class EngineWorker(threading.Thread):
 
         self.engine.quit()
 
-    def _analyze_move(self, fen: str, move_uci: str) -> Optional[Tuple[bool, int]]:
-        """Analyze a move to detect if it leads to forced mate."""
+    def _analyze_move(self, fen: str, move_uci: str, is_winning_move: bool) -> int:
+        """
+        Analyze a move to detect mate depth.
+
+        Returns:
+            Positive int: Mate in N moves (we are winning)
+            Negative int: Getting mated in N moves (we are losing)
+            0: Not a forced mate or analysis failed
+        """
         try:
             board = chess.Board(fen)
             move = chess.Move.from_uci(move_uci)
             if move not in board.legal_moves:
-                return None
+                return 0
 
             board.push(move)
 
-            # Immediate checkmate - no need to call Stockfish
+            # Immediate checkmate
             if board.is_checkmate():
-                return (True, 1)
+                return 1 if is_winning_move else -1
 
             info = self.engine.analyse(
                 board,
-                chess.engine.Limit(time=MATE_SEARCH_TIME, depth=MATE_SEARCH_DEPTH)
+                chess.engine.Limit(depth=MATE_SEARCH_DEPTH)
             )
 
             score = info.get("score")
             if score is None:
-                return None
+                return 0
 
+            # Score is from perspective of side to move (after our move)
             pov_score = score.relative
             if pov_score.is_mate():
                 mate_in = pov_score.mate()
                 if mate_in is not None:
+                    # mate_in < 0 means the side to move is getting mated
+                    # mate_in > 0 means the side to move will deliver mate
+                    # We made the move, so:
+                    # - If mate_in < 0: opponent (who just moved) is getting mated = we win
+                    # - If mate_in > 0: opponent will deliver mate = we lose
                     if mate_in < 0:
-                        return (True, abs(mate_in))
+                        # We are winning (opponent getting mated)
+                        return abs(mate_in)
                     else:
-                        return (False, mate_in)
-            return None
+                        # We are losing (opponent will mate us)
+                        return -mate_in
+            return 0
         except Exception:
-            return None
+            return 0
 
 
 class EnginePool:
@@ -139,8 +151,8 @@ class EnginePool:
             self.workers.append(worker)
         print(f"All {num_engines} engines ready.\n")
 
-    def submit(self, key: tuple, fen: str, move_uci: str):
-        self.work_queue.put((key, fen, move_uci))
+    def submit(self, key: tuple, fen: str, move_uci: str, is_winning_move: bool):
+        self.work_queue.put((key, fen, move_uci, is_winning_move))
 
     def get_completed_count(self) -> int:
         with self.count_lock:
@@ -168,7 +180,7 @@ class EnginePool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate dataset with refined mate-in-n win percentages"
+        description="Generate dataset with mate-in-n information for extreme win% moves"
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--stockfish", type=str, default=DEFAULT_STOCKFISH_PATH)
@@ -185,7 +197,7 @@ def main():
     input_path = Path(input_path)
 
     print("=" * 60)
-    print("MATE-REFINED DATASET GENERATION")
+    print("MATE DEPTH DATASET GENERATION")
     print("=" * 60)
     print(f"Input: {input_path}")
     print(f"Output: {args.output}")
@@ -209,7 +221,7 @@ def main():
         print(f"Sampling {args.num_positions:,} positions (seed={args.seed})...")
         dataset = dataset.shuffle(seed=args.seed).select(range(args.num_positions))
 
-    # Convert to plain Python lists (batch loading for speed)
+    # Convert to plain Python lists
     print("Loading into memory...")
     num_positions = len(dataset)
     fens = []
@@ -227,71 +239,69 @@ def main():
     print(f"Loaded {num_positions:,} positions into memory\n")
 
     # =========================================================
-    # Phase 1: Identify mate positions and remap non-mate positions
+    # Phase 1: Identify positions with extreme win probability moves
     # =========================================================
-    print("Phase 1: Scanning for mate candidates and remapping...")
-
-    # Output arrays
-    output_p_wins: list[list[float]] = []
+    print("Phase 1: Scanning for mate candidate moves...")
 
     # Track positions needing Stockfish analysis
-    mate_positions: list[int] = []  # indices of positions with mate candidates
-    mate_moves: list[list[tuple[int, str, bool]]] = []  # [(move_idx, move_uci, is_winning), ...]
+    # mate_candidates[pos_idx] = [(move_idx, move_uci, is_winning), ...]
+    mate_candidates: dict[int, list[tuple[int, str, bool]]] = {}
 
+    total_mate_moves = 0
     for i in tqdm(range(num_positions), desc="Scanning positions"):
         p_wins = p_wins_list[i]
         moves = moves_list[i]
 
-        # Check for mate candidates
-        position_mate_moves = []
+        position_mates = []
         for move_idx, p_win in enumerate(p_wins):
-            if p_win >= WIN_THRESHOLD or p_win <= LOSS_THRESHOLD:
-                position_mate_moves.append((move_idx, moves[move_idx], p_win >= WIN_THRESHOLD))
+            if p_win >= WIN_THRESHOLD:
+                position_mates.append((move_idx, moves[move_idx], True))
+            elif p_win <= LOSS_THRESHOLD:
+                position_mates.append((move_idx, moves[move_idx], False))
 
-        if position_mate_moves:
-            # Has mate candidates - will process with Stockfish later
-            mate_positions.append(i)
-            mate_moves.append(position_mate_moves)
-            output_p_wins.append(None)  # Placeholder, will fill in later
-        else:
-            # No mate candidates - just remap
-            output_p_wins.append([0.02 + p * 0.96 for p in p_wins])
+        if position_mates:
+            mate_candidates[i] = position_mates
+            total_mate_moves += len(position_mates)
 
-    print(f"  Positions with mate candidates: {len(mate_positions):,}")
-    print(f"  Positions without mates: {num_positions - len(mate_positions):,}")
-    print(f"  Mate ratio: {len(mate_positions) / num_positions * 100:.1f}%\n")
+    print(f"  Positions with mate candidates: {len(mate_candidates):,}")
+    print(f"  Total moves to analyze: {total_mate_moves:,}")
+    print(f"  Mate position ratio: {len(mate_candidates) / num_positions * 100:.1f}%\n")
 
     # =========================================================
-    # Phase 2: Stockfish analysis for mate positions
+    # Phase 2: Stockfish analysis for mate depths
     # =========================================================
-    if mate_positions:
-        print("Phase 2: Analyzing mate positions with Stockfish...")
+    # Initialize mate arrays (0 = not a forced mate)
+    mate_depths: list[list[int]] = [[0] * len(moves_list[i]) for i in range(num_positions)]
+
+    if mate_candidates:
+        print("Phase 2: Analyzing mate depths with Stockfish...")
 
         # Collect all work items
-        # Key: (mate_pos_idx, move_idx) -> result
-        work_items: list[tuple[tuple[int, int], str, str]] = []
-        for mate_pos_idx, pos_idx in enumerate(mate_positions):
+        work_items: list[tuple[tuple[int, int], str, str, bool]] = []
+        for pos_idx, candidates in mate_candidates.items():
             fen = fens[pos_idx]
-            for move_idx, move_uci, _ in mate_moves[mate_pos_idx]:
-                work_items.append(((mate_pos_idx, move_idx), fen, move_uci))
+            for move_idx, move_uci, is_winning in candidates:
+                work_items.append(((pos_idx, move_idx), fen, move_uci, is_winning))
 
-        print(f"  Total moves to analyze: {len(work_items):,}")
+        print(f"  Submitting {len(work_items):,} moves for analysis...")
 
-        # Submit all work and show progress
         with EnginePool(args.stockfish, args.num_engines) as pool:
             total_work = len(work_items)
-            with tqdm(total=total_work, desc="Analyzing moves") as pbar:
-                # Submit work, updating progress periodically
-                for i, (key, fen, move_uci) in enumerate(work_items):
-                    pool.submit(key, fen, move_uci)
-                    if i % 1000 == 0:
-                        pbar.n = pool.get_completed_count()
-                        pbar.refresh()
 
-                # Wait for remaining work
+            for key, fen, move_uci, is_winning in work_items:
+                pool.submit(key, fen, move_uci, is_winning)
+
+            start_time = time.time()
+            with tqdm(total=total_work, desc="Analyzing moves") as pbar:
                 while True:
                     completed = pool.get_completed_count()
                     pbar.n = completed
+
+                    elapsed = time.time() - start_time
+                    if elapsed > 0 and completed > 0:
+                        rate = completed / elapsed
+                        pbar.set_postfix({"rate": f"{rate:.0f}/s"})
+
                     pbar.refresh()
                     if completed >= total_work:
                         break
@@ -299,51 +309,31 @@ def main():
 
             analysis_results = pool.wait_and_get_results()
 
-        print("  Building results...")
+        print("  Populating mate depths...")
 
-        # Fill in mate positions
-        for mate_pos_idx, pos_idx in enumerate(tqdm(mate_positions, desc="Assembling")):
-            p_wins = p_wins_list[pos_idx]
-            fen = fens[pos_idx]
-            mate_move_info = {m[0]: (m[1], m[2]) for m in mate_moves[mate_pos_idx]}  # move_idx -> (move_uci, is_winning)
+        # Fill in mate depths from analysis
+        confirmed_mates = 0
+        for (pos_idx, move_idx), mate_depth in analysis_results.items():
+            mate_depths[pos_idx][move_idx] = mate_depth
+            if mate_depth != 0:
+                confirmed_mates += 1
 
-            new_p_wins = []
-            for move_idx, p_win in enumerate(p_wins):
-                if move_idx in mate_move_info:
-                    move_uci, is_winning_move = mate_move_info[move_idx]
-                    result = analysis_results.get((mate_pos_idx, move_idx))
-                    if result is not None:
-                        is_winning, mate_in_n = result
-                        new_winrate = compute_mate_winrate(mate_in_n, is_winning)
-                    else:
-                        new_winrate = 0.98 if is_winning_move else 0.02
-
-                    # Sanity check: new winrate should be on same side of 50% as original
-                    original_above_50 = p_win >= 0.5
-                    new_above_50 = new_winrate >= 0.5
-                    if original_above_50 != new_above_50:
-                        raise ValueError(
-                            f"Win rate crossed 50% boundary! "
-                            f"FEN: {fen}, Move: {move_uci}, "
-                            f"Original: {p_win:.4f}, New: {new_winrate:.4f}"
-                        )
-
-                    new_p_wins.append(new_winrate)
-                else:
-                    new_p_wins.append(0.02 + p_win * 0.96)
-
-            output_p_wins[pos_idx] = new_p_wins
-
-    print()
+        print(f"  Confirmed mates: {confirmed_mates:,} / {total_mate_moves:,}")
+        print(f"  Confirmation rate: {confirmed_mates / total_mate_moves * 100:.1f}%\n")
 
     # =========================================================
     # Phase 3: Save output
     # =========================================================
     print("Phase 3: Saving output...")
 
-    # Build final dataset
+    # Build final dataset - keep p_win unchanged, add mate depths
     output_data = [
-        {"fen": fens[i], "moves": list(moves_list[i]), "p_win": output_p_wins[i]}
+        {
+            "fen": fens[i],
+            "moves": list(moves_list[i]),
+            "p_win": list(p_wins_list[i]),  # Unchanged from source
+            "mate": mate_depths[i],  # New field: mate depth for each move
+        }
         for i in tqdm(range(num_positions), desc="Building dataset")
     ]
 

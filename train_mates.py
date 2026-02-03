@@ -50,8 +50,10 @@ class TrackingTrainer(Trainer):
         self._last_total_loss: Optional[float] = None
         self._last_move_winrate_loss: Optional[float] = None
         self._last_illegality_loss: Optional[float] = None
+        self._last_mate_loss: Optional[float] = None
         self._last_top1_agreement: Optional[float] = None
         self._last_value_mae: Optional[float] = None
+        self._last_mate_accuracy: Optional[float] = None
 
     def compute_loss(self, model, inputs, return_outputs: bool = False, num_items_in_batch: Optional[int] = None):
         inputs['training_step'] = self.state.global_step
@@ -67,13 +69,18 @@ class TrackingTrainer(Trainer):
             ("winrate_loss", "_last_winrate_loss"),
             ("move_winrate_loss", "_last_move_winrate_loss"),
             ("illegality_loss", "_last_illegality_loss"),
+            ("mate_loss", "_last_mate_loss"),
         ]:
             val = getattr(outputs, name, None)
             if val is not None:
                 weight = float(getattr(model, f"{name}_weight", 1.0))
                 setattr(self, attr, float(val.detach().item()) / weight if weight > 0 else float(val.detach().item()))
 
-        for name, attr in [("top1_agreement", "_last_top1_agreement"), ("value_mae", "_last_value_mae")]:
+        for name, attr in [
+            ("top1_agreement", "_last_top1_agreement"),
+            ("value_mae", "_last_value_mae"),
+            ("mate_accuracy", "_last_mate_accuracy"),
+        ]:
             val = getattr(outputs, name, None)
             setattr(self, attr, float(val.detach().item()) if val is not None else None)
 
@@ -88,8 +95,10 @@ class TrackingTrainer(Trainer):
                 ("_last_winrate_loss", "winrate_loss"),
                 ("_last_move_winrate_loss", "move_winrate_loss"),
                 ("_last_illegality_loss", "illegality_loss"),
+                ("_last_mate_loss", "mate_loss"),
                 ("_last_top1_agreement", "top1_agreement"),
                 ("_last_value_mae", "value_mae"),
+                ("_last_mate_accuracy", "mate_accuracy"),
             ]:
                 val = getattr(self, attr, None)
                 if val is not None:
@@ -185,7 +194,7 @@ def train_mates(run_name: Optional[str] = None) -> None:
         output_dir=OUTPUT_DIR,
         num_train_epochs=3,
         per_device_train_batch_size=1024,
-        learning_rate=1e-5,
+        learning_rate=2e-5,
         warmup_steps=300,
         weight_decay=0.01,
         max_grad_norm=1.0,
