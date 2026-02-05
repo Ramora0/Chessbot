@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import queue
 import shutil
 import threading
 import time
@@ -40,9 +39,8 @@ DEFAULT_NUM_POSITIONS = 2_000_000
 DEFAULT_SEED = 42
 DEFAULT_NUM_ENGINES = 40
 
-# Depth 6 is sufficient to detect mate-in-4 (8 plies after our move = 6 plies remaining)
-# Since we classify mate_in_4_plus as a single bucket, no need for deeper search
-MATE_SEARCH_DEPTH = 6
+# Time limit per position in seconds
+MATE_SEARCH_TIME = 0.005
 
 WIN_THRESHOLD = 0.9999
 LOSS_THRESHOLD = 0.0001
@@ -51,13 +49,12 @@ LOSS_THRESHOLD = 0.0001
 class EngineWorker(threading.Thread):
     """Worker thread that owns a single Stockfish engine."""
 
-    def __init__(self, stockfish_path: str, work_queue: queue.Queue, results: dict, lock: threading.Lock, pool: "EnginePool"):
+    def __init__(self, stockfish_path: str, pool: "EnginePool", results: dict, lock: threading.Lock, pool_ref: "EnginePool"):
         super().__init__(daemon=True)
         self.stockfish_path = stockfish_path
-        self.work_queue = work_queue
+        self.pool = pool
         self.results = results
         self.lock = lock
-        self.pool = pool
         self.engine: Optional[chess.engine.SimpleEngine] = None
 
     def run(self):
@@ -65,9 +62,8 @@ class EngineWorker(threading.Thread):
         self.engine.configure({"Threads": 1})
 
         while True:
-            item = self.work_queue.get()
+            item = self.pool.get_next_work()
             if item is None:
-                self.work_queue.task_done()
                 break
 
             key, fen, move_uci, is_winning_move = item
@@ -77,8 +73,6 @@ class EngineWorker(threading.Thread):
                 self.results[key] = result
             with self.pool.count_lock:
                 self.pool.completed_count += 1
-
-            self.work_queue.task_done()
 
         self.engine.quit()
 
@@ -105,7 +99,7 @@ class EngineWorker(threading.Thread):
 
             info = self.engine.analyse(
                 board,
-                chess.engine.Limit(depth=MATE_SEARCH_DEPTH)
+                chess.engine.Limit(time=MATE_SEARCH_TIME)
             )
 
             score = info.get("score")
@@ -136,38 +130,52 @@ class EngineWorker(threading.Thread):
 class EnginePool:
     """Pool of Stockfish engine workers."""
 
-    def __init__(self, stockfish_path: str, num_engines: int):
-        self.work_queue: queue.Queue = queue.Queue()
+    def __init__(self, stockfish_path: str, num_engines: int, work_items: list = None):
         self.results: dict = {}
         self.lock = threading.Lock()
         self.completed_count = 0
         self.count_lock = threading.Lock()
         self.workers: list[EngineWorker] = []
 
-        print(f"Starting {num_engines} Stockfish engines...")
-        for _ in tqdm(range(num_engines), desc="Initializing engines"):
-            worker = EngineWorker(stockfish_path, self.work_queue, self.results, self.lock, self)
+        # Use shared list + atomic index instead of queue (no per-item locking)
+        self.work_items = work_items or []
+        self.work_index = 0
+        self.index_lock = threading.Lock()
+        self.num_engines = num_engines
+        self.stockfish_path = stockfish_path
+
+    def start_workers(self):
+        """Start worker threads after work items are populated."""
+        print(f"Starting {self.num_engines} Stockfish engines...")
+        for _ in tqdm(range(self.num_engines), desc="Initializing engines"):
+            worker = EngineWorker(self.stockfish_path, self, self.results, self.lock, self)
             worker.start()
             self.workers.append(worker)
-        print(f"All {num_engines} engines ready.\n")
+        print(f"All {self.num_engines} engines ready.\n")
 
-    def submit(self, key: tuple, fen: str, move_uci: str, is_winning_move: bool):
-        self.work_queue.put((key, fen, move_uci, is_winning_move))
+    def get_next_work(self):
+        """Get next work item (lock-free for reads, minimal lock for index update)."""
+        with self.index_lock:
+            idx = self.work_index
+            if idx >= len(self.work_items):
+                return None
+            self.work_index += 1
+        return self.work_items[idx]
 
     def get_completed_count(self) -> int:
         with self.count_lock:
             return self.completed_count
 
     def wait_and_get_results(self) -> dict:
-        self.work_queue.join()
+        for worker in self.workers:
+            worker.join()
         with self.lock:
             results = dict(self.results)
             self.results.clear()
         return results
 
     def shutdown(self):
-        for _ in self.workers:
-            self.work_queue.put(None)
+        # Workers exit when get_next_work returns None
         for worker in self.workers:
             worker.join()
 
@@ -283,13 +291,11 @@ def main():
             for move_idx, move_uci, is_winning in candidates:
                 work_items.append(((pos_idx, move_idx), fen, move_uci, is_winning))
 
-        print(f"  Submitting {len(work_items):,} moves for analysis...")
+        print(f"  Queued {len(work_items):,} moves for analysis...")
 
-        with EnginePool(args.stockfish, args.num_engines) as pool:
+        with EnginePool(args.stockfish, args.num_engines, work_items) as pool:
             total_work = len(work_items)
-
-            for key, fen, move_uci, is_winning in work_items:
-                pool.submit(key, fen, move_uci, is_winning)
+            pool.start_workers()
 
             start_time = time.time()
             with tqdm(total=total_work, desc="Analyzing moves") as pbar:
