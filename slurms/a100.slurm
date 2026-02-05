@@ -27,10 +27,14 @@ echo "Cloning branch '$BRANCH' to local storage..."
 echo "Job ID: $SLURM_JOB_ID"
 echo "================================================"
 
+# Get remote URL from local repo, then clone from remote
+# This ensures we can access all pushed branches, not just local ones
+REMOTE_URL=$(git -C "$HOME/personal/Chessbot" remote get-url origin)
+
 # Clone specific branch directly into isolated temp directory
 # Uses --single-branch for efficiency (only fetches needed branch)
 git clone --branch "$BRANCH" --single-branch --depth 1 \
-    "$HOME/personal/Chessbot" "$CODE_LOCAL"
+    "$REMOTE_URL" "$CODE_LOCAL"
 
 echo "Clone complete. Branch: $(cd "$CODE_LOCAL" && git branch --show-current)"
 echo "Commit: $(cd "$CODE_LOCAL" && git rev-parse --short HEAD)"
@@ -55,11 +59,11 @@ time cp -r "$DATASET_SOURCE/"* "$DATASET_LOCAL/"
 echo "Dataset copy complete. Size:"
 du -sh "$DATASET_LOCAL"
 
+# Activate python env from original location (not cloned)
+source "$HOME/personal/Chessbot/.a100/bin/activate"
+
 # Go to local code copy
 cd "$CODE_LOCAL"
-
-# Your python env
-source .a100/bin/activate
 
 # Run training with local dataset path
 export DATASET_PATH="$DATASET_LOCAL"
