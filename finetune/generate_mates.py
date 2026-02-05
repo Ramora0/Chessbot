@@ -42,7 +42,6 @@ DEFAULT_OUTPUT_PATH = Path("/fs/scratch/PAS2836/lees_stuff/searchless_mates")
 DEFAULT_STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
 
 DEFAULT_NUM_POSITIONS = 2_000_000
-DEFAULT_SEED = 42
 DEFAULT_NUM_ENGINES = 40
 
 # Time limit per position in seconds
@@ -199,7 +198,6 @@ def main():
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--stockfish", type=str, default=DEFAULT_STOCKFISH_PATH)
     parser.add_argument("--num-positions", type=int, default=DEFAULT_NUM_POSITIONS)
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--num-engines", type=int, default=DEFAULT_NUM_ENGINES)
 
     args = parser.parse_args()
@@ -227,13 +225,14 @@ def main():
     # =========================================================
     # Load dataset (memory-mapped, not loaded into RAM)
     # =========================================================
+    t0 = time.time()
     print(f"Loading dataset from {input_path}...")
     dataset = load_from_disk(str(input_path))
-    print(f"Dataset has {len(dataset):,} positions")
+    print(f"Dataset has {len(dataset):,} positions ({time.time() - t0:.1f}s)")
 
     if len(dataset) > args.num_positions:
-        print(f"Sampling {args.num_positions:,} positions (seed={args.seed})...")
-        dataset = dataset.shuffle(seed=args.seed).select(range(args.num_positions))
+        print(f"Selecting first {args.num_positions:,} positions (dataset pre-shuffled)...")
+        dataset = dataset.select(range(args.num_positions))
 
     num_positions = len(dataset)
     print(f"Processing {num_positions:,} positions\n")
@@ -316,26 +315,44 @@ def main():
 
     # Build final dataset - read from dataset, lookup mate depths from sparse results
     output_data = []
-    for i in tqdm(range(num_positions), desc="Building dataset", leave=True):
-        row = dataset[i]
-        num_moves = len(row["moves"])
-        # Build mate array: lookup from results, default to 0
-        mate = [analysis_results.get((i, m), 0) for m in range(num_moves)]
-        output_data.append({
-            "fen": row["fen"],
-            "moves": list(row["moves"]),
-            "p_win": list(row["p_win"]),
-            "mate": mate,
-        })
+    time_iter = 0.0
+    time_build = 0.0
+    iter_start = time.time()
+    pbar = tqdm(dataset.iter(batch_size=batch_size),
+                total=(num_positions + batch_size - 1) // batch_size,
+                desc="Building dataset", leave=True)
+    global_idx = 0
+    for batch in pbar:
+        time_iter += time.time() - iter_start
+        build_start = time.time()
+        for fen, moves, p_wins in zip(batch["fen"], batch["moves"], batch["p_win"]):
+            num_moves = len(moves)
+            mate = [analysis_results.get((global_idx, m), 0) for m in range(num_moves)]
+            output_data.append({
+                "fen": fen,
+                "moves": list(moves),
+                "p_win": list(p_wins),
+                "mate": mate,
+            })
+            global_idx += 1
+        time_build += time.time() - build_start
+        pbar.set_postfix({"iter": f"{time_iter:.1f}s", "build": f"{time_build:.1f}s"})
+        iter_start = time.time()
 
     if args.output.exists():
         print(f"Removing existing output at {args.output}")
         shutil.rmtree(args.output)
 
-    print(f"Saving {len(output_data):,} positions to {args.output}...")
+    t0 = time.time()
+    print(f"Creating Dataset from list...")
     output_dataset = Dataset.from_list(output_data)
+    print(f"  from_list: {time.time() - t0:.1f}s")
+
+    t0 = time.time()
+    print(f"Saving {len(output_data):,} positions to {args.output}...")
     args.output.mkdir(parents=True, exist_ok=True)
     output_dataset.save_to_disk(str(args.output))
+    print(f"  save_to_disk: {time.time() - t0:.1f}s")
 
     print("\nDone!")
     return 0
