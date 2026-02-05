@@ -22,6 +22,240 @@ from loss_weights import (
 )
 
 
+class ChessRelativePositionEmbedding(nn.Module):
+    """Chess-aware relative position embeddings with full Q, K, V biases.
+
+    Board positions (0-63) use 2D relative coordinates (rank_diff, file_diff).
+    Metadata positions (64-71) use special global embeddings.
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        board_size: int = 64,
+        max_seq_len: int = 72,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.board_size = board_size
+        self.max_seq_len = max_seq_len
+
+        # Board-to-board: 15x15 = 225 unique (rank_diff, file_diff) pairs
+        # rank_diff and file_diff each range from -7 to +7
+        self.rel_query_board = nn.Embedding(225, num_heads * head_dim)
+        self.rel_key_board = nn.Embedding(225, num_heads * head_dim)
+        self.rel_value_board = nn.Embedding(225, num_heads * head_dim)
+
+        # Metadata relationships: 3 types
+        # 0: board-to-metadata, 1: metadata-to-board, 2: metadata-to-metadata
+        self.rel_query_meta = nn.Embedding(3, num_heads * head_dim)
+        self.rel_key_meta = nn.Embedding(3, num_heads * head_dim)
+        self.rel_value_meta = nn.Embedding(3, num_heads * head_dim)
+
+        # Initialize with small values for stability
+        nn.init.normal_(self.rel_query_board.weight, std=0.02)
+        nn.init.normal_(self.rel_key_board.weight, std=0.02)
+        nn.init.normal_(self.rel_value_board.weight, std=0.02)
+        nn.init.normal_(self.rel_query_meta.weight, std=0.02)
+        nn.init.normal_(self.rel_key_meta.weight, std=0.02)
+        nn.init.normal_(self.rel_value_meta.weight, std=0.02)
+
+        # Precompute relative position indices (fixed for chess board)
+        self._precompute_indices()
+
+    def _precompute_indices(self):
+        """Precompute relative position index matrix."""
+        seq_len = self.max_seq_len
+
+        # Board indices: convert (rank_diff, file_diff) to single index
+        # rank_diff + 7 gives 0-14, file_diff + 7 gives 0-14
+        # index = (rank_diff + 7) * 15 + (file_diff + 7)
+        board_indices = torch.zeros(self.board_size, self.board_size, dtype=torch.long)
+        for i in range(self.board_size):
+            rank_i, file_i = i // 8, i % 8
+            for j in range(self.board_size):
+                rank_j, file_j = j // 8, j % 8
+                rank_diff = rank_j - rank_i + 7  # 0-14
+                file_diff = file_j - file_i + 7  # 0-14
+                board_indices[i, j] = rank_diff * 15 + file_diff
+
+        # Full index matrix: separate board and metadata regions
+        rel_indices = torch.zeros(seq_len, seq_len, dtype=torch.long)
+        rel_indices[:self.board_size, :self.board_size] = board_indices
+
+        # Metadata type indices (stored separately)
+        meta_type_indices = torch.zeros(seq_len, seq_len, dtype=torch.long)
+        meta_type_indices[:self.board_size, self.board_size:] = 0  # board-to-meta
+        meta_type_indices[self.board_size:, :self.board_size] = 1  # meta-to-board
+        meta_type_indices[self.board_size:, self.board_size:] = 2  # meta-to-meta
+
+        # Mask to distinguish board-board from metadata interactions
+        is_board_board = torch.zeros(seq_len, seq_len, dtype=torch.bool)
+        is_board_board[:self.board_size, :self.board_size] = True
+
+        self.register_buffer('rel_indices', rel_indices)
+        self.register_buffer('meta_type_indices', meta_type_indices)
+        self.register_buffer('is_board_board', is_board_board)
+
+    def get_bias_matrices(self, seq_len: int, device: torch.device):
+        """Get relative position bias matrices for queries, keys, and values.
+
+        Returns:
+            rel_query_bias: [seq_len, seq_len, num_heads, head_dim]
+            rel_key_bias: [seq_len, seq_len, num_heads, head_dim]
+            rel_value_bias: [seq_len, seq_len, num_heads, head_dim]
+        """
+        # Clamp seq_len to max
+        seq_len = min(seq_len, self.max_seq_len)
+
+        # Get indices for this sequence length
+        rel_idx = self.rel_indices[:seq_len, :seq_len]
+        meta_idx = self.meta_type_indices[:seq_len, :seq_len]
+        is_bb = self.is_board_board[:seq_len, :seq_len]
+
+        # Gather board-board embeddings
+        board_query = self.rel_query_board(rel_idx)  # [seq, seq, num_heads * head_dim]
+        board_key = self.rel_key_board(rel_idx)
+        board_value = self.rel_value_board(rel_idx)
+
+        # Gather metadata embeddings
+        meta_query = self.rel_query_meta(meta_idx)
+        meta_key = self.rel_key_meta(meta_idx)
+        meta_value = self.rel_value_meta(meta_idx)
+
+        # Combine: use board embeddings for board-board, meta for rest
+        is_bb_expanded = is_bb.unsqueeze(-1)  # [seq, seq, 1]
+        rel_query_bias = torch.where(is_bb_expanded, board_query, meta_query)
+        rel_key_bias = torch.where(is_bb_expanded, board_key, meta_key)
+        rel_value_bias = torch.where(is_bb_expanded, board_value, meta_value)
+
+        # Reshape to [seq, seq, num_heads, head_dim]
+        rel_query_bias = rel_query_bias.view(seq_len, seq_len, self.num_heads, self.head_dim)
+        rel_key_bias = rel_key_bias.view(seq_len, seq_len, self.num_heads, self.head_dim)
+        rel_value_bias = rel_value_bias.view(seq_len, seq_len, self.num_heads, self.head_dim)
+
+        return rel_query_bias, rel_key_bias, rel_value_bias
+
+
+def relative_position_attention_forward(
+    query: torch.Tensor,          # [batch, num_heads, seq_len, head_dim]
+    key: torch.Tensor,            # [batch, num_heads, seq_len, head_dim]
+    value: torch.Tensor,          # [batch, num_heads, seq_len, head_dim]
+    rel_query_bias: torch.Tensor, # [seq_len, seq_len, num_heads, head_dim]
+    rel_key_bias: torch.Tensor,   # [seq_len, seq_len, num_heads, head_dim]
+    rel_value_bias: torch.Tensor, # [seq_len, seq_len, num_heads, head_dim]
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    training: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Attention with full Q, K, V relative position representations.
+
+    e_ij = (q_i + a_ij^Q) @ (k_j + a_ij^K)^T * scale
+         = (q_i @ k_j^T + q_i @ a_ij^K + a_ij^Q @ k_j^T + a_ij^Q @ a_ij^K) * scale
+    z_i = sum_j softmax(e_ij) * (v_j + a_ij^V)
+    """
+    batch_size, num_heads, seq_len, head_dim = query.shape
+
+    # Permute bias tensors for efficient computation: [heads, seq_q, seq_k, dim]
+    rel_query_bias_t = rel_query_bias.permute(2, 0, 1, 3)
+    rel_key_bias_t = rel_key_bias.permute(2, 0, 1, 3)
+    rel_value_bias_t = rel_value_bias.permute(2, 0, 1, 3)
+
+    # Term 1: q_i @ k_j^T (standard attention)
+    # [batch, heads, seq_q, dim] @ [batch, heads, dim, seq_k] -> [batch, heads, seq_q, seq_k]
+    attn_scores = torch.matmul(query, key.transpose(-2, -1))
+
+    # Term 2: q_i @ a_ij^K (query to key-bias)
+    # [batch, heads, seq_q, dim] einsum [heads, seq_q, seq_k, dim] -> [batch, heads, seq_q, seq_k]
+    term2 = torch.einsum('bhqd,hqkd->bhqk', query, rel_key_bias_t)
+    attn_scores = attn_scores + term2
+
+    # Term 3: a_ij^Q @ k_j^T (query-bias to key)
+    # [heads, seq_q, seq_k, dim] einsum [batch, heads, seq_k, dim] -> [batch, heads, seq_q, seq_k]
+    term3 = torch.einsum('hqkd,bhkd->bhqk', rel_query_bias_t, key)
+    attn_scores = attn_scores + term3
+
+    # Term 4: a_ij^Q @ a_ij^K (bias to bias - position-only attention)
+    # [heads, seq_q, seq_k, dim] einsum [heads, seq_q, seq_k, dim] -> [heads, seq_q, seq_k]
+    # This is a fixed bias matrix (independent of input), broadcast to batch
+    term4 = torch.einsum('hqkd,hqkd->hqk', rel_query_bias_t, rel_key_bias_t)
+    attn_scores = attn_scores + term4.unsqueeze(0)  # [1, heads, seq_q, seq_k]
+
+    # Apply scaling
+    attn_scores = attn_scores * scaling
+
+    # Apply attention mask
+    if attention_mask is not None:
+        attn_scores = attn_scores + attention_mask
+
+    # Softmax
+    attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    if dropout > 0.0 and training:
+        attn_weights = F.dropout(attn_weights, p=dropout, training=True)
+
+    # Standard attention output: attn_weights @ V
+    attn_output = torch.matmul(attn_weights, value)  # [batch, heads, seq_q, dim]
+
+    # Relative position value bias term: attn_weights @ a_ij^V
+    rel_value_output = torch.einsum('bhqk,hqkd->bhqd', attn_weights, rel_value_bias_t)
+    attn_output = attn_output + rel_value_output
+
+    # Transpose for output projection: [batch, seq, heads, dim]
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
+def make_relative_attention_forward(rel_pos_emb: ChessRelativePositionEmbedding):
+    """Create a patched attention forward that uses full Q, K, V relative positions."""
+
+    def forward_with_relative_pos(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values=None,
+        cache_position=None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        # NOTE: RoPE is disabled, so we skip apply_rotary_pos_emb
+        # Full Q, K, V relative position bias is computed here instead
+
+        seq_len = hidden_states.size(1)
+        rel_query_bias, rel_key_bias, rel_value_bias = rel_pos_emb.get_bias_matrices(
+            seq_len, hidden_states.device
+        )
+
+        attn_output, attn_weights = relative_position_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            rel_query_bias,
+            rel_key_bias,
+            rel_value_bias,
+            attention_mask,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            training=self.training,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+    return forward_with_relative_pos
+
+
 class MultiTaskAttentionPooling(nn.Module):
     """Multi-task attention pooling with shared K/V projections.
 
@@ -143,14 +377,20 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self._disable_rope()
         hidden_size = config.hidden_size
 
-        # Learned positional embeddings for all tokens
-        # Tokens 0-63: board positions (a8, b8, ..., h1)
-        # Token 64: turn (w/b)
-        # Tokens 65-68: castling rights (K, Q, k, q)
-        # Token 69: en passant square
-        # Token 70: halfmove clock
-        # Token 71: fullmove number
-        self.position_embeddings = nn.Embedding(72, hidden_size)
+        # Relative position embeddings with full Q, K, V biases
+        # Board positions (0-63) use 2D relative coordinates (rank_diff, file_diff)
+        # Metadata positions (64-71) use special global embeddings
+        num_heads = config.num_attention_heads
+        head_dim = hidden_size // num_heads
+        self.rel_pos_emb = ChessRelativePositionEmbedding(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            board_size=64,
+            max_seq_len=72,
+        )
+
+        # Replace attention forward in all layers to use relative position embeddings
+        self._install_relative_attention()
 
         # Multi-task attention pooling (shared K/V, task-specific queries)
         # Winrate head predicts win% in 128 bins (0.0 to 1.0)
@@ -192,6 +432,17 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
     # type: ignore[override]
     def load_state_dict(self, state_dict, strict: bool = False):
+        # Handle legacy checkpoints with absolute position embeddings
+        legacy_key = 'position_embeddings.weight'
+        if legacy_key in state_dict:
+            print("Warning: Ignoring legacy absolute position embeddings from checkpoint")
+            del state_dict[legacy_key]
+
+        # Check for new relative position keys
+        rel_pos_keys = [k for k in state_dict if 'rel_pos_emb' in k]
+        if not rel_pos_keys:
+            print("Note: Checkpoint has no relative position embeddings, using random initialization")
+
         result = super().load_state_dict(state_dict, strict=strict)
 
         missing = list(getattr(result, "missing_keys", ()))
@@ -261,13 +512,21 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             block.self_attn.is_causal = False
 
     def _disable_rope(self) -> None:
-        """Disable rotary position embeddings - we use learned positional embeddings instead."""
+        """Disable rotary position embeddings - we use relative position embeddings instead."""
         import transformers.models.llama.modeling_llama as llama_module
 
         def no_op_rotary(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
             return q, k  # Return unchanged
 
         llama_module.apply_rotary_pos_emb = no_op_rotary
+
+    def _install_relative_attention(self) -> None:
+        """Replace LlamaAttention forward methods to use relative position embeddings."""
+        import types
+
+        new_forward = make_relative_attention_forward(self.rel_pos_emb)
+        for block in self.transformer.layers:
+            block.self_attn.forward = types.MethodType(new_forward, block.self_attn)
 
     def forward(
         self,
@@ -288,17 +547,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         # Convert input_ids to embeddings
         batch_size = input_ids.size(0)
         input_embeds = self.transformer.embed_tokens(input_ids)
-        original_seq_len = input_embeds.size(1)
 
-        # Add learned positional embeddings to all tokens
-        # This allows the model to instantly know each token's position (e.g., knight on f1 = position 61)
-        position_ids = torch.arange(
-            original_seq_len, dtype=torch.long, device=input_ids.device)
-        position_ids = position_ids.unsqueeze(0).expand(
-            batch_size, -1)  # [batch_size, seq_len]
-        position_embeds = self.position_embeddings(
-            position_ids)  # [batch_size, seq_len, hidden_size]
-        input_embeds = input_embeds + position_embeds
+        # Relative position embeddings are now handled inside attention layers
+        # via ChessRelativePositionEmbedding (no absolute position embedding addition)
 
         # Process all tokens through transformer
         transformer_outputs = self.transformer(
