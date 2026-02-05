@@ -2,24 +2,25 @@
 """
 Generate dataset with mate-in-n information for extreme win probability moves.
 
+Processes the dataset shard-by-shard, maintaining 1-1 correspondence with input shards.
+Each shard is saved independently, allowing resume after interruption.
+
 Keeps original win percentages unchanged and adds mate depth information:
 - mate[i] > 0: Move leads to mate in N moves (winning)
 - mate[i] < 0: Move leads to getting mated in N moves (losing)
 - mate[i] = 0: Not a forced mate (or not analyzed)
 
 Only moves with p_win >= 0.9999 or p_win <= 0.0001 are analyzed for mate depth.
-
-The model classifies into 5 classes: no_mate, mate_in_1, mate_in_2, mate_in_3, mate_in_4_plus.
-Depth 6 search is sufficient since mate_in_4+ is our coarsest bucket.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing as mp
 import os
-import shutil
 import time
+from glob import glob
 from pathlib import Path
 
 import chess
@@ -33,8 +34,6 @@ from tqdm import tqdm
 
 DEFAULT_OUTPUT_PATH = Path("/fs/scratch/PAS2836/lees_stuff/searchless_mates")
 DEFAULT_STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
-
-DEFAULT_NUM_POSITIONS = 2_000_000
 DEFAULT_NUM_ENGINES = 40
 
 # Time limit per position in seconds
@@ -88,8 +87,6 @@ def _analyze_move(args: tuple) -> tuple:
         if pov_score.is_mate():
             mate_in = pov_score.mate()
             if mate_in is not None:
-                # mate_in < 0 means opponent getting mated = we win
-                # mate_in > 0 means opponent will mate us = we lose
                 if mate_in < 0:
                     return (key, abs(mate_in))
                 else:
@@ -99,14 +96,102 @@ def _analyze_move(args: tuple) -> tuple:
         return (key, 0)
 
 
+def get_shard_files(dataset_path: Path) -> list[Path]:
+    """Get list of Arrow shard files from a HuggingFace dataset directory."""
+    # HF datasets store data as data-00000-of-00500.arrow files
+    pattern = str(dataset_path / "data-*.arrow")
+    files = sorted(glob(pattern))
+    if not files:
+        # Fallback: might be named differently
+        pattern = str(dataset_path / "*.arrow")
+        files = sorted(glob(pattern))
+    return [Path(f) for f in files]
+
+
+def process_shard(
+    shard_path: Path,
+    shard_idx: int,
+    output_dir: Path,
+    stockfish_path: str,
+    num_engines: int,
+) -> dict:
+    """Process a single shard of the dataset."""
+    output_path = output_dir / shard_path.with_suffix(".parquet").name
+
+    # Check if shard already complete
+    if output_path.exists():
+        return {"skipped": True}
+
+    # Load just this shard
+    shard_data = Dataset.from_file(str(shard_path))
+    shard_size = len(shard_data)
+
+    # Phase 1: Scan for mate candidates
+    work_items: list[tuple[tuple[int, int], str, str, bool]] = []
+    batch_size = 10000
+
+    local_idx = 0
+    for batch in shard_data.iter(batch_size=batch_size):
+        for fen, moves, p_wins in zip(batch["fen"], batch["moves"], batch["p_win"]):
+            for move_idx, p_win in enumerate(p_wins):
+                if p_win >= WIN_THRESHOLD:
+                    work_items.append(((local_idx, move_idx), fen, moves[move_idx], True))
+                elif p_win <= LOSS_THRESHOLD:
+                    work_items.append(((local_idx, move_idx), fen, moves[move_idx], False))
+            local_idx += 1
+
+    # Phase 2: Stockfish analysis
+    analysis_results: dict[tuple[int, int], int] = {}
+    confirmed_mates = 0
+
+    if work_items:
+        with mp.Pool(num_engines, initializer=_init_worker, initargs=(stockfish_path,)) as pool:
+            for key, mate_depth in tqdm(
+                pool.imap_unordered(_analyze_move, work_items, chunksize=100),
+                total=len(work_items),
+                desc=f"  Shard {shard_idx}",
+                leave=False
+            ):
+                analysis_results[key] = mate_depth
+                if mate_depth != 0:
+                    confirmed_mates += 1
+
+    # Phase 3: Build output
+    output_data = []
+    local_idx = 0
+    for batch in shard_data.iter(batch_size=batch_size):
+        for fen, moves, p_wins in zip(batch["fen"], batch["moves"], batch["p_win"]):
+            num_moves = len(moves)
+            mate = [analysis_results.get((local_idx, m), 0) for m in range(num_moves)]
+            output_data.append({
+                "fen": fen,
+                "moves": list(moves),
+                "p_win": list(p_wins),
+                "mate": mate,
+            })
+            local_idx += 1
+
+    # Save shard as parquet
+    output_dataset = Dataset.from_list(output_data)
+    output_dataset.to_parquet(str(output_path))
+
+    return {
+        "skipped": False,
+        "positions": shard_size,
+        "mate_candidates": len(work_items),
+        "confirmed_mates": confirmed_mates,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate dataset with mate-in-n information for extreme win% moves"
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--stockfish", type=str, default=DEFAULT_STOCKFISH_PATH)
-    parser.add_argument("--num-positions", type=int, default=DEFAULT_NUM_POSITIONS)
     parser.add_argument("--num-engines", type=int, default=DEFAULT_NUM_ENGINES)
+    parser.add_argument("--max-shards", type=int, default=None,
+                        help="Max shards to process (for testing)")
 
     args = parser.parse_args()
 
@@ -122,7 +207,6 @@ def main():
     print(f"Input: {input_path}")
     print(f"Output: {args.output}")
     print(f"Stockfish: {args.stockfish}")
-    print(f"Positions: {args.num_positions:,}")
     print(f"Engines: {args.num_engines}")
     print("=" * 60 + "\n")
 
@@ -130,129 +214,92 @@ def main():
         print(f"ERROR: Stockfish not found at {args.stockfish}")
         return 1
 
-    # =========================================================
-    # Load dataset (memory-mapped, not loaded into RAM)
-    # =========================================================
-    t0 = time.time()
-    print(f"Loading dataset from {input_path}...")
-    dataset = load_from_disk(str(input_path))
-    print(f"Dataset has {len(dataset):,} positions ({time.time() - t0:.1f}s)")
+    # Discover input shards
+    shard_files = get_shard_files(input_path)
+    num_shards = len(shard_files)
 
-    if len(dataset) > args.num_positions:
-        print(f"Selecting first {args.num_positions:,} positions (dataset pre-shuffled)...")
-        dataset = dataset.select(range(args.num_positions))
+    if num_shards == 0:
+        print(f"ERROR: No Arrow shard files found in {input_path}")
+        return 1
 
-    num_positions = len(dataset)
-    print(f"Processing {num_positions:,} positions\n")
+    print(f"Found {num_shards} input shards\n")
 
-    # =========================================================
-    # Phase 1: Scan for mate candidates AND build work items
-    # =========================================================
-    print("Phase 1: Scanning for mate candidate moves...")
+    if args.max_shards:
+        shard_files = shard_files[:args.max_shards]
+        num_shards = len(shard_files)
+        print(f"Processing first {num_shards} shards (--max-shards)\n")
 
-    # Build work items directly while scanning (avoids second pass over dataset)
-    work_items: list[tuple[tuple[int, int], str, str, bool]] = []
-
-    # Batched iteration amortizes Arrow deserialization overhead
-    batch_size = 10000
-    global_idx = 0
-    time_iter = 0.0
-    time_inner = 0.0
-    iter_start = time.time()
-    pbar = tqdm(dataset.iter(batch_size=batch_size),
-                total=(num_positions + batch_size - 1) // batch_size,
-                desc="Scanning positions", leave=True)
-    for batch in pbar:
-        time_iter += time.time() - iter_start
-        inner_start = time.time()
-        for fen, moves, p_wins in zip(batch["fen"], batch["moves"], batch["p_win"]):
-            for move_idx, p_win in enumerate(p_wins):
-                if p_win >= WIN_THRESHOLD:
-                    work_items.append(((global_idx, move_idx), fen, moves[move_idx], True))
-                elif p_win <= LOSS_THRESHOLD:
-                    work_items.append(((global_idx, move_idx), fen, moves[move_idx], False))
-            global_idx += 1
-        time_inner += time.time() - inner_start
-        pbar.set_postfix({"iter": f"{time_iter:.1f}s", "proc": f"{time_inner:.1f}s"})
-        iter_start = time.time()
-
-    print(f"  Total moves to analyze: {len(work_items):,}")
-    print(f"  Avg per position: {len(work_items) / num_positions:.2f}\n")
-
-    # =========================================================
-    # Phase 2: Stockfish analysis for mate depths
-    # =========================================================
-    # Results stored sparsely: analysis_results[(pos_idx, move_idx)] = mate_depth
-    analysis_results: dict[tuple[int, int], int] = {}
-
-    if work_items:
-        print("Phase 2: Analyzing mate depths with Stockfish...")
-        total_work = len(work_items)
-        print(f"  Analyzing {total_work:,} moves with {args.num_engines} processes...")
-
-        # Use multiprocessing Pool - each process has its own Stockfish engine (no GIL contention)
-        confirmed_mates = 0
-        with mp.Pool(args.num_engines, initializer=_init_worker, initargs=(args.stockfish,)) as pool:
-            for key, mate_depth in tqdm(
-                pool.imap_unordered(_analyze_move, work_items, chunksize=100),
-                total=total_work,
-                desc="Analyzing moves",
-                leave=True
-            ):
-                analysis_results[key] = mate_depth
-                if mate_depth != 0:
-                    confirmed_mates += 1
-
-        print(f"  Confirmed mates: {confirmed_mates:,} / {len(work_items):,}")
-        print(f"  Confirmation rate: {confirmed_mates / len(work_items) * 100:.1f}%\n")
-
-    # =========================================================
-    # Phase 3: Save output
-    # =========================================================
-    print("Phase 3: Building output (streaming from dataset)...")
-
-    # Build final dataset - read from dataset, lookup mate depths from sparse results
-    output_data = []
-    time_iter = 0.0
-    time_build = 0.0
-    iter_start = time.time()
-    pbar = tqdm(dataset.iter(batch_size=batch_size),
-                total=(num_positions + batch_size - 1) // batch_size,
-                desc="Building dataset", leave=True)
-    global_idx = 0
-    for batch in pbar:
-        time_iter += time.time() - iter_start
-        build_start = time.time()
-        for fen, moves, p_wins in zip(batch["fen"], batch["moves"], batch["p_win"]):
-            num_moves = len(moves)
-            mate = [analysis_results.get((global_idx, m), 0) for m in range(num_moves)]
-            output_data.append({
-                "fen": fen,
-                "moves": list(moves),
-                "p_win": list(p_wins),
-                "mate": mate,
-            })
-            global_idx += 1
-        time_build += time.time() - build_start
-        pbar.set_postfix({"iter": f"{time_iter:.1f}s", "build": f"{time_build:.1f}s"})
-        iter_start = time.time()
-
-    if args.output.exists():
-        print(f"Removing existing output at {args.output}")
-        shutil.rmtree(args.output)
-
-    t0 = time.time()
-    print(f"Creating Dataset from list...")
-    output_dataset = Dataset.from_list(output_data)
-    print(f"  from_list: {time.time() - t0:.1f}s")
-
-    t0 = time.time()
-    print(f"Saving {len(output_data):,} positions to {args.output}...")
+    # Create output directory
     args.output.mkdir(parents=True, exist_ok=True)
-    output_dataset.save_to_disk(str(args.output))
-    print(f"  save_to_disk: {time.time() - t0:.1f}s")
 
-    print("\nDone!")
+    # Save metadata
+    metadata = {
+        "input_path": str(input_path),
+        "num_shards": num_shards,
+        "win_threshold": WIN_THRESHOLD,
+        "loss_threshold": LOSS_THRESHOLD,
+        "mate_search_time": MATE_SEARCH_TIME,
+    }
+    with open(args.output / "metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    # Process each shard
+    total_stats = {
+        "positions_processed": 0,
+        "positions_skipped": 0,
+        "shards_skipped": 0,
+        "mate_candidates": 0,
+        "confirmed_mates": 0,
+    }
+
+    overall_start = time.time()
+
+    for shard_idx, shard_path in enumerate(shard_files):
+        print(f"Shard {shard_idx}/{num_shards}: {shard_path.name}")
+
+        shard_start = time.time()
+        stats = process_shard(
+            shard_path=shard_path,
+            shard_idx=shard_idx,
+            output_dir=args.output,
+            stockfish_path=args.stockfish,
+            num_engines=args.num_engines,
+        )
+        shard_time = time.time() - shard_start
+
+        if stats["skipped"]:
+            total_stats["shards_skipped"] += 1
+            print(f"  Skipped (already exists)")
+        else:
+            total_stats["positions_processed"] += stats["positions"]
+            total_stats["mate_candidates"] += stats["mate_candidates"]
+            total_stats["confirmed_mates"] += stats["confirmed_mates"]
+
+            # Progress estimate
+            shards_done = shard_idx + 1 - total_stats["shards_skipped"]
+            shards_remaining = num_shards - shard_idx - 1
+            if shards_done > 0:
+                elapsed = time.time() - overall_start
+                time_per_shard = elapsed / shards_done
+                eta_hours = (shards_remaining * time_per_shard) / 3600
+                print(f"  {stats['positions']:,} positions, {stats['confirmed_mates']:,} mates | "
+                      f"{shard_time:.1f}s | ETA: {eta_hours:.1f}h")
+
+        print()
+
+    # Final summary
+    total_time = time.time() - overall_start
+    print("=" * 60)
+    print("COMPLETE")
+    print("=" * 60)
+    print(f"Total time: {total_time / 3600:.2f} hours")
+    print(f"Positions processed: {total_stats['positions_processed']:,}")
+    print(f"Shards skipped: {total_stats['shards_skipped']}")
+    print(f"Mate candidates analyzed: {total_stats['mate_candidates']:,}")
+    print(f"Confirmed mates: {total_stats['confirmed_mates']:,}")
+    print(f"Output: {args.output}")
+    print("=" * 60)
+
     return 0
 
 
