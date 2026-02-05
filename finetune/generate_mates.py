@@ -302,25 +302,20 @@ def main():
                     pbar.n = completed
 
                     elapsed = time.time() - start_time
-                    if elapsed > 0 and completed > 0:
-                        rate = completed / elapsed
-                        pbar.set_postfix({"rate": f"{rate:.0f}/s"})
+                    rate = completed / elapsed if elapsed > 0 and completed > 0 else 0
 
+                    # Collect timing from workers
+                    total_analyse = sum(w.time_analyse for w in pool.workers)
+                    total_calls = sum(w.call_count for w in pool.workers)
+                    ms_per_call = (total_analyse / total_calls * 1000) if total_calls > 0 else 0
+
+                    pbar.set_postfix({"rate": f"{rate:.0f}/s", "analyse": f"{ms_per_call:.1f}ms"})
                     pbar.refresh()
                     if completed >= total_work:
                         break
                     time.sleep(0.1)
 
             analysis_results = pool.wait_and_get_results()
-
-            # Report timing breakdown from workers
-            total_board = sum(w.time_board for w in pool.workers)
-            total_analyse = sum(w.time_analyse for w in pool.workers)
-            total_calls = sum(w.call_count for w in pool.workers)
-            if total_calls > 0:
-                print(f"  Timing breakdown (summed across {args.num_engines} workers):")
-                print(f"    Board setup:    {total_board:.1f}s ({total_board/total_calls*1000:.2f}ms/call)")
-                print(f"    engine.analyse: {total_analyse:.1f}s ({total_analyse/total_calls*1000:.2f}ms/call)")
 
         confirmed_mates = sum(1 for v in analysis_results.values() if v != 0)
         print(f"  Confirmed mates: {confirmed_mates:,} / {len(work_items):,}")
