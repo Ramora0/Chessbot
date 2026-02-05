@@ -25,7 +25,7 @@ from evaluation_regret import evaluate_regret, print_regret_results, NUM_EVAL_PO
 from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 
-OUTPUT_DIR = "/users/PAS2836/leedavis/personal/Chessbot/final-model"
+OUTPUT_DIR = "/users/PAS2836/leedavis/personal/Chessbot/positional-funkiness"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 256  # Board tokens: 72
 DATASET_PATH = os.getenv("DATASET_PATH", "fuck")
@@ -57,7 +57,7 @@ BASE_GAME_EVAL_STEPS = GAME_EVAL_STEPS
 # Set to None to start from scratch
 # RESUME_FROM_CHECKPOINT = "./outputs/checkpoint-90000"
 # RESUME_FROM_CHECKPOINT = "./checkpoints/final/checkpoint-197500"
-RESUME_FROM_CHECKPOINT = "./final-model/checkpoint-477500"
+RESUME_FROM_CHECKPOINT = None
 
 
 torch.backends.cuda.enable_flash_sdp(True)
