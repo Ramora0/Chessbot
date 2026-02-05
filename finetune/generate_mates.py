@@ -37,7 +37,7 @@ DEFAULT_STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
 DEFAULT_NUM_ENGINES = 40
 
 # Depth limit for mate search
-MATE_SEARCH_DEPTH = 16
+MATE_SEARCH_DEPTH = 12
 
 WIN_THRESHOLD = 0.9999
 LOSS_THRESHOLD = 0.0001
