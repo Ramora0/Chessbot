@@ -16,23 +16,16 @@ Depth 6 search is sufficient since mate_in_4+ is our coarsest bucket.
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import os
 import shutil
-import threading
 import time
 from pathlib import Path
-from typing import Optional
 
 import chess
 import chess.engine
 from datasets import Dataset, load_from_disk
 from tqdm import tqdm
-
-"""
-Timing (2,000,000 positions)
-
-Scanning: 12m
-"""
 
 # -------------------------------------------------------------------
 # CONFIG
@@ -51,153 +44,59 @@ WIN_THRESHOLD = 0.9999
 LOSS_THRESHOLD = 0.0001
 
 
-class EngineWorker(threading.Thread):
-    """Worker thread that owns a single Stockfish engine."""
-
-    def __init__(self, stockfish_path: str, pool: "EnginePool", results: dict, lock: threading.Lock):
-        super().__init__(daemon=True)
-        self.stockfish_path = stockfish_path
-        self.pool = pool
-        self.results = results
-        self.lock = lock
-        self.engine: Optional[chess.engine.SimpleEngine] = None
-        # Timing diagnostics
-        self.time_board = 0.0
-        self.time_analyse = 0.0
-        self.call_count = 0
-
-    def run(self):
-        self.engine = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
-        self.engine.configure({"Threads": 1})
-
-        while True:
-            item = self.pool.get_next_work()
-            if item is None:
-                break
-
-            key, fen, move_uci, is_winning_move = item
-            result = self._analyze_move(fen, move_uci, is_winning_move)
-
-            with self.lock:
-                self.results[key] = result
-            with self.pool.count_lock:
-                self.pool.completed_count += 1
-
-        self.engine.quit()
-
-    def _analyze_move(self, fen: str, move_uci: str, is_winning_move: bool) -> int:
-        """
-        Analyze a move to detect mate depth.
-
-        Returns:
-            Positive int: Mate in N moves (we are winning)
-            Negative int: Getting mated in N moves (we are losing)
-            0: Not a forced mate or analysis failed
-        """
-        try:
-            t0 = time.time()
-            board = chess.Board(fen)
-            move = chess.Move.from_uci(move_uci)
-            if move not in board.legal_moves:
-                return 0
-
-            board.push(move)
-
-            # Immediate checkmate
-            if board.is_checkmate():
-                return 1 if is_winning_move else -1
-            self.time_board += time.time() - t0
-
-            t0 = time.time()
-            info = self.engine.analyse(
-                board,
-                chess.engine.Limit(time=MATE_SEARCH_TIME)
-            )
-            self.time_analyse += time.time() - t0
-            self.call_count += 1
-
-            score = info.get("score")
-            if score is None:
-                return 0
-
-            # Score is from perspective of side to move (after our move)
-            pov_score = score.relative
-            if pov_score.is_mate():
-                mate_in = pov_score.mate()
-                if mate_in is not None:
-                    # mate_in < 0 means the side to move is getting mated
-                    # mate_in > 0 means the side to move will deliver mate
-                    # We made the move, so:
-                    # - If mate_in < 0: opponent (who just moved) is getting mated = we win
-                    # - If mate_in > 0: opponent will deliver mate = we lose
-                    if mate_in < 0:
-                        # We are winning (opponent getting mated)
-                        return abs(mate_in)
-                    else:
-                        # We are losing (opponent will mate us)
-                        return -mate_in
-            return 0
-        except Exception:
-            return 0
+# Global engine for worker processes (initialized once per process)
+_worker_engine = None
 
 
-class EnginePool:
-    """Pool of Stockfish engine workers."""
+def _init_worker(stockfish_path: str):
+    """Initialize Stockfish engine in worker process."""
+    global _worker_engine
+    _worker_engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+    _worker_engine.configure({"Threads": 1})
 
-    def __init__(self, stockfish_path: str, num_engines: int, work_items: list = None):
-        self.results: dict = {}
-        self.lock = threading.Lock()
-        self.completed_count = 0
-        self.count_lock = threading.Lock()
-        self.workers: list[EngineWorker] = []
 
-        # Use shared list + atomic index instead of queue (no per-item locking)
-        self.work_items = work_items or []
-        self.work_index = 0
-        self.index_lock = threading.Lock()
-        self.num_engines = num_engines
-        self.stockfish_path = stockfish_path
+def _analyze_move(args: tuple) -> tuple:
+    """
+    Analyze a move to detect mate depth. Runs in worker process.
 
-    def start_workers(self):
-        """Start worker threads after work items are populated."""
-        print(f"Starting {self.num_engines} Stockfish engines...")
-        for _ in tqdm(range(self.num_engines), desc="Initializing engines", leave=True):
-            worker = EngineWorker(self.stockfish_path, self, self.results, self.lock)
-            worker.start()
-            self.workers.append(worker)
-        print(f"All {self.num_engines} engines ready.\n")
+    Returns: (key, mate_depth)
+    """
+    key, fen, move_uci, is_winning_move = args
+    try:
+        board = chess.Board(fen)
+        move = chess.Move.from_uci(move_uci)
+        if move not in board.legal_moves:
+            return (key, 0)
 
-    def get_next_work(self):
-        """Get next work item (lock-free for reads, minimal lock for index update)."""
-        with self.index_lock:
-            idx = self.work_index
-            if idx >= len(self.work_items):
-                return None
-            self.work_index += 1
-        return self.work_items[idx]
+        board.push(move)
 
-    def get_completed_count(self) -> int:
-        with self.count_lock:
-            return self.completed_count
+        # Immediate checkmate
+        if board.is_checkmate():
+            return (key, 1 if is_winning_move else -1)
 
-    def wait_and_get_results(self) -> dict:
-        for worker in self.workers:
-            worker.join()
-        with self.lock:
-            results = dict(self.results)
-            self.results.clear()
-        return results
+        info = _worker_engine.analyse(
+            board,
+            chess.engine.Limit(time=MATE_SEARCH_TIME)
+        )
 
-    def shutdown(self):
-        # Workers exit when get_next_work returns None
-        for worker in self.workers:
-            worker.join()
+        score = info.get("score")
+        if score is None:
+            return (key, 0)
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.shutdown()
+        # Score is from perspective of side to move (after our move)
+        pov_score = score.relative
+        if pov_score.is_mate():
+            mate_in = pov_score.mate()
+            if mate_in is not None:
+                # mate_in < 0 means opponent getting mated = we win
+                # mate_in > 0 means opponent will mate us = we lose
+                if mate_in < 0:
+                    return (key, abs(mate_in))
+                else:
+                    return (key, -mate_in)
+        return (key, 0)
+    except Exception:
+        return (key, 0)
 
 
 def main():
@@ -288,36 +187,22 @@ def main():
 
     if work_items:
         print("Phase 2: Analyzing mate depths with Stockfish...")
+        total_work = len(work_items)
+        print(f"  Analyzing {total_work:,} moves with {args.num_engines} processes...")
 
-        print(f"  Queued {len(work_items):,} moves for analysis...")
+        # Use multiprocessing Pool - each process has its own Stockfish engine (no GIL contention)
+        confirmed_mates = 0
+        with mp.Pool(args.num_engines, initializer=_init_worker, initargs=(args.stockfish,)) as pool:
+            for key, mate_depth in tqdm(
+                pool.imap_unordered(_analyze_move, work_items, chunksize=100),
+                total=total_work,
+                desc="Analyzing moves",
+                leave=True
+            ):
+                analysis_results[key] = mate_depth
+                if mate_depth != 0:
+                    confirmed_mates += 1
 
-        with EnginePool(args.stockfish, args.num_engines, work_items) as pool:
-            total_work = len(work_items)
-            pool.start_workers()
-
-            start_time = time.time()
-            with tqdm(total=total_work, desc="Analyzing moves", leave=True) as pbar:
-                while True:
-                    completed = pool.get_completed_count()
-                    pbar.n = completed
-
-                    elapsed = time.time() - start_time
-                    rate = completed / elapsed if elapsed > 0 and completed > 0 else 0
-
-                    # Collect timing from workers
-                    total_analyse = sum(w.time_analyse for w in pool.workers)
-                    total_calls = sum(w.call_count for w in pool.workers)
-                    ms_per_call = (total_analyse / total_calls * 1000) if total_calls > 0 else 0
-
-                    pbar.set_postfix({"rate": f"{rate:.0f}/s", "analyse": f"{ms_per_call:.1f}ms"})
-                    pbar.refresh()
-                    if completed >= total_work:
-                        break
-                    time.sleep(0.1)
-
-            analysis_results = pool.wait_and_get_results()
-
-        confirmed_mates = sum(1 for v in analysis_results.values() if v != 0)
         print(f"  Confirmed mates: {confirmed_mates:,} / {len(work_items):,}")
         print(f"  Confirmation rate: {confirmed_mates / len(work_items) * 100:.1f}%\n")
 
