@@ -37,7 +37,7 @@ DEFAULT_STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
 DEFAULT_NUM_ENGINES = 40
 
 # Depth limit for mate search
-MATE_SEARCH_DEPTH = 12
+MATE_SEARCH_DEPTH = 16
 
 WIN_THRESHOLD = 0.9999
 LOSS_THRESHOLD = 0.0001
@@ -131,7 +131,7 @@ def process_shard(
     batch_size = 10000
 
     local_idx = 0
-    for batch in shard_data.iter(batch_size=batch_size):
+    for batch in tqdm(shard_data.iter(batch_size=batch_size), desc=f"  Scanning", total=(shard_size + batch_size - 1) // batch_size, leave=False):
         for fen, moves, p_wins in zip(batch["fen"], batch["moves"], batch["p_win"]):
             for move_idx, p_win in enumerate(p_wins):
                 if p_win >= WIN_THRESHOLD:
