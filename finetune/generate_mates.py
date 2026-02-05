@@ -28,6 +28,12 @@ import chess.engine
 from datasets import Dataset, load_from_disk
 from tqdm import tqdm
 
+"""
+Timing (2,000,000 positions)
+
+Scanning: 12m
+"""
+
 # -------------------------------------------------------------------
 # CONFIG
 # -------------------------------------------------------------------
@@ -147,7 +153,7 @@ class EnginePool:
     def start_workers(self):
         """Start worker threads after work items are populated."""
         print(f"Starting {self.num_engines} Stockfish engines...")
-        for _ in tqdm(range(self.num_engines), desc="Initializing engines"):
+        for _ in tqdm(range(self.num_engines), desc="Initializing engines", leave=True):
             worker = EngineWorker(self.stockfish_path, self, self.results, self.lock)
             worker.start()
             self.workers.append(worker)
@@ -240,17 +246,19 @@ def main():
     # Build work items directly while scanning (avoids second pass over dataset)
     work_items: list[tuple[tuple[int, int], str, str, bool]] = []
 
-    for i in tqdm(range(num_positions), desc="Scanning positions"):
-        row = dataset[i]
-        p_wins = row["p_win"]
-        moves = row["moves"]
-        fen = row["fen"]
-
-        for move_idx, p_win in enumerate(p_wins):
-            if p_win >= WIN_THRESHOLD:
-                work_items.append(((i, move_idx), fen, moves[move_idx], True))
-            elif p_win <= LOSS_THRESHOLD:
-                work_items.append(((i, move_idx), fen, moves[move_idx], False))
+    # Batched iteration amortizes Arrow deserialization overhead
+    batch_size = 10000
+    global_idx = 0
+    for batch in tqdm(dataset.iter(batch_size=batch_size),
+                      total=(num_positions + batch_size - 1) // batch_size,
+                      desc="Scanning positions", leave=True):
+        for fen, moves, p_wins in zip(batch["fen"], batch["moves"], batch["p_win"]):
+            for move_idx, p_win in enumerate(p_wins):
+                if p_win >= WIN_THRESHOLD:
+                    work_items.append(((global_idx, move_idx), fen, moves[move_idx], True))
+                elif p_win <= LOSS_THRESHOLD:
+                    work_items.append(((global_idx, move_idx), fen, moves[move_idx], False))
+            global_idx += 1
 
     print(f"  Total moves to analyze: {len(work_items):,}")
     print(f"  Avg per position: {len(work_items) / num_positions:.2f}\n")
@@ -271,7 +279,7 @@ def main():
             pool.start_workers()
 
             start_time = time.time()
-            with tqdm(total=total_work, desc="Analyzing moves") as pbar:
+            with tqdm(total=total_work, desc="Analyzing moves", leave=True) as pbar:
                 while True:
                     completed = pool.get_completed_count()
                     pbar.n = completed
@@ -299,7 +307,7 @@ def main():
 
     # Build final dataset - read from dataset, lookup mate depths from sparse results
     output_data = []
-    for i in tqdm(range(num_positions), desc="Building dataset"):
+    for i in tqdm(range(num_positions), desc="Building dataset", leave=True):
         row = dataset[i]
         num_moves = len(row["moves"])
         # Build mate array: lookup from results, default to 0
