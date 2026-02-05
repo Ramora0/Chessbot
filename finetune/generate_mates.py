@@ -21,7 +21,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import chess
 import chess.engine
@@ -49,7 +49,7 @@ LOSS_THRESHOLD = 0.0001
 class EngineWorker(threading.Thread):
     """Worker thread that owns a single Stockfish engine."""
 
-    def __init__(self, stockfish_path: str, pool: "EnginePool", results: dict, lock: threading.Lock, pool_ref: "EnginePool"):
+    def __init__(self, stockfish_path: str, pool: "EnginePool", results: dict, lock: threading.Lock):
         super().__init__(daemon=True)
         self.stockfish_path = stockfish_path
         self.pool = pool
@@ -148,7 +148,7 @@ class EnginePool:
         """Start worker threads after work items are populated."""
         print(f"Starting {self.num_engines} Stockfish engines...")
         for _ in tqdm(range(self.num_engines), desc="Initializing engines"):
-            worker = EngineWorker(self.stockfish_path, self, self.results, self.lock, self)
+            worker = EngineWorker(self.stockfish_path, self, self.results, self.lock)
             worker.start()
             self.workers.append(worker)
         print(f"All {self.num_engines} engines ready.\n")
@@ -219,77 +219,50 @@ def main():
         return 1
 
     # =========================================================
-    # Load dataset into memory
+    # Load dataset (memory-mapped, not loaded into RAM)
     # =========================================================
     print(f"Loading dataset from {input_path}...")
     dataset = load_from_disk(str(input_path))
-    print(f"Loaded {len(dataset):,} positions")
+    print(f"Dataset has {len(dataset):,} positions")
 
     if len(dataset) > args.num_positions:
         print(f"Sampling {args.num_positions:,} positions (seed={args.seed})...")
         dataset = dataset.shuffle(seed=args.seed).select(range(args.num_positions))
 
-    # Convert to plain Python lists
-    print("Loading into memory...")
     num_positions = len(dataset)
-    fens = []
-    moves_list = []
-    p_wins_list = []
-
-    batch_size = 50_000
-    for start in tqdm(range(0, num_positions, batch_size), desc="Loading to RAM"):
-        end = min(start + batch_size, num_positions)
-        batch = dataset[start:end]
-        fens.extend(batch["fen"])
-        moves_list.extend(batch["moves"])
-        p_wins_list.extend(batch["p_win"])
-
-    print(f"Loaded {num_positions:,} positions into memory\n")
+    print(f"Processing {num_positions:,} positions\n")
 
     # =========================================================
-    # Phase 1: Identify positions with extreme win probability moves
+    # Phase 1: Scan for mate candidates AND build work items
     # =========================================================
     print("Phase 1: Scanning for mate candidate moves...")
 
-    # Track positions needing Stockfish analysis
-    # mate_candidates[pos_idx] = [(move_idx, move_uci, is_winning), ...]
-    mate_candidates: dict[int, list[tuple[int, str, bool]]] = {}
+    # Build work items directly while scanning (avoids second pass over dataset)
+    work_items: list[tuple[tuple[int, int], str, str, bool]] = []
 
-    total_mate_moves = 0
     for i in tqdm(range(num_positions), desc="Scanning positions"):
-        p_wins = p_wins_list[i]
-        moves = moves_list[i]
+        row = dataset[i]
+        p_wins = row["p_win"]
+        moves = row["moves"]
+        fen = row["fen"]
 
-        position_mates = []
         for move_idx, p_win in enumerate(p_wins):
             if p_win >= WIN_THRESHOLD:
-                position_mates.append((move_idx, moves[move_idx], True))
+                work_items.append(((i, move_idx), fen, moves[move_idx], True))
             elif p_win <= LOSS_THRESHOLD:
-                position_mates.append((move_idx, moves[move_idx], False))
+                work_items.append(((i, move_idx), fen, moves[move_idx], False))
 
-        if position_mates:
-            mate_candidates[i] = position_mates
-            total_mate_moves += len(position_mates)
-
-    print(f"  Positions with mate candidates: {len(mate_candidates):,}")
-    print(f"  Total moves to analyze: {total_mate_moves:,}")
-    print(f"  Mate position ratio: {len(mate_candidates) / num_positions * 100:.1f}%\n")
+    print(f"  Total moves to analyze: {len(work_items):,}")
+    print(f"  Avg per position: {len(work_items) / num_positions:.2f}\n")
 
     # =========================================================
     # Phase 2: Stockfish analysis for mate depths
     # =========================================================
-    # Initialize mate arrays (0 = not a forced mate)
-    mate_depths: list[list[int]] = [[0] * len(moves_list[i]) for i in range(num_positions)]
+    # Results stored sparsely: analysis_results[(pos_idx, move_idx)] = mate_depth
+    analysis_results: dict[tuple[int, int], int] = {}
 
-    if mate_candidates:
+    if work_items:
         print("Phase 2: Analyzing mate depths with Stockfish...")
-
-        # Collect all work items
-        work_items: list[tuple[tuple[int, int], str, str, bool]] = []
-        for pos_idx, candidates in mate_candidates.items():
-            fen = fens[pos_idx]
-            for move_idx, move_uci, is_winning in candidates:
-                work_items.append(((pos_idx, move_idx), fen, move_uci, is_winning))
 
         print(f"  Queued {len(work_items):,} moves for analysis...")
 
@@ -315,33 +288,28 @@ def main():
 
             analysis_results = pool.wait_and_get_results()
 
-        print("  Populating mate depths...")
-
-        # Fill in mate depths from analysis
-        confirmed_mates = 0
-        for (pos_idx, move_idx), mate_depth in analysis_results.items():
-            mate_depths[pos_idx][move_idx] = mate_depth
-            if mate_depth != 0:
-                confirmed_mates += 1
-
-        print(f"  Confirmed mates: {confirmed_mates:,} / {total_mate_moves:,}")
-        print(f"  Confirmation rate: {confirmed_mates / total_mate_moves * 100:.1f}%\n")
+        confirmed_mates = sum(1 for v in analysis_results.values() if v != 0)
+        print(f"  Confirmed mates: {confirmed_mates:,} / {len(work_items):,}")
+        print(f"  Confirmation rate: {confirmed_mates / len(work_items) * 100:.1f}%\n")
 
     # =========================================================
     # Phase 3: Save output
     # =========================================================
-    print("Phase 3: Saving output...")
+    print("Phase 3: Building output (streaming from dataset)...")
 
-    # Build final dataset - keep p_win unchanged, add mate depths
-    output_data = [
-        {
-            "fen": fens[i],
-            "moves": list(moves_list[i]),
-            "p_win": list(p_wins_list[i]),  # Unchanged from source
-            "mate": mate_depths[i],  # New field: mate depth for each move
-        }
-        for i in tqdm(range(num_positions), desc="Building dataset")
-    ]
+    # Build final dataset - read from dataset, lookup mate depths from sparse results
+    output_data = []
+    for i in tqdm(range(num_positions), desc="Building dataset"):
+        row = dataset[i]
+        num_moves = len(row["moves"])
+        # Build mate array: lookup from results, default to 0
+        mate = [analysis_results.get((i, m), 0) for m in range(num_moves)]
+        output_data.append({
+            "fen": row["fen"],
+            "moves": list(row["moves"]),
+            "p_win": list(row["p_win"]),
+            "mate": mate,
+        })
 
     if args.output.exists():
         print(f"Removing existing output at {args.output}")
