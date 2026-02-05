@@ -249,9 +249,15 @@ def main():
     # Batched iteration amortizes Arrow deserialization overhead
     batch_size = 10000
     global_idx = 0
-    for batch in tqdm(dataset.iter(batch_size=batch_size),
-                      total=(num_positions + batch_size - 1) // batch_size,
-                      desc="Scanning positions", leave=True):
+    time_iter = 0.0
+    time_inner = 0.0
+    iter_start = time.time()
+    pbar = tqdm(dataset.iter(batch_size=batch_size),
+                total=(num_positions + batch_size - 1) // batch_size,
+                desc="Scanning positions", leave=True)
+    for batch in pbar:
+        time_iter += time.time() - iter_start
+        inner_start = time.time()
         for fen, moves, p_wins in zip(batch["fen"], batch["moves"], batch["p_win"]):
             for move_idx, p_win in enumerate(p_wins):
                 if p_win >= WIN_THRESHOLD:
@@ -259,6 +265,9 @@ def main():
                 elif p_win <= LOSS_THRESHOLD:
                     work_items.append(((global_idx, move_idx), fen, moves[move_idx], False))
             global_idx += 1
+        time_inner += time.time() - inner_start
+        pbar.set_postfix({"iter": f"{time_iter:.1f}s", "proc": f"{time_inner:.1f}s"})
+        iter_start = time.time()
 
     print(f"  Total moves to analyze: {len(work_items):,}")
     print(f"  Avg per position: {len(work_items) / num_positions:.2f}\n")
