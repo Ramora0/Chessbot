@@ -385,7 +385,17 @@ class EloEvaluationCallback(TrainerCallback):
 
 
 class GameEvaluationCallback(TrainerCallback):
-    """Callback to run game-based evaluation against Stockfish during training."""
+    """Callback to run game-based evaluation against Stockfish during training.
+
+    The opponent ELO dynamically adjusts after each evaluation: it is set to the
+    model's estimated ELO from the previous evaluation (clamped to Stockfish's
+    supported range).  This ensures the model always faces a challenging opponent
+    rather than being stuck playing against a fixed, potentially inferior level.
+    """
+
+    # Stockfish UCI_Elo supported range
+    STOCKFISH_ELO_MIN = 1320
+    STOCKFISH_ELO_MAX = 3190
 
     def __init__(
         self,
@@ -434,7 +444,7 @@ class GameEvaluationCallback(TrainerCallback):
 
         try:
             print(f"\n{'='*80}")
-            print(f"Running game evaluation at step {step}...")
+            print(f"Running game evaluation at step {step} (opponent ELO: {self.opponent_elo})...")
             print(f"{'='*80}")
 
             # Run game evaluation
@@ -461,6 +471,14 @@ class GameEvaluationCallback(TrainerCallback):
 
             self.trainer.log(metrics)
             self._last_step_logged = step
+
+            # Dynamically adjust opponent ELO for next evaluation
+            if not math.isnan(estimated_elo):
+                old_elo = self.opponent_elo
+                new_elo = int(round(estimated_elo))
+                new_elo = max(self.STOCKFISH_ELO_MIN, min(self.STOCKFISH_ELO_MAX, new_elo))
+                self.opponent_elo = new_elo
+                print(f"Opponent ELO updated: {old_elo} -> {new_elo} (model estimated: {estimated_elo:.0f})")
 
             print(
                 f"Game evaluation complete: ELO={estimated_elo:.1f} ± {std_error:.1f}")

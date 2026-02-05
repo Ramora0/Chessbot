@@ -26,7 +26,7 @@ class ChessRelativePositionEmbedding(nn.Module):
     """Chess-aware relative position embeddings with full Q, K, V biases.
 
     Board positions (0-63) use 2D relative coordinates (rank_diff, file_diff).
-    Metadata positions (64-71) use special global embeddings.
+    Metadata positions (64-71) get zero bias (rely on token embeddings for identity).
     """
 
     def __init__(
@@ -48,27 +48,16 @@ class ChessRelativePositionEmbedding(nn.Module):
         self.rel_key_board = nn.Embedding(225, num_heads * head_dim)
         self.rel_value_board = nn.Embedding(225, num_heads * head_dim)
 
-        # Metadata relationships: 3 types
-        # 0: board-to-metadata, 1: metadata-to-board, 2: metadata-to-metadata
-        self.rel_query_meta = nn.Embedding(3, num_heads * head_dim)
-        self.rel_key_meta = nn.Embedding(3, num_heads * head_dim)
-        self.rel_value_meta = nn.Embedding(3, num_heads * head_dim)
-
         # Initialize with small values for stability
         nn.init.normal_(self.rel_query_board.weight, std=0.02)
         nn.init.normal_(self.rel_key_board.weight, std=0.02)
         nn.init.normal_(self.rel_value_board.weight, std=0.02)
-        nn.init.normal_(self.rel_query_meta.weight, std=0.02)
-        nn.init.normal_(self.rel_key_meta.weight, std=0.02)
-        nn.init.normal_(self.rel_value_meta.weight, std=0.02)
 
         # Precompute relative position indices (fixed for chess board)
         self._precompute_indices()
 
     def _precompute_indices(self):
-        """Precompute relative position index matrix."""
-        seq_len = self.max_seq_len
-
+        """Precompute relative position index matrix for board squares only."""
         # Board indices: convert (rank_diff, file_diff) to single index
         # rank_diff + 7 gives 0-14, file_diff + 7 gives 0-14
         # index = (rank_diff + 7) * 15 + (file_diff + 7)
@@ -81,55 +70,34 @@ class ChessRelativePositionEmbedding(nn.Module):
                 file_diff = file_j - file_i + 7  # 0-14
                 board_indices[i, j] = rank_diff * 15 + file_diff
 
-        # Full index matrix: separate board and metadata regions
-        rel_indices = torch.zeros(seq_len, seq_len, dtype=torch.long)
-        rel_indices[:self.board_size, :self.board_size] = board_indices
-
-        # Metadata type indices (stored separately)
-        meta_type_indices = torch.zeros(seq_len, seq_len, dtype=torch.long)
-        meta_type_indices[:self.board_size, self.board_size:] = 0  # board-to-meta
-        meta_type_indices[self.board_size:, :self.board_size] = 1  # meta-to-board
-        meta_type_indices[self.board_size:, self.board_size:] = 2  # meta-to-meta
-
-        # Mask to distinguish board-board from metadata interactions
-        is_board_board = torch.zeros(seq_len, seq_len, dtype=torch.bool)
-        is_board_board[:self.board_size, :self.board_size] = True
-
-        self.register_buffer('rel_indices', rel_indices)
-        self.register_buffer('meta_type_indices', meta_type_indices)
-        self.register_buffer('is_board_board', is_board_board)
+        self.register_buffer('board_indices', board_indices)
 
     def get_bias_matrices(self, seq_len: int, device: torch.device):
         """Get relative position bias matrices for queries, keys, and values.
+
+        Board-to-board interactions use learned relative position embeddings.
+        All other interactions (involving metadata) get zero bias.
 
         Returns:
             rel_query_bias: [seq_len, seq_len, num_heads, head_dim]
             rel_key_bias: [seq_len, seq_len, num_heads, head_dim]
             rel_value_bias: [seq_len, seq_len, num_heads, head_dim]
         """
-        # Clamp seq_len to max
         seq_len = min(seq_len, self.max_seq_len)
+        board_size = min(self.board_size, seq_len)
+        emb_dim = self.num_heads * self.head_dim
 
-        # Get indices for this sequence length
-        rel_idx = self.rel_indices[:seq_len, :seq_len]
-        meta_idx = self.meta_type_indices[:seq_len, :seq_len]
-        is_bb = self.is_board_board[:seq_len, :seq_len]
+        # Initialize full bias matrices with zeros
+        rel_query_bias = torch.zeros(seq_len, seq_len, emb_dim, device=device)
+        rel_key_bias = torch.zeros(seq_len, seq_len, emb_dim, device=device)
+        rel_value_bias = torch.zeros(seq_len, seq_len, emb_dim, device=device)
 
-        # Gather board-board embeddings
-        board_query = self.rel_query_board(rel_idx)  # [seq, seq, num_heads * head_dim]
-        board_key = self.rel_key_board(rel_idx)
-        board_value = self.rel_value_board(rel_idx)
-
-        # Gather metadata embeddings
-        meta_query = self.rel_query_meta(meta_idx)
-        meta_key = self.rel_key_meta(meta_idx)
-        meta_value = self.rel_value_meta(meta_idx)
-
-        # Combine: use board embeddings for board-board, meta for rest
-        is_bb_expanded = is_bb.unsqueeze(-1)  # [seq, seq, 1]
-        rel_query_bias = torch.where(is_bb_expanded, board_query, meta_query)
-        rel_key_bias = torch.where(is_bb_expanded, board_key, meta_key)
-        rel_value_bias = torch.where(is_bb_expanded, board_value, meta_value)
+        # Fill in board-to-board region with learned embeddings
+        if board_size > 0:
+            board_idx = self.board_indices[:board_size, :board_size]
+            rel_query_bias[:board_size, :board_size] = self.rel_query_board(board_idx)
+            rel_key_bias[:board_size, :board_size] = self.rel_key_board(board_idx)
+            rel_value_bias[:board_size, :board_size] = self.rel_value_board(board_idx)
 
         # Reshape to [seq, seq, num_heads, head_dim]
         rel_query_bias = rel_query_bias.view(seq_len, seq_len, self.num_heads, self.head_dim)
@@ -437,6 +405,12 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         if legacy_key in state_dict:
             print("Warning: Ignoring legacy absolute position embeddings from checkpoint")
             del state_dict[legacy_key]
+
+        # Handle legacy checkpoints with metadata relative position embeddings (now removed)
+        legacy_meta_keys = [k for k in state_dict if 'rel_pos_emb.rel_' in k and '_meta' in k]
+        for key in legacy_meta_keys:
+            print(f"Warning: Ignoring legacy metadata position embedding: {key}")
+            del state_dict[key]
 
         # Check for new relative position keys
         rel_pos_keys = [k for k in state_dict if 'rel_pos_emb' in k]
