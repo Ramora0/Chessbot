@@ -143,6 +143,7 @@ def process_shard(
     # Phase 2: Stockfish analysis
     analysis_results: dict[tuple[int, int], int] = {}
     confirmed_mates = 0
+    total_mate_depth = 0
 
     if work_items:
         with mp.Pool(num_engines, initializer=_init_worker, initargs=(stockfish_path,)) as pool:
@@ -156,8 +157,10 @@ def process_shard(
                 analysis_results[key] = mate_depth
                 if mate_depth != 0:
                     confirmed_mates += 1
+                    total_mate_depth += abs(mate_depth)
                     mate_pct = 100.0 * confirmed_mates / len(analysis_results)
-                    pbar.set_postfix(mate_pct=f"{mate_pct:.1f}%")
+                    avg_depth = total_mate_depth / confirmed_mates
+                    pbar.set_postfix(mate_pct=f"{mate_pct:.1f}%", avg_depth=f"{avg_depth:.1f}")
 
     # Phase 3: Build output
     output_data = []
