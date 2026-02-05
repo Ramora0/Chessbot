@@ -23,6 +23,7 @@ import time
 from glob import glob
 from pathlib import Path
 
+import numpy as np
 import chess
 import chess.engine
 from datasets import Dataset, load_from_disk
@@ -34,7 +35,7 @@ from tqdm import tqdm
 
 DEFAULT_OUTPUT_PATH = Path("/fs/scratch/PAS2836/lees_stuff/searchless_mates")
 DEFAULT_STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
-DEFAULT_NUM_ENGINES = 40
+DEFAULT_NUM_ENGINES = 22
 
 # Depth limit for mate search
 MATE_SEARCH_DEPTH = 16
@@ -117,76 +118,99 @@ def process_shard(
 ) -> dict:
     """Process a single shard of the dataset."""
     output_path = output_dir / shard_path.with_suffix(".parquet").name
+    lock_path = output_path.with_suffix(".lock")
 
     # Check if shard already complete
     if output_path.exists():
         return {"skipped": True}
 
-    # Load just this shard
-    shard_data = Dataset.from_file(str(shard_path))
-    shard_size = len(shard_data)
+    # Atomically claim this shard so parallel instances don't duplicate work
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        return {"skipped": True}
 
-    # Phase 1: Scan for mate candidates
-    work_items: list[tuple[tuple[int, int], str, str, bool]] = []
-    batch_size = 10000
+    try:
+        # Load just this shard
+        shard_data = Dataset.from_file(str(shard_path))
+        shard_size = len(shard_data)
 
-    local_idx = 0
-    for batch in tqdm(shard_data.iter(batch_size=batch_size), desc=f"  Scanning", total=(shard_size + batch_size - 1) // batch_size, leave=False):
-        for fen, moves, p_wins in zip(batch["fen"], batch["moves"], batch["p_win"]):
-            for move_idx, p_win in enumerate(p_wins):
-                if p_win >= WIN_THRESHOLD:
-                    work_items.append(((local_idx, move_idx), fen, moves[move_idx], True))
-                elif p_win <= LOSS_THRESHOLD:
-                    work_items.append(((local_idx, move_idx), fen, moves[move_idx], False))
-            local_idx += 1
+        # Phase 1: Vectorized scan for mate candidates
+        table = shard_data.data.combine_chunks()
+        p_win_arr = table.column("p_win").chunk(0)
+        offsets = p_win_arr.offsets.to_numpy()
+        flat_p_win = p_win_arr.values.to_numpy()
 
-    # Phase 2: Stockfish analysis
-    analysis_results: dict[tuple[int, int], int] = {}
-    confirmed_mates = 0
-    total_mate_depth = 0
+        win_mask = flat_p_win >= WIN_THRESHOLD
+        loss_mask = flat_p_win <= LOSS_THRESHOLD
+        candidate_indices = np.nonzero(win_mask | loss_mask)[0]
 
-    if work_items:
-        with mp.Pool(num_engines, initializer=_init_worker, initargs=(stockfish_path,)) as pool:
-            pbar = tqdm(
-                pool.imap_unordered(_analyze_move, work_items, chunksize=100),
-                total=len(work_items),
-                desc=f"  Shard {shard_idx}",
-                leave=False
-            )
-            for key, mate_depth in pbar:
-                analysis_results[key] = mate_depth
-                if mate_depth != 0:
-                    confirmed_mates += 1
-                    total_mate_depth += abs(mate_depth)
-                    mate_pct = 100.0 * confirmed_mates / len(analysis_results)
-                    avg_depth = total_mate_depth / confirmed_mates
-                    pbar.set_postfix(mate_pct=f"{mate_pct:.1f}%", avg_depth=f"{avg_depth:.1f}")
+        row_indices = np.searchsorted(offsets, candidate_indices, side='right') - 1
+        move_indices = candidate_indices - offsets[row_indices]
+        is_winning = win_mask[candidate_indices]
 
-    # Phase 3: Build output
-    output_data = []
-    local_idx = 0
-    for batch in shard_data.iter(batch_size=batch_size):
-        for fen, moves, p_wins in zip(batch["fen"], batch["moves"], batch["p_win"]):
-            num_moves = len(moves)
-            mate = [analysis_results.get((local_idx, m), 0) for m in range(num_moves)]
-            output_data.append({
-                "fen": fen,
-                "moves": list(moves),
-                "p_win": list(p_wins),
-                "mate": mate,
-            })
-            local_idx += 1
+        # Convert columns to Python for work item construction & output
+        fens = table.column("fen").to_pylist()
+        moves_col = table.column("moves").to_pylist()
+        p_wins_col = table.column("p_win").to_pylist()
 
-    # Save shard as parquet
-    output_dataset = Dataset.from_list(output_data)
-    output_dataset.to_parquet(str(output_path))
+        work_items = [
+            ((int(r), int(m)), fens[int(r)], moves_col[int(r)][int(m)], bool(w))
+            for r, m, w in zip(row_indices, move_indices, is_winning)
+        ]
 
-    return {
-        "skipped": False,
-        "positions": shard_size,
-        "mate_candidates": len(work_items),
-        "confirmed_mates": confirmed_mates,
-    }
+        # Phase 2: Stockfish analysis
+        analysis_results: dict[tuple[int, int], int] = {}
+        confirmed_mates = 0
+        total_mate_depth = 0
+
+        if work_items:
+            with mp.Pool(num_engines, initializer=_init_worker, initargs=(stockfish_path,)) as pool:
+                pbar = tqdm(
+                    pool.imap_unordered(_analyze_move, work_items, chunksize=100),
+                    total=len(work_items),
+                    desc=f"  Shard {shard_idx}",
+                    leave=False
+                )
+                for key, mate_depth in pbar:
+                    analysis_results[key] = mate_depth
+                    if mate_depth != 0:
+                        confirmed_mates += 1
+                        total_mate_depth += abs(mate_depth)
+                        mate_pct = 100.0 * confirmed_mates / len(analysis_results)
+                        avg_depth = total_mate_depth / confirmed_mates
+                        pbar.set_postfix(mate_pct=f"{mate_pct:.1f}%", avg_depth=f"{avg_depth:.1f}")
+
+        # Phase 3: Build output
+        output_data = [
+            {
+                "fen": fens[i],
+                "moves": moves_col[i],
+                "p_win": p_wins_col[i],
+                "mate": [analysis_results.get((i, m), 0) for m in range(len(moves_col[i]))],
+            }
+            for i in tqdm(range(shard_size), desc=f"  Building output", leave=False)
+        ]
+
+        # Save shard as parquet (atomic: write temp, then rename)
+        tmp_path = output_path.with_suffix(".parquet.tmp")
+        output_dataset = Dataset.from_list(output_data)
+        output_dataset.to_parquet(str(tmp_path))
+        os.rename(str(tmp_path), str(output_path))
+
+        return {
+            "skipped": False,
+            "positions": shard_size,
+            "mate_candidates": len(work_items),
+            "confirmed_mates": confirmed_mates,
+        }
+    finally:
+        # Release lock so other instances can retry on failure
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
 
 
 def main():
