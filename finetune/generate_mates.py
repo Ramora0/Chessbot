@@ -36,8 +36,8 @@ DEFAULT_OUTPUT_PATH = Path("/fs/scratch/PAS2836/lees_stuff/searchless_mates")
 DEFAULT_STOCKFISH_PATH = "/users/PAS2836/leedavis/stockfish/src/stockfish"
 DEFAULT_NUM_ENGINES = 40
 
-# Time limit per position in seconds
-MATE_SEARCH_TIME = 0.005
+# Depth limit for mate search
+MATE_SEARCH_DEPTH = 16
 
 WIN_THRESHOLD = 0.9999
 LOSS_THRESHOLD = 0.0001
@@ -75,7 +75,7 @@ def _analyze_move(args: tuple) -> tuple:
 
         info = _worker_engine.analyse(
             board,
-            chess.engine.Limit(time=MATE_SEARCH_TIME)
+            chess.engine.Limit(depth=MATE_SEARCH_DEPTH)
         )
 
         score = info.get("score")
@@ -146,15 +146,18 @@ def process_shard(
 
     if work_items:
         with mp.Pool(num_engines, initializer=_init_worker, initargs=(stockfish_path,)) as pool:
-            for key, mate_depth in tqdm(
+            pbar = tqdm(
                 pool.imap_unordered(_analyze_move, work_items, chunksize=100),
                 total=len(work_items),
                 desc=f"  Shard {shard_idx}",
                 leave=False
-            ):
+            )
+            for key, mate_depth in pbar:
                 analysis_results[key] = mate_depth
                 if mate_depth != 0:
                     confirmed_mates += 1
+                    mate_pct = 100.0 * confirmed_mates / len(analysis_results)
+                    pbar.set_postfix(mate_pct=f"{mate_pct:.1f}%")
 
     # Phase 3: Build output
     output_data = []
@@ -238,7 +241,7 @@ def main():
         "num_shards": num_shards,
         "win_threshold": WIN_THRESHOLD,
         "loss_threshold": LOSS_THRESHOLD,
-        "mate_search_time": MATE_SEARCH_TIME,
+        "mate_search_depth": MATE_SEARCH_DEPTH,
     }
     with open(args.output / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
@@ -254,10 +257,8 @@ def main():
 
     overall_start = time.time()
 
-    for shard_idx, shard_path in enumerate(shard_files):
-        print(f"Shard {shard_idx}/{num_shards}: {shard_path.name}")
-
-        shard_start = time.time()
+    shard_bar = tqdm(shard_files, desc="Shards", unit="shard")
+    for shard_idx, shard_path in enumerate(shard_bar):
         stats = process_shard(
             shard_path=shard_path,
             shard_idx=shard_idx,
@@ -265,27 +266,14 @@ def main():
             stockfish_path=args.stockfish,
             num_engines=args.num_engines,
         )
-        shard_time = time.time() - shard_start
 
         if stats["skipped"]:
             total_stats["shards_skipped"] += 1
-            print(f"  Skipped (already exists)")
         else:
             total_stats["positions_processed"] += stats["positions"]
             total_stats["mate_candidates"] += stats["mate_candidates"]
             total_stats["confirmed_mates"] += stats["confirmed_mates"]
 
-            # Progress estimate
-            shards_done = shard_idx + 1 - total_stats["shards_skipped"]
-            shards_remaining = num_shards - shard_idx - 1
-            if shards_done > 0:
-                elapsed = time.time() - overall_start
-                time_per_shard = elapsed / shards_done
-                eta_hours = (shards_remaining * time_per_shard) / 3600
-                print(f"  {stats['positions']:,} positions, {stats['confirmed_mates']:,} mates | "
-                      f"{shard_time:.1f}s | ETA: {eta_hours:.1f}h")
-
-        print()
 
     # Final summary
     total_time = time.time() - overall_start
