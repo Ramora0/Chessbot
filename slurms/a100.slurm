@@ -13,22 +13,27 @@
 
 set -euo pipefail
 
-# Optional: Set RUN_NAME environment variable before submitting
-# export RUN_NAME="my-experiment"
-: ${RUN_NAME:=""}
+# CLI arguments (passed after -- in sbatch command)
+# Usage: sbatch slurms/a100.slurm [branch] [run_name]
+# Example: sbatch slurms/a100.slurm feature-branch my-experiment
+BRANCH="${1:-master}"
+RUN_NAME="${2:-}"
 
-# Copy code to local storage FIRST (quick, locks in code version)
-CODE_LOCAL="$TMPDIR/Chessbot"
+# Each job gets unique directory (SLURM_JOB_ID ensures no collisions)
+CODE_LOCAL="$TMPDIR/Chessbot-$SLURM_JOB_ID"
+
 echo "================================================"
-echo "Copying code to local storage..."
+echo "Cloning branch '$BRANCH' to local storage..."
+echo "Job ID: $SLURM_JOB_ID"
 echo "================================================"
 
-# Copy current code state to local node
-mkdir -p "$CODE_LOCAL"
-cp -r "$HOME/personal/Chessbot/"* "$CODE_LOCAL/" 2>/dev/null || true
-cp -r "$HOME/personal/Chessbot/".??* "$CODE_LOCAL/" 2>/dev/null || true
+# Clone specific branch directly into isolated temp directory
+# Uses --single-branch for efficiency (only fetches needed branch)
+git clone --branch "$BRANCH" --single-branch --depth 1 \
+    "$HOME/personal/Chessbot" "$CODE_LOCAL"
 
-echo "Code copy complete."
+echo "Clone complete. Branch: $(cd "$CODE_LOCAL" && git branch --show-current)"
+echo "Commit: $(cd "$CODE_LOCAL" && git rev-parse --short HEAD)"
 
 # Original dataset location on shared storage
 DATASET_SOURCE="/fs/scratch/PAS2836/lees_stuff/action_value"
