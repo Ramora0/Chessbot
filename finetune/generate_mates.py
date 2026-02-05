@@ -61,6 +61,10 @@ class EngineWorker(threading.Thread):
         self.results = results
         self.lock = lock
         self.engine: Optional[chess.engine.SimpleEngine] = None
+        # Timing diagnostics
+        self.time_board = 0.0
+        self.time_analyse = 0.0
+        self.call_count = 0
 
     def run(self):
         self.engine = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
@@ -91,6 +95,7 @@ class EngineWorker(threading.Thread):
             0: Not a forced mate or analysis failed
         """
         try:
+            t0 = time.time()
             board = chess.Board(fen)
             move = chess.Move.from_uci(move_uci)
             if move not in board.legal_moves:
@@ -101,11 +106,15 @@ class EngineWorker(threading.Thread):
             # Immediate checkmate
             if board.is_checkmate():
                 return 1 if is_winning_move else -1
+            self.time_board += time.time() - t0
 
+            t0 = time.time()
             info = self.engine.analyse(
                 board,
                 chess.engine.Limit(time=MATE_SEARCH_TIME)
             )
+            self.time_analyse += time.time() - t0
+            self.call_count += 1
 
             score = info.get("score")
             if score is None:
@@ -303,6 +312,15 @@ def main():
                     time.sleep(0.1)
 
             analysis_results = pool.wait_and_get_results()
+
+            # Report timing breakdown from workers
+            total_board = sum(w.time_board for w in pool.workers)
+            total_analyse = sum(w.time_analyse for w in pool.workers)
+            total_calls = sum(w.call_count for w in pool.workers)
+            if total_calls > 0:
+                print(f"  Timing breakdown (summed across {args.num_engines} workers):")
+                print(f"    Board setup:    {total_board:.1f}s ({total_board/total_calls*1000:.2f}ms/call)")
+                print(f"    engine.analyse: {total_analyse:.1f}s ({total_analyse/total_calls*1000:.2f}ms/call)")
 
         confirmed_mates = sum(1 for v in analysis_results.values() if v != 0)
         print(f"  Confirmed mates: {confirmed_mates:,} / {len(work_items):,}")
