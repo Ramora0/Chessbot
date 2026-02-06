@@ -168,8 +168,9 @@ def relative_position_attention_forward(
     attn_output = torch.matmul(attn_weights, value)  # [batch, heads, seq_q, dim]
 
     # Relative position value bias term: attn_weights @ a_ij^V
-    rel_value_output = torch.einsum('bhqk,hqkd->bhqd', attn_weights, rel_value_bias_t)
-    attn_output = attn_output + rel_value_output
+    # DISABLED: May cause instability since it bypasses softmax saturation
+    # rel_value_output = torch.einsum('bhqk,hqkd->bhqd', attn_weights, rel_value_bias_t)
+    # attn_output = attn_output + rel_value_output
 
     # Transpose for output projection: [batch, seq, heads, dim]
     attn_output = attn_output.transpose(1, 2).contiguous()
