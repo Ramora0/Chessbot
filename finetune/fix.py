@@ -19,6 +19,7 @@ Uses ds.map(batched=True) to avoid loading 500M rows into memory at once.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import chess
@@ -26,6 +27,7 @@ from datasets import load_from_disk
 
 
 DEFAULT_DATASET_PATH = Path("/fs/scratch/PAS2836/lees_stuff/searchless_mates_hf")
+SCRATCH_CACHE = "/fs/scratch/PAS2836/lees_stuff/hf_cache"
 
 
 def fix_batch(batch):
@@ -72,21 +74,27 @@ def main():
         print(f"Output already exists at {args.output}")
         return 1
 
+    # Redirect HF cache to scratch so intermediate Arrow files
+    # don't fill up the home directory quota
+    os.makedirs(SCRATCH_CACHE, exist_ok=True)
+    os.environ["HF_DATASETS_CACHE"] = SCRATCH_CACHE
+    os.environ["HF_HOME"] = SCRATCH_CACHE
+
     print(f"Loading dataset from {args.dataset}...")
     ds = load_from_disk(str(args.dataset))
     print(f"Loaded {len(ds):,} rows")
 
-    print("Fixing mate depths...")
+    print(f"Fixing mate depths with {args.num_proc} processes...")
     fixed_ds = ds.map(
         fix_batch,
         batched=True,
         batch_size=10000,
-        num_proc=args.num_proc,
+        num_proc=args.num_proc if args.num_proc > 1 else None,
         desc="Fixing",
     )
 
     print(f"Saving to {args.output}...")
-    fixed_ds.save_to_disk(str(args.output))
+    fixed_ds.save_to_disk(str(args.output), num_proc=args.num_proc)
     print(f"Saved {len(fixed_ds):,} rows to {args.output}")
 
     return 0
