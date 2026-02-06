@@ -326,7 +326,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         # Mate prediction: 7-class classification per move (from shared attention pooling via bottleneck)
         mate_bottleneck = task_outputs['mate']  # [batch, 128]
         mate_logits_flat = self.mate_expand(mate_bottleneck)  # [batch, policy_dim * num_mate_classes]
-        mate_logits = mate_logits_flat.reshape(batch_size, self.policy_dim, self.num_mate_classes)
+        mate_logits = mate_logits_flat.reshape(batch_size, self.policy_dim, self.num_mate_classes) # .contiguous()
 
         target_device = policy_logits.device
 
@@ -560,10 +560,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
                 # Flatten for loss computation
                 # [batch*seq, vocab]
-                lm_logits_flat = lm_logits.view(-1, lm_logits.size(-1))
-                original_ids_flat = original_input_ids.view(-1)  # [batch*seq]
+                lm_logits_flat = lm_logits.reshape(-1, lm_logits.size(-1))
+                original_ids_flat = original_input_ids.reshape(-1)  # [batch*seq]
                 # [batch*seq]
-                masked_positions_flat = masked_positions.view(-1)
+                masked_positions_flat = masked_positions.reshape(-1)
 
                 # Only compute loss on masked positions
                 masked_lm_logits = lm_logits_flat[masked_positions_flat]
