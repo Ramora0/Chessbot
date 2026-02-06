@@ -326,7 +326,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         # Mate prediction: 7-class classification per move (from shared attention pooling via bottleneck)
         mate_bottleneck = task_outputs['mate']  # [batch, 128]
         mate_logits_flat = self.mate_expand(mate_bottleneck)  # [batch, policy_dim * num_mate_classes]
-        mate_logits = mate_logits_flat.reshape(batch_size, self.policy_dim, self.num_mate_classes) # .contiguous()
+        mate_logits = mate_logits_flat.reshape(batch_size, self.policy_dim, self.num_mate_classes).contiguous()
 
         target_device = policy_logits.device
 
