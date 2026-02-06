@@ -429,6 +429,15 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         self.post_init()
 
+        # Zero-init RPE embeddings AFTER post_init(), which re-inits all
+        # nn.Embedding modules with normal(0, initializer_range).
+        # Zero init is critical: matches lc0, lets the model start with
+        # pure content-based attention and gradually learn positional signal.
+        for rpe in self.rel_pos_embs:
+            nn.init.zeros_(rpe.rel_query_board.weight)
+            nn.init.zeros_(rpe.rel_key_board.weight)
+            nn.init.zeros_(rpe.rel_value_board.weight)
+
     # type: ignore[override]
     def load_state_dict(self, state_dict, strict: bool = False):
         # Handle legacy checkpoints with absolute position embeddings
