@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -136,27 +137,23 @@ def relative_position_attention_forward(
     # [batch, heads, seq_q, dim] @ [batch, heads, dim, seq_k] -> [batch, heads, seq_q, seq_k]
     attn_scores = torch.matmul(query, key.transpose(-2, -1))
 
-    # Term 2: q_i @ a_ij^K (query to key-bias)
+    # Term 2: q_i @ a_ij^K (content-to-position)
     # [batch, heads, seq_q, dim] einsum [heads, seq_q, seq_k, dim] -> [batch, heads, seq_q, seq_k]
-    # DISABLED: Testing if Q/K biases cause instability
-    # term2 = torch.einsum('bhqd,hqkd->bhqk', query, rel_key_bias_t)
-    # attn_scores = attn_scores + term2
+    term2 = torch.einsum('bhqd,hqkd->bhqk', query, rel_key_bias_t)
+    attn_scores = attn_scores + term2
 
-    # Term 3: a_ij^Q @ k_j^T (query-bias to key)
+    # Term 3: a_ij^Q @ k_j^T (position-to-content)
     # [heads, seq_q, seq_k, dim] einsum [batch, heads, seq_k, dim] -> [batch, heads, seq_q, seq_k]
-    # DISABLED: Testing if Q/K biases cause instability
-    # term3 = torch.einsum('hqkd,bhkd->bhqk', rel_query_bias_t, key)
-    # attn_scores = attn_scores + term3
+    term3 = torch.einsum('hqkd,bhkd->bhqk', rel_query_bias_t, key)
+    attn_scores = attn_scores + term3
 
-    # Term 4: a_ij^Q @ a_ij^K (bias to bias - position-only attention)
-    # [heads, seq_q, seq_k, dim] einsum [heads, seq_q, seq_k, dim] -> [heads, seq_q, seq_k]
-    # This is a fixed bias matrix (independent of input), broadcast to batch
-    # DISABLED: Testing if Q/K biases cause instability
-    # term4 = torch.einsum('hqkd,hqkd->hqk', rel_query_bias_t, rel_key_bias_t)
-    # attn_scores = attn_scores + term4.unsqueeze(0)  # [1, heads, seq_q, seq_k]
+    # Term 4 (position-to-position, a^Q @ a^K) deliberately omitted:
+    # it's input-independent and universally dropped (DeBERTa, Transformer-XL)
 
-    # Apply scaling
-    attn_scores = attn_scores * scaling
+    # Apply scaling corrected for 3-term attention (DeBERTa-style):
+    # standard 1/sqrt(d) assumes one dot-product; with 3 terms the variance
+    # is ~3x larger, so we use 1/sqrt(3d) = scaling / sqrt(3)
+    attn_scores = attn_scores * (scaling / math.sqrt(3.0))
 
     # Apply attention mask
     if attention_mask is not None:
@@ -348,17 +345,21 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self._disable_rope()
         hidden_size = config.hidden_size
 
-        # Relative position embeddings with full Q, K, V biases
+        # Per-layer relative position embeddings with full Q, K, V biases
         # Board positions (0-63) use 2D relative coordinates (rank_diff, file_diff)
-        # Metadata positions (64-71) use special global embeddings
+        # Each layer gets its own embeddings to avoid 20x gradient accumulation
         num_heads = config.num_attention_heads
         head_dim = hidden_size // num_heads
-        self.rel_pos_emb = ChessRelativePositionEmbedding(
-            num_heads=num_heads,
-            head_dim=head_dim,
-            board_size=64,
-            max_seq_len=72,
-        )
+        num_layers = config.num_hidden_layers
+        self.rel_pos_embs = nn.ModuleList([
+            ChessRelativePositionEmbedding(
+                num_heads=num_heads,
+                head_dim=head_dim,
+                board_size=64,
+                max_seq_len=72,
+            )
+            for _ in range(num_layers)
+        ])
 
         # Replace attention forward in all layers to use relative position embeddings
         self._install_relative_attention()
@@ -410,12 +411,23 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             del state_dict[legacy_key]
 
         # Handle legacy checkpoints with metadata relative position embeddings (now removed)
-        legacy_meta_keys = [k for k in state_dict if 'rel_pos_emb.rel_' in k and '_meta' in k]
+        legacy_meta_keys = [k for k in state_dict if 'rel_pos_emb' in k and '_meta' in k]
         for key in legacy_meta_keys:
             print(f"Warning: Ignoring legacy metadata position embedding: {key}")
             del state_dict[key]
 
-        # Check for new relative position keys
+        # Handle legacy shared rel_pos_emb -> broadcast to per-layer rel_pos_embs
+        shared_keys = [k for k in state_dict if k.startswith('rel_pos_emb.') and 'rel_pos_embs.' not in k]
+        if shared_keys:
+            num_layers = len(self.rel_pos_embs)
+            print(f"Broadcasting legacy shared position embeddings to {num_layers} per-layer embeddings")
+            for key in list(shared_keys):
+                suffix = key[len('rel_pos_emb.'):]  # e.g. 'rel_query_board.weight'
+                for i in range(num_layers):
+                    state_dict[f'rel_pos_embs.{i}.{suffix}'] = state_dict[key].clone()
+                del state_dict[key]
+
+        # Check for relative position keys
         rel_pos_keys = [k for k in state_dict if 'rel_pos_emb' in k]
         if not rel_pos_keys:
             print("Note: Checkpoint has no relative position embeddings, using random initialization")
@@ -498,12 +510,12 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         llama_module.apply_rotary_pos_emb = no_op_rotary
 
     def _install_relative_attention(self) -> None:
-        """Replace LlamaAttention forward methods to use relative position embeddings."""
+        """Replace LlamaAttention forward methods to use per-layer relative position embeddings."""
         import types
 
-        new_forward = make_relative_attention_forward(self.rel_pos_emb)
-        for block in self.transformer.layers:
-            block.self_attn.forward = types.MethodType(new_forward, block.self_attn)
+        for i, block in enumerate(self.transformer.layers):
+            forward_fn = make_relative_attention_forward(self.rel_pos_embs[i])
+            block.self_attn.forward = types.MethodType(forward_fn, block.self_attn)
 
     def forward(
         self,
