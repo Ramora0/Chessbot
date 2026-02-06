@@ -49,10 +49,13 @@ class ChessRelativePositionEmbedding(nn.Module):
         self.rel_key_board = nn.Embedding(225, num_heads * head_dim)
         self.rel_value_board = nn.Embedding(225, num_heads * head_dim)
 
-        # Initialize with small values for stability
-        nn.init.normal_(self.rel_query_board.weight, std=0.02)
-        nn.init.normal_(self.rel_key_board.weight, std=0.02)
-        nn.init.normal_(self.rel_value_board.weight, std=0.02)
+        # Initialize to zeros for stability (matches lc0's approach).
+        # Zero init means the model starts with no positional signal and
+        # gradually learns it, preventing RPE from dominating content-based
+        # attention and causing gradient spikes in deep (20-layer) models.
+        nn.init.zeros_(self.rel_query_board.weight)
+        nn.init.zeros_(self.rel_key_board.weight)
+        nn.init.zeros_(self.rel_value_board.weight)
 
         # Precompute relative position indices (fixed for chess board)
         self._precompute_indices()
