@@ -523,9 +523,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             legal_mask = (policy > -0.99)  # [batch, policy_dim]
 
             # Flatten for cross-entropy
-            mate_logits_flat = mate_logits.view(-1, self.num_mate_classes)  # [batch * policy_dim, 7]
-            mate_targets_flat = mate_classes.view(-1)  # [batch * policy_dim]
-            legal_mask_flat = legal_mask.view(-1)  # [batch * policy_dim]
+            mate_logits_flat = mate_logits.reshape(-1, self.num_mate_classes)  # [batch * policy_dim, 7]
+            mate_targets_flat = mate_classes.reshape(-1)  # [batch * policy_dim]
+            legal_mask_flat = legal_mask.reshape(-1)  # [batch * policy_dim]
 
             # Only compute loss on legal moves
             if legal_mask_flat.any():
