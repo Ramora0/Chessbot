@@ -629,9 +629,34 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             illegality_rate = summed_illegal_prob.mean()
 
             # Top-1 agreement: % of time model's top move matches Stockfish's best move
-            model_best_move_idx = model_probs.argmax(dim=-1)
-            stockfish_best_move_idx = policy.argmax(dim=-1)
-            top1_agreement = (model_best_move_idx == stockfish_best_move_idx).float().mean()
+            # Handles tied best moves and mate-depth preferences
+            model_best_move_idx = model_probs.argmax(dim=-1)  # [batch]
+
+            # Find all moves tied for best (policy=0.0 is best, tolerance for float imprecision)
+            best_policy_val = policy.max(dim=-1, keepdim=True).values  # [batch, 1]
+            is_best = (policy >= best_policy_val - 1e-4)  # [batch, policy_dim]
+
+            if mate_depths is not None:
+                md = mate_depths.float()
+                # Among tied-best moves, check for positive mate depths (mate-in-N, winning)
+                tied_positive_mate = is_best & (md > 0)  # [batch, policy_dim]
+                any_positive_mate = tied_positive_mate.any(dim=-1, keepdim=True)  # [batch, 1]
+
+                # Find shortest mate depth among tied-best positive-mate moves
+                mate_for_min = torch.where(
+                    tied_positive_mate, md, torch.full_like(md, float('inf'))
+                )
+                shortest_mate = mate_for_min.min(dim=-1, keepdim=True).values  # [batch, 1]
+
+                # If any tied-best move has a positive mate, only shortest-mate moves are "best"
+                is_best = torch.where(
+                    any_positive_mate,
+                    tied_positive_mate & (md == shortest_mate),
+                    is_best,
+                )
+
+            # Check if model's pick is among the best moves
+            top1_agreement = is_best.gather(1, model_best_move_idx.unsqueeze(1)).squeeze(1).float().mean()
 
         loss_components = [
             component

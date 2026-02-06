@@ -12,22 +12,31 @@
 
 set -euo pipefail
 
-# Optional: Set RUN_NAME environment variable before submitting
-# export RUN_NAME="my-experiment"
-: ${RUN_NAME:=""}
+# CLI arguments (passed after -- in sbatch command)
+# Usage: sbatch slurms/h100.slurm [branch] [run_name]
+# Example: sbatch slurms/h100.slurm feature-branch my-experiment
+BRANCH="${1:-master}"
+RUN_NAME="${2:-}"
 
-# Copy code to local storage FIRST (quick, locks in code version)
-CODE_LOCAL="$TMPDIR/Chessbot"
+# Each job gets unique directory (SLURM_JOB_ID ensures no collisions)
+CODE_LOCAL="$TMPDIR/Chessbot-$SLURM_JOB_ID"
+
 echo "================================================"
-echo "Copying code to local storage..."
+echo "Cloning branch '$BRANCH' to local storage..."
+echo "Job ID: $SLURM_JOB_ID"
 echo "================================================"
 
-# Copy current code state to local node
-mkdir -p "$CODE_LOCAL"
-cp -r "$HOME/personal/Chessbot/"* "$CODE_LOCAL/" 2>/dev/null || true
-cp -r "$HOME/personal/Chessbot/".??* "$CODE_LOCAL/" 2>/dev/null || true
+# Get remote URL from local repo, then clone from remote
+# This ensures we can access all pushed branches, not just local ones
+REMOTE_URL=$(git -C "$HOME/personal/Chessbot" remote get-url origin)
 
-echo "Code copy complete."
+# Clone specific branch directly into isolated temp directory
+# Uses --single-branch for efficiency (only fetches needed branch)
+git clone --branch "$BRANCH" --single-branch --depth 1 \
+    "$REMOTE_URL" "$CODE_LOCAL"
+
+echo "Clone complete. Branch: $(cd "$CODE_LOCAL" && git branch --show-current)"
+echo "Commit: $(cd "$CODE_LOCAL" && git rev-parse --short HEAD)"
 
 # Original dataset location on shared storage
 DATASET_SOURCE="/fs/scratch/PAS2836/lees_stuff/action_value"
@@ -49,11 +58,11 @@ time cp -r "$DATASET_SOURCE/"* "$DATASET_LOCAL/"
 echo "Dataset copy complete. Size:"
 du -sh "$DATASET_LOCAL"
 
+# Activate python env from original location (not cloned)
+source "$HOME/personal/Chessbot/.h100/bin/activate"
+
 # Go to local code copy
 cd "$CODE_LOCAL"
-
-# Your python env
-source .h100/bin/activate
 
 # Run training with local dataset path
 export DATASET_PATH="$DATASET_LOCAL"
