@@ -143,6 +143,49 @@ class TrackingTrainer(Trainer):
             raise ValueError(
                 "Model did not return a loss tensor during training")
 
+        # --- Blowup detection: dump all loss components if loss is bad ---
+        loss_val = loss.detach().item()
+        if not math.isfinite(loss_val) or loss_val > 1000:
+            step = self.state.global_step
+            print(f"\n{'!'*70}")
+            print(f"LOSS BLOWUP at step {step}: total_loss={loss_val}")
+            # Dump every individual loss component (unweighted)
+            raw_model = model.module if hasattr(model, 'module') else model
+            component_names = [
+                'policy_loss', 'move_winrate_loss', 'illegality_loss',
+                'winrate_loss', 'control_map_loss', 'masked_token_loss', 'mate_loss',
+            ]
+            for name in component_names:
+                val = getattr(outputs, name, None)
+                if val is not None:
+                    v = val.detach().item()
+                    weight_attr = name.replace('_loss', '_loss_weight')
+                    w = float(getattr(raw_model, weight_attr, 1.0))
+                    print(f"  {name:25s} = {v:12.4f}  (weight={w}, raw={v/w if w else v:.6f})")
+            # RPE weight norms
+            if hasattr(raw_model, 'rel_pos_embs'):
+                print("  RPE weight norms:")
+                for i, rpe in enumerate(raw_model.rel_pos_embs):
+                    q_n = rpe.rel_query_board.weight.norm().item()
+                    k_n = rpe.rel_key_board.weight.norm().item()
+                    v_n = rpe.rel_value_board.weight.norm().item()
+                    q_max = rpe.rel_query_board.weight.abs().max().item()
+                    k_max = rpe.rel_key_board.weight.abs().max().item()
+                    v_max = rpe.rel_value_board.weight.abs().max().item()
+                    print(f"    Layer {i:2d}: Q(norm={q_n:.4f}, max={q_max:.4f})  "
+                          f"K(norm={k_n:.4f}, max={k_max:.4f})  "
+                          f"V(norm={v_n:.4f}, max={v_max:.4f})")
+            # Input data stats
+            if 'policy' in inputs and inputs['policy'] is not None:
+                p = inputs['policy']
+                tv = inputs.get('true_value')
+                print(f"  Input policy: min={p.min().item():.4f} max={p.max().item():.4f} "
+                      f"has_nan={bool(torch.isnan(p).any())}")
+                if tv is not None:
+                    print(f"  Input true_value: min={tv.min().item():.4f} max={tv.max().item():.4f} "
+                          f"has_nan={bool(torch.isnan(tv).any())}")
+            print(f"{'!'*70}\n")
+
         self._last_total_loss = float(loss.detach().item())
 
         policy_loss = getattr(outputs, "policy_loss", None)
@@ -310,6 +353,22 @@ class TrackingTrainer(Trainer):
             if self._last_model_entropy is not None:
                 logs.setdefault("model_entropy",
                                 self._last_model_entropy)
+
+            # RPE weight norms (track growth over time in wandb)
+            raw_model = self.model.module if hasattr(self.model, 'module') else self.model
+            if hasattr(raw_model, 'rel_pos_embs'):
+                q_norms, k_norms, v_norms = [], [], []
+                for rpe in raw_model.rel_pos_embs:
+                    q_norms.append(rpe.rel_query_board.weight.norm().item())
+                    k_norms.append(rpe.rel_key_board.weight.norm().item())
+                    v_norms.append(rpe.rel_value_board.weight.norm().item())
+                logs["rpe_q_norm_mean"] = sum(q_norms) / len(q_norms)
+                logs["rpe_k_norm_mean"] = sum(k_norms) / len(k_norms)
+                logs["rpe_v_norm_mean"] = sum(v_norms) / len(v_norms)
+                logs["rpe_q_norm_max"] = max(q_norms)
+                logs["rpe_k_norm_max"] = max(k_norms)
+                logs["rpe_v_norm_max"] = max(v_norms)
+
         super().log(logs, *args, **kwargs)
 
 

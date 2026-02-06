@@ -122,6 +122,7 @@ def relative_position_attention_forward(
     scaling: float,
     dropout: float = 0.0,
     training: bool = False,
+    layer_idx: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Attention with full Q, K, V relative position representations.
 
@@ -175,13 +176,34 @@ def relative_position_attention_forward(
     rel_value_output = torch.einsum('bhqk,hqkd->bhqd', attn_weights, rel_value_bias_t)
     attn_output = attn_output + rel_value_output
 
+    # --- Numerical health check (only on first batch element, cheap) ---
+    if training and _rpe_diag_enabled:
+        with torch.no_grad():
+            _rpe_diagnostics.setdefault('layers', {})[layer_idx] = {
+                'qk_max': attn_scores[:1].abs().max().item(),
+                'term2_max': term2[:1].abs().max().item(),
+                'term3_max': term3[:1].abs().max().item(),
+                'attn_output_max': attn_output[:1].abs().max().item(),
+                'rel_value_max': rel_value_output[:1].abs().max().item(),
+                'value_max': value[:1].abs().max().item(),
+                'attn_has_nan': bool(torch.isnan(attn_output[:1]).any()),
+                'attn_has_inf': bool(torch.isinf(attn_output[:1]).any()),
+            }
+
     # Transpose for output projection: [batch, seq, heads, dim]
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
 
 
-def make_relative_attention_forward(rel_pos_emb: ChessRelativePositionEmbedding):
+# ── RPE diagnostics toggle ──────────────────────────────────────────────
+# Set _rpe_diag_enabled = True before a forward pass to collect per-layer
+# stats into _rpe_diagnostics.  Cheap (first sample only, no grad).
+_rpe_diag_enabled: bool = False
+_rpe_diagnostics: dict = {}
+
+
+def make_relative_attention_forward(rel_pos_emb: ChessRelativePositionEmbedding, layer_idx: int = -1):
     """Create a patched attention forward that uses full Q, K, V relative positions."""
 
     def forward_with_relative_pos(
@@ -219,6 +241,7 @@ def make_relative_attention_forward(rel_pos_emb: ChessRelativePositionEmbedding)
             scaling=self.scaling,
             dropout=0.0 if not self.training else self.attention_dropout,
             training=self.training,
+            layer_idx=layer_idx,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -518,7 +541,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         import types
 
         for i, block in enumerate(self.transformer.layers):
-            forward_fn = make_relative_attention_forward(self.rel_pos_embs[i])
+            forward_fn = make_relative_attention_forward(self.rel_pos_embs[i], layer_idx=i)
             block.self_attn.forward = types.MethodType(forward_fn, block.self_attn)
 
     def forward(
@@ -544,10 +567,46 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         # Relative position embeddings are now handled inside attention layers
         # via ChessRelativePositionEmbedding (no absolute position embedding addition)
 
+        # Enable per-layer RPE diagnostics during training
+        global _rpe_diag_enabled, _rpe_diagnostics
+        if self.training:
+            _rpe_diag_enabled = True
+            _rpe_diagnostics.clear()
+
         # Process all tokens through transformer
         transformer_outputs = self.transformer(
             inputs_embeds=input_embeds, **kwargs)
         hidden_states = transformer_outputs.last_hidden_state
+
+        # Check for numerical issues in hidden states coming out of the transformer
+        if self.training:
+            _rpe_diag_enabled = False
+            with torch.no_grad():
+                hs_abs_max = hidden_states.abs().max().item()
+                hs_has_nan = bool(torch.isnan(hidden_states).any())
+                hs_has_inf = bool(torch.isinf(hidden_states).any())
+                if hs_has_nan or hs_has_inf or hs_abs_max > 60000:
+                    print(f"\n{'='*70}")
+                    print(f"NUMERICAL ISSUE in hidden states: max={hs_abs_max:.1f} nan={hs_has_nan} inf={hs_has_inf}")
+                    print(f"Input embed max: {input_embeds.abs().max().item():.4f}")
+                    # Dump per-layer attention diagnostics
+                    for layer_id in sorted(_rpe_diagnostics.get('layers', {}).keys()):
+                        d = _rpe_diagnostics['layers'][layer_id]
+                        print(f"  Layer {layer_id:2d}: "
+                              f"qk_max={d['qk_max']:.1f}  "
+                              f"term2_max={d['term2_max']:.1f}  "
+                              f"term3_max={d['term3_max']:.1f}  "
+                              f"attn_out_max={d['attn_output_max']:.1f}  "
+                              f"rpe_v_max={d['rel_value_max']:.1f}  "
+                              f"V_max={d['value_max']:.1f}  "
+                              f"nan={d['attn_has_nan']}  inf={d['attn_has_inf']}")
+                    # RPE weight norms
+                    for i, rpe in enumerate(self.rel_pos_embs):
+                        q_norm = rpe.rel_query_board.weight.norm().item()
+                        k_norm = rpe.rel_key_board.weight.norm().item()
+                        v_norm = rpe.rel_value_board.weight.norm().item()
+                        print(f"  RPE weights layer {i:2d}: Q_norm={q_norm:.4f}  K_norm={k_norm:.4f}  V_norm={v_norm:.4f}")
+                    print(f"{'='*70}\n")
 
         # Multi-task attention pooling (single forward pass)
         task_outputs = self.task_head(hidden_states)
