@@ -106,9 +106,6 @@ class ChessPolicyValueOutput(ModelOutput):
     policy_logits: torch.Tensor = None
     winrate_logits: torch.Tensor = None
     control_logits: torch.Tensor = None
-    illegality_logits: torch.Tensor = None
-    move_winrate_logits: torch.Tensor = None
-    mate_logits: torch.Tensor = None
     policy_loss: Optional[torch.Tensor] = None
     winrate_loss: Optional[torch.Tensor] = None
     control_map_loss: Optional[torch.Tensor] = None
@@ -326,7 +323,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         # Mate prediction: 7-class classification per move (from shared attention pooling via bottleneck)
         mate_bottleneck = task_outputs['mate']  # [batch, 128]
         mate_logits_flat = self.mate_expand(mate_bottleneck)  # [batch, policy_dim * num_mate_classes]
-        mate_logits = mate_logits_flat.reshape(batch_size, self.policy_dim, self.num_mate_classes).contiguous()
+        mate_logits = mate_logits_flat.reshape(batch_size, self.policy_dim, self.num_mate_classes)# .contiguous()
 
         target_device = policy_logits.device
 
@@ -668,9 +665,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             policy_logits=policy_logits,
             winrate_logits=winrate_logits,
             control_logits=control_logits,
-            illegality_logits=policy_logits,  # Now unified with policy_logits - sigmoid predicts both win% and legality
-            move_winrate_logits=policy_logits,  # Alias - sigmoid of policy_logits used for win% and legality
-            mate_logits=mate_logits,  # [batch, policy_dim, 7] mate class predictions per move
             policy_loss=policy_loss,  # Cross-entropy with softmax target from un-sigmoid'd Stockfish win%
             winrate_loss=winrate_loss,
             control_map_loss=control_map_loss,
