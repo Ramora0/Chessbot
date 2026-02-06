@@ -153,10 +153,11 @@ def relative_position_attention_forward(
     # Term 4 (position-to-position, a^Q @ a^K) deliberately omitted:
     # it's input-independent and universally dropped (DeBERTa, Transformer-XL)
 
-    # Apply scaling corrected for 3-term attention (DeBERTa-style):
-    # standard 1/sqrt(d) assumes one dot-product; with 3 terms the variance
-    # is ~3x larger, so we use 1/sqrt(3d) = scaling / sqrt(3)
-    attn_scores = attn_scores * (scaling / math.sqrt(3.0))
+    # Standard 1/sqrt(d) scaling, matching lc0's approach: all three terms
+    # (QK^T, Q@RPE_K, RPE_Q@K) are summed then scaled together.
+    # With zero-init RPE, only the QK^T term is active early in training,
+    # so the 1/sqrt(3) DeBERTa correction would over-dampen initial attention.
+    attn_scores = attn_scores * scaling
 
     # Apply attention mask
     if attention_mask is not None:
