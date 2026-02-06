@@ -17,8 +17,7 @@ This dataset is derived from the action-value data released with ["Grandmaster-L
 
 ## Use Cases
 
-- Training a policy/value model with richer per-position action structure
-- Studying calibration of win probability vs. mate depth
+- Training a policy model with full stockfish signal, rather than just best move as Deepmind does
 - Training models to predict mate imminence signals beyond saturated win rates
 
 ## Source Dataset
@@ -38,7 +37,7 @@ Each row contains:
 | `p_win` | `List[float]` | Win probability for side-to-move per move, in `[0.0, 1.0]` (unchanged from source) |
 | `mate` | `List[int]` | Mate depth per move (new field, see below) |
 
-All three list fields (`moves`, `p_win`, `mate`) share the same length for each row.
+All three list fields (`moves`, `p_win`, `mate`) share the same length for each row and are correlated.
 
 ## Mate Field Definition
 
@@ -50,7 +49,7 @@ The `mate` field encodes forced mate depth in **full moves** (not plies), from t
 | `mate < 0` | Playing this move leads to getting mated in N moves |
 | `mate = 0` | No forced mate detected, or move was not analyzed |
 
-Only moves meeting the extreme win probability threshold are analyzed for mate depth. All other moves have `mate = 0`.
+Only moves with stockfish win probability of 0% or 100% are analyzed, since these represent when stockfish found a mate in its search. All other moves have `mate = 0` by default.
 
 ### Analysis Thresholds
 
@@ -60,7 +59,7 @@ Only moves meeting the extreme win probability threshold are analyzed for mate d
 
 ## How Mate-in-N Was Computed
 
-Mate depth labels were generated using Stockfish with depth 16; we found this found forced mates for ~98.5% of moves with winrates of 0% or 100%.
+Mate depth labels were generated using Stockfish with depth 16; we found this found forced mates for ~98.5% of moves with winrates of 0% or 100%. It also means the maximum mate depth is 8 moves; when move winrate is 0% or 100% and mate is 0, it likely means a deeper stockfish found a forced mate in 8+ moves.
 
 ### Analysis Procedure
 
@@ -69,7 +68,7 @@ For each move meeting the win probability threshold:
 1. The move is applied to the board position
 2. If the resulting position is immediate checkmate, `mate = 1` (or `-1` if a losing move)
 3. Otherwise, Stockfish analyzes the resulting position to depth 16
-4. If Stockfish reports a mate score, the mate depth (in full moves) is recorded
+4. If Stockfish reports a mate score, the mate depth (in full moves) is recorded, + 1 to account for our original move
 5. If no mate score is found within the depth limit, `mate = 0`
 
 **Note**: `mate = 0` does not imply no forced mate exists -- only that none was found within the search depth limit.
