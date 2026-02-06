@@ -31,29 +31,7 @@ from tokenizer import process_fen
 
 EXPECTED_SEQ_LEN = 72
 NUM_VALUE_BINS = 128
-NUM_MATE_CLASSES = 5
-
-
-def mate_depth_to_class(mate_depth: int) -> int:
-    """Convert mate depth to class index.
-
-    Classes:
-        0: no_mate (includes getting mated, i.e., negative depths)
-        1: mate_in_1
-        2: mate_in_2
-        3: mate_in_3
-        4: mate_in_4_plus
-    """
-    if mate_depth <= 0:
-        return 0  # no_mate (includes getting mated)
-    elif mate_depth == 1:
-        return 1
-    elif mate_depth == 2:
-        return 2
-    elif mate_depth == 3:
-        return 3
-    else:
-        return 4  # mate_in_4_plus
+NUM_MATE_CLASSES = 7
 
 
 def create_action_value_dataset(
@@ -146,7 +124,7 @@ def _transform_example(
     all_true_value = []
     all_legal_move_mask = []
     all_control_map = []
-    all_mate_classes = []
+    all_mate_depths = []
 
     # Check if mate field exists in dataset
     has_mate_field = "mate" in examples
@@ -226,15 +204,13 @@ def _transform_example(
             control_map[sq] = len(board.attackers(chess.WHITE, chess_sq))
             control_map[64 + sq] = len(board.attackers(chess.BLACK, chess_sq))
 
-        # 6. Process mate classes if mate field exists
-        mate_classes = np.zeros(policy_size, dtype=np.int64)
+        # 6. Process mate depths if mate field exists
+        mate_depths_arr = np.zeros(policy_size, dtype=np.int16)
         if has_mate_field:
-            mate_depths = examples["mate"][i]
-            for j, (move, mate_depth) in enumerate(zip(moves, mate_depths)):
+            mate_depths_raw = examples["mate"][i]
+            for j, (move, md) in enumerate(zip(moves, mate_depths_raw)):
                 if move in move_to_idx:
-                    idx = move_to_idx[move]
-                    mate_class = mate_depth_to_class(mate_depth)
-                    mate_classes[idx] = mate_class
+                    mate_depths_arr[move_to_idx[move]] = int(md)
 
         # Add to batch outputs
         all_input_ids.append(input_ids)
@@ -243,7 +219,7 @@ def _transform_example(
         all_true_value.append(float(best_win_prob))
         all_legal_move_mask.append(legal_move_mask.tolist())
         all_control_map.append(control_map.tolist())
-        all_mate_classes.append(mate_classes.tolist())
+        all_mate_depths.append(mate_depths_arr.tolist())
 
     result = {
         "input_ids": all_input_ids,
@@ -254,8 +230,8 @@ def _transform_example(
         "control_map": all_control_map,
     }
 
-    # Only include mate classes if mate data exists in dataset
+    # Only include mate depths if mate data exists in dataset
     if has_mate_field:
-        result["mate_classes"] = all_mate_classes
+        result["mate_depths"] = all_mate_depths
 
     return result

@@ -69,7 +69,7 @@ class ChessPolicyCollator:
         winrate_list = []
         legal_move_mask_list = []
         control_map_list = []
-        mate_classes_list = []
+        mate_depths_list = []
 
         for item in batch:
             # Convert lists to tensors (HF datasets return lists)
@@ -100,11 +100,11 @@ class ChessPolicyCollator:
                     control_map = torch.tensor(control_map, dtype=torch.float32)
                 control_map_list.append(control_map)
 
-            if "mate_classes" in item:
-                mate_classes = item["mate_classes"]
-                if not isinstance(mate_classes, torch.Tensor):
-                    mate_classes = torch.tensor(mate_classes, dtype=torch.long)
-                mate_classes_list.append(mate_classes)
+            if "mate_depths" in item:
+                mate_depths = item["mate_depths"]
+                if not isinstance(mate_depths, torch.Tensor):
+                    mate_depths = torch.tensor(mate_depths, dtype=torch.int16)
+                mate_depths_list.append(mate_depths)
 
         if not input_ids_list:
             raise ValueError("Empty batch provided to ChessPolicyCollator")
@@ -185,9 +185,9 @@ class ChessPolicyCollator:
             control_maps = torch.stack(control_map_list)
             result["control_map"] = control_maps
 
-        if mate_classes_list:
-            mate_classes = torch.stack(mate_classes_list)
-            result["mate_classes"] = mate_classes
+        if mate_depths_list:
+            mate_depths = torch.stack(mate_depths_list)
+            result["mate_depths"] = mate_depths
 
         # Add masking-related fields if masking was applied
         if original_input_ids is not None:
