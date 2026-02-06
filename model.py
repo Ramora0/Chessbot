@@ -23,6 +23,25 @@ from loss_weights import (
 )
 
 
+# ── Gradient explosion diagnostics ─────────────────────────────────────
+# Register backward hooks on intermediate tensors to catch gradient explosions.
+# Hooks fire during backward and print when grad norm exceeds threshold.
+_GRAD_DEBUG_THRESHOLD = 100.0  # Print when any grad norm > this
+
+
+def _make_grad_hook(name: str):
+    """Create a backward hook that checks gradient health."""
+    def hook(grad):
+        grad_norm = grad.norm().item()
+        grad_max = grad.abs().max().item()
+        has_nan = bool(torch.isnan(grad).any())
+        has_inf = bool(torch.isinf(grad).any())
+        if has_nan or has_inf or grad_norm > _GRAD_DEBUG_THRESHOLD:
+            print(f"  GRAD [{name}]: norm={grad_norm:.2e} max={grad_max:.2e} "
+                  f"shape={list(grad.shape)} nan={has_nan} inf={has_inf}")
+    return hook
+
+
 class ChessRelativePositionEmbedding(nn.Module):
     """Chess-aware relative position embeddings with full Q, K, V biases.
 
@@ -641,6 +660,36 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         target_device = policy_logits.device
 
+        # Register backward hooks on key intermediate tensors (training only)
+        if self.training:
+            hidden_states.register_hook(_make_grad_hook("hidden_states"))
+            policy_logits.register_hook(_make_grad_hook("policy_logits"))
+            winrate_logits.register_hook(_make_grad_hook("winrate_logits"))
+            control_logits.register_hook(_make_grad_hook("control_logits"))
+            mate_logits_flat.register_hook(_make_grad_hook("mate_logits_flat"))
+
+        # Forward-pass health check on task head outputs
+        if self.training:
+            with torch.no_grad():
+                _fwd_issues = []
+                for _name, _t in [("policy_logits", policy_logits),
+                                   ("winrate_logits", winrate_logits),
+                                   ("control_logits", control_logits),
+                                   ("mate_logits_flat", mate_logits_flat)]:
+                    _t_max = _t.abs().max().item()
+                    if torch.isnan(_t).any():
+                        _fwd_issues.append(f"{_name} has NaN")
+                    if torch.isinf(_t).any():
+                        _fwd_issues.append(f"{_name} has Inf")
+                    if _t_max > 1000:
+                        _fwd_issues.append(f"{_name} max={_t_max:.1f}")
+                if _fwd_issues:
+                    print(f"\n{'='*70}")
+                    print(f"FORWARD HEALTH CHECK — task head outputs (step {training_step}):")
+                    for _issue in _fwd_issues:
+                        print(f"  {_issue}")
+                    print(f"{'='*70}\n")
+
         # Use passed endgame weights for loss upweighting, or default to uniform weights
         if endgame_weights is None:
             endgame_weights = torch.ones(batch_size, device=target_device)
@@ -715,6 +764,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 torch.clamp(annealed_logits, max=-1e9)
             )
 
+            # Register gradient hook on annealed_logits (feeds both policy CE and BCE losses)
+            if self.training:
+                annealed_logits.register_hook(_make_grad_hook("annealed_logits"))
+
             # Use log_softmax (numerically stable — never computes log(0))
             # then derive probs only where needed for metrics.
             # The old pattern `softmax() + log() + 1e-10` is unsafe in bf16:
@@ -762,6 +815,41 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             mae_per_move = torch.abs(pred_winrates - absolute_winrates)
             total_legal_count = policy_mask_bool.float().sum()
             move_winrate_mae = (mae_per_move * policy_mask_bool.float()).sum() / total_legal_count.clamp(min=1)
+
+            # Forward health check on targets and loss intermediates
+            if self.training:
+                with torch.no_grad():
+                    _fwd_issues = []
+                    # Check absolute_winrates range (should be [0,1])
+                    aw_min = absolute_winrates.min().item()
+                    aw_max = absolute_winrates.max().item()
+                    if aw_min < -0.1 or aw_max > 1.1:
+                        _fwd_issues.append(f"absolute_winrates out of range [{aw_min:.4f}, {aw_max:.4f}]")
+                    # Check target_logits on legal moves
+                    _legal_tl = target_logits[policy_mask_bool]
+                    if _legal_tl.numel() > 0:
+                        tl_max = _legal_tl.abs().max().item()
+                        if tl_max > 50:
+                            _fwd_issues.append(f"target_logits (legal) max={tl_max:.1f}")
+                    # Check annealed_logits range
+                    _legal_al = annealed_logits[policy_mask_bool]
+                    if _legal_al.numel() > 0:
+                        al_max = _legal_al.abs().max().item()
+                        if al_max > 100:
+                            _fwd_issues.append(f"annealed_logits (legal) max={al_max:.1f}")
+                    # Check individual loss values
+                    for _ln, _lv in [("policy_loss", policy_loss), ("move_winrate_loss", move_winrate_loss),
+                                     ("illegality_loss", illegality_loss)]:
+                        if _lv is not None:
+                            _lval = _lv.item()
+                            if not math.isfinite(_lval) or _lval > 100:
+                                _fwd_issues.append(f"{_ln}={_lval:.4f}")
+                    if _fwd_issues:
+                        print(f"\n{'='*70}")
+                        print(f"FORWARD HEALTH CHECK — targets/losses (step {training_step}):")
+                        for _issue in _fwd_issues:
+                            print(f"  {_issue}")
+                        print(f"{'='*70}\n")
 
         winrate_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None
@@ -930,6 +1018,20 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             model_best_move_idx = model_probs.argmax(dim=-1)
             stockfish_best_move_idx = policy.argmax(dim=-1)
             top1_agreement = (model_best_move_idx == stockfish_best_move_idx).float().mean()
+
+        # Register backward hooks on individual loss tensors
+        if self.training:
+            for loss_name, loss_tensor in [
+                ("policy_loss", policy_loss),
+                ("move_winrate_loss", move_winrate_loss),
+                ("illegality_loss", illegality_loss),
+                ("winrate_loss", winrate_loss),
+                ("control_map_loss", control_map_loss),
+                ("masked_token_loss", masked_token_loss),
+                ("mate_loss", mate_loss),
+            ]:
+                if loss_tensor is not None and loss_tensor.requires_grad:
+                    loss_tensor.register_hook(_make_grad_hook(loss_name))
 
         loss_components = [
             component

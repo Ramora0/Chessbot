@@ -60,11 +60,35 @@ BASE_GAME_EVAL_STEPS = GAME_EVAL_STEPS
 RESUME_FROM_CHECKPOINT = None
 
 
+# Set True to get exact backward traceback for NaN grads (~2x slower)
+DETECT_ANOMALY = False
+
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
 
 torch.set_float32_matmul_precision("high")
+
+
+def _classify_param_group(name: str) -> str:
+    """Classify a parameter name into a human-readable group for grad norm analysis."""
+    if 'rel_pos_emb' in name or 'rel_query' in name or 'rel_key' in name or 'rel_value' in name:
+        return 'rpe'
+    if 'task_head' in name:
+        return 'task_heads'
+    if 'control_head' in name:
+        return 'control_head'
+    if 'lm_head' in name:
+        return 'lm_head'
+    if 'embed_tokens' in name:
+        return 'embeddings'
+    if 'layers.' in name:
+        parts = name.split('.')
+        for i, p in enumerate(parts):
+            if p == 'layers' and i + 1 < len(parts):
+                return f'transformer_layer_{int(parts[i+1]):02d}'
+        return 'transformer_other'
+    return 'other'
 
 
 @dataclass
@@ -124,6 +148,7 @@ class TrackingTrainer(Trainer):
         self._last_value_mae: Optional[float] = None
         self._last_move_winrate_mae: Optional[float] = None
         self._last_model_entropy: Optional[float] = None
+        self._last_preclip_grad_norm: Optional[float] = None
         # NEW: Attention policy head losses
         self._last_attention_policy_loss: Optional[float] = None
         self._last_attention_move_winrate_loss: Optional[float] = None
@@ -308,6 +333,46 @@ class TrackingTrainer(Trainer):
             return loss, outputs
         return loss
 
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override to compute per-parameter-group gradient norms after backward."""
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+
+        # Compute pre-clip gradient norms by parameter group
+        raw_model = model.module if hasattr(model, 'module') else model
+        total_norm_sq = 0.0
+        group_norms_sq: dict[str, float] = {}
+        for name, param in raw_model.named_parameters():
+            if param.grad is not None:
+                pn_sq = param.grad.norm().item() ** 2
+                total_norm_sq += pn_sq
+                group = _classify_param_group(name)
+                group_norms_sq.setdefault(group, 0.0)
+                group_norms_sq[group] += pn_sq
+        total_norm = total_norm_sq ** 0.5
+        group_norms = {k: v ** 0.5 for k, v in group_norms_sq.items()}
+
+        self._last_preclip_grad_norm = total_norm
+
+        if total_norm > 100:
+            step = self.state.global_step
+            print(f"\n{'#'*70}")
+            print(f"GRAD EXPLOSION at step {step}: total_norm={total_norm:.2e}")
+            print(f"Per-group grad norms (sorted):")
+            for group, norm in sorted(group_norms.items(), key=lambda x: -x[1]):
+                print(f"  {group:30s}: {norm:.2e}")
+            # Top individual parameters
+            param_norms = []
+            for name, param in raw_model.named_parameters():
+                if param.grad is not None:
+                    param_norms.append((name, param.grad.norm().item(), param.grad.abs().max().item()))
+            param_norms.sort(key=lambda x: -x[1])
+            print(f"Top 10 parameters by grad norm:")
+            for name, norm, mx in param_norms[:10]:
+                print(f"  {name:60s}: norm={norm:.2e} max={mx:.2e}")
+            print(f"{'#'*70}\n")
+
+        return loss
+
     def log(self, logs, *args, **kwargs):  # type: ignore[override]
         logs = dict(logs)
         if "loss" in logs:
@@ -353,6 +418,11 @@ class TrackingTrainer(Trainer):
             if self._last_model_entropy is not None:
                 logs.setdefault("model_entropy",
                                 self._last_model_entropy)
+
+            # Pre-clip gradient norm (catches explosions before clipping hides them)
+            if self._last_preclip_grad_norm is not None:
+                logs.setdefault("preclip_grad_norm",
+                                self._last_preclip_grad_norm)
 
             # RPE weight norms (track growth over time in wandb)
             raw_model = self.model.module if hasattr(self.model, 'module') else self.model
@@ -637,6 +707,11 @@ class RegretEvaluationCallback(TrainerCallback):
 
 def train(run_name: Optional[str] = None) -> None:
     print("Starting chess transformer training...")
+
+    if DETECT_ANOMALY:
+        torch.autograd.set_detect_anomaly(True)
+        print("WARNING: torch.autograd.detect_anomaly enabled — training will be ~2x slower")
+
     os.environ["WANDB_PROJECT"] = "chessformer"
     # Avoid W&B from uploading checkpoints while keeping metric logging enabled.
     os.environ["WANDB_LOG_MODEL"] = "false"
