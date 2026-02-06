@@ -138,19 +138,22 @@ def relative_position_attention_forward(
 
     # Term 2: q_i @ a_ij^K (query to key-bias)
     # [batch, heads, seq_q, dim] einsum [heads, seq_q, seq_k, dim] -> [batch, heads, seq_q, seq_k]
-    term2 = torch.einsum('bhqd,hqkd->bhqk', query, rel_key_bias_t)
-    attn_scores = attn_scores + term2
+    # DISABLED: Testing if Q/K biases cause instability
+    # term2 = torch.einsum('bhqd,hqkd->bhqk', query, rel_key_bias_t)
+    # attn_scores = attn_scores + term2
 
     # Term 3: a_ij^Q @ k_j^T (query-bias to key)
     # [heads, seq_q, seq_k, dim] einsum [batch, heads, seq_k, dim] -> [batch, heads, seq_q, seq_k]
-    term3 = torch.einsum('hqkd,bhkd->bhqk', rel_query_bias_t, key)
-    attn_scores = attn_scores + term3
+    # DISABLED: Testing if Q/K biases cause instability
+    # term3 = torch.einsum('hqkd,bhkd->bhqk', rel_query_bias_t, key)
+    # attn_scores = attn_scores + term3
 
     # Term 4: a_ij^Q @ a_ij^K (bias to bias - position-only attention)
     # [heads, seq_q, seq_k, dim] einsum [heads, seq_q, seq_k, dim] -> [heads, seq_q, seq_k]
     # This is a fixed bias matrix (independent of input), broadcast to batch
-    term4 = torch.einsum('hqkd,hqkd->hqk', rel_query_bias_t, rel_key_bias_t)
-    attn_scores = attn_scores + term4.unsqueeze(0)  # [1, heads, seq_q, seq_k]
+    # DISABLED: Testing if Q/K biases cause instability
+    # term4 = torch.einsum('hqkd,hqkd->hqk', rel_query_bias_t, rel_key_bias_t)
+    # attn_scores = attn_scores + term4.unsqueeze(0)  # [1, heads, seq_q, seq_k]
 
     # Apply scaling
     attn_scores = attn_scores * scaling
@@ -168,9 +171,8 @@ def relative_position_attention_forward(
     attn_output = torch.matmul(attn_weights, value)  # [batch, heads, seq_q, dim]
 
     # Relative position value bias term: attn_weights @ a_ij^V
-    # DISABLED: May cause instability since it bypasses softmax saturation
-    # rel_value_output = torch.einsum('bhqk,hqkd->bhqd', attn_weights, rel_value_bias_t)
-    # attn_output = attn_output + rel_value_output
+    rel_value_output = torch.einsum('bhqk,hqkd->bhqd', attn_weights, rel_value_bias_t)
+    attn_output = attn_output + rel_value_output
 
     # Transpose for output projection: [batch, seq, heads, dim]
     attn_output = attn_output.transpose(1, 2).contiguous()
