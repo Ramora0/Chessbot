@@ -706,16 +706,21 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 torch.clamp(annealed_logits, max=-1e9)
             )
 
-            model_probs = F.softmax(masked_logits / self.temperature, dim=-1)
+            # Use log_softmax (numerically stable — never computes log(0))
+            # then derive probs only where needed for metrics.
+            # The old pattern `softmax() + log() + 1e-10` is unsafe in bf16:
+            # 1e-10 rounds to 0 in bf16 (min positive ~6e-8), so log(0) = -inf.
+            log_model_probs = F.log_softmax(masked_logits / self.temperature, dim=-1)
+            model_probs = log_model_probs.exp()  # only for metrics (entropy, top1)
 
-            # Cross-entropy loss: -sum(target_probs * log(model_probs))
+            # Cross-entropy loss: -sum(target_probs * log_softmax(model_logits))
             # Compute per-sample loss, apply endgame weights, then take weighted mean
-            per_sample_policy_loss = -(target_probs * torch.log(model_probs + 1e-10)).sum(dim=-1)  # [batch]
+            per_sample_policy_loss = -(target_probs * log_model_probs).sum(dim=-1)  # [batch]
             raw_policy_loss = (per_sample_policy_loss * endgame_weights).sum() / endgame_weights.sum()
             policy_loss = self.policy_loss_weight * raw_policy_loss
 
-            # Compute policy entropy for monitoring saturation
-            model_entropy = -(model_probs * torch.log(model_probs + 1e-10)).sum(dim=-1).mean()
+            # Compute policy entropy for monitoring saturation (use log_probs we already have)
+            model_entropy = -(model_probs * log_model_probs).sum(dim=-1).mean()
 
             # Loss 2: Sigmoid-based absolute win% prediction for LEGAL moves only
             # Legal moves: target = their absolute win% (e.g., 0.52, 0.48, etc.)
