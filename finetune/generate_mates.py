@@ -315,6 +315,18 @@ def main():
     print(f"Output: {args.output}")
     print("=" * 60)
 
+    # Combine parquet shards into a proper HuggingFace dataset
+    parquet_files = sorted(glob(str(args.output / "*.parquet")))
+    if not parquet_files:
+        print("\nERROR: No parquet files found to combine")
+        return 1
+
+    print(f"\nCombining {len(parquet_files)} parquet shards into HuggingFace dataset...")
+    combined = Dataset.from_parquet(parquet_files)
+    hf_path = args.output.parent / (args.output.name + "_hf")
+    combined.save_to_disk(str(hf_path))
+    print(f"Saved HuggingFace dataset ({len(combined):,} rows) to {hf_path}")
+
     return 0
 
 
