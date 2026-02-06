@@ -8,97 +8,96 @@ size_categories:
 - 100M<n<1B
 ---
 
-# Dataset Summary
+# ChessBench Action-Values + Mate-in-N
 
-This dataset is an adaptation of the action-value data released with “Grandmaster-Level Chess Without Search” (DeepMind). It provides:
-	1.	A reorganization of the original action-value format into a per-position structure:
-	•	each FEN → list of all legal moves → per-move win probability (as provided in the upstream release).
-	2.	An augmentation: for moves with predicted win probability 0% or 100%, we run Stockfish mate search and add a mate-in-N field per move (when a forced mate is detected).
+This dataset is derived from the action-value data released with ["Grandmaster-Level Chess Without Search"](https://arxiv.org/abs/2402.04494) (DeepMind). It provides:
 
-Use cases
-	•	Learning a policy/value model with richer per-position action structure
-	•	Studying calibration of win-probability vs. mate-depth
-	•	Training models to predict “mate imminence” signals beyond saturated winrates
+1. A reorganization of the original action-value format into a **per-position** structure: each FEN maps to a list of all legal moves with per-move win probabilities (as provided in the upstream release).
+2. A **mate-in-N augmentation**: for moves with win probability >= 99.99% or <= 0.01%, Stockfish mate search adds a `mate` depth field per move when a forced mate is detected.
 
-Source Dataset (Upstream)
-	•	Upstream: DeepMind “searchless chess” / ChessBench action-value release.
-	•	Paper: “Grandmaster-Level Chess Without Search” (see upstream).
-	•	Upstream license note: some portions are CC0 (lichess), remainder is CC BY 4.0.
+## Use Cases
 
-# Schema
+- Training a policy/value model with richer per-position action structure
+- Studying calibration of win probability vs. mate depth
+- Training models to predict mate imminence signals beyond saturated win rates
+
+## Source Dataset
+
+- **Upstream**: DeepMind ["searchless chess" / ChessBench](https://github.com/google-deepmind/searchless_chess) action-value release
+- **Paper**: ["Grandmaster-Level Chess Without Search"](https://arxiv.org/abs/2402.04494) (Ruoss et al., 2024)
+- **Upstream license**: Some portions are CC0 (Lichess), remainder is CC BY 4.0
+
+## Schema
+
 Each row contains:
-{                                                                                                                                      
-      "fen": str,           # FEN string                                                                                                 
-      "moves": List[str],   # Legal moves in UCI format                                                                                  
-      "p_win": List[float], # Win probability per move for side-to-move (unchanged from source)                                                           
-      "mate": List[int],    # Mate depth per move (new field)                                                                            
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `fen` | `str` | Chess position in FEN notation |
+| `moves` | `List[str]` | All legal moves in UCI format (e.g., `["e2e4", "d2d4", ...]`) |
+| `p_win` | `List[float]` | Win probability for side-to-move per move, in `[0.0, 1.0]` (unchanged from source) |
+| `mate` | `List[int]` | Mate depth per move (new field, see below) |
+
+All three list fields (`moves`, `p_win`, `mate`) share the same length for each row.
+
+## Mate Field Definition
+
+The `mate` field encodes forced mate depth in **full moves** (not plies), from the perspective of the **side to move**:
+
+| Value | Meaning |
+|-------|---------|
+| `mate > 0` | Playing this move leads to mating the opponent in N moves |
+| `mate < 0` | Playing this move leads to getting mated in N moves |
+| `mate = 0` | No forced mate detected, or move was not analyzed |
+
+Only moves meeting the extreme win probability threshold are analyzed for mate depth. All other moves have `mate = 0`.
+
+### Analysis Thresholds
+
+- Moves with `p_win >= 0.9999` are analyzed as potential winning mates
+- Moves with `p_win <= 0.0001` are analyzed as potential losing mates
+- All other moves are not analyzed (`mate = 0`)
+
+## How Mate-in-N Was Computed
+
+Mate depth labels were generated using Stockfish with depth 16; we found this found forced mates for ~98.5% of moves with winrates of 0% or 100%.
+
+### Analysis Procedure
+
+For each move meeting the win probability threshold:
+
+1. The move is applied to the board position
+2. If the resulting position is immediate checkmate, `mate = 1` (or `-1` if a losing move)
+3. Otherwise, Stockfish analyzes the resulting position to depth 16
+4. If Stockfish reports a mate score, the mate depth (in full moves) is recorded
+5. If no mate score is found within the depth limit, `mate = 0`
+
+**Note**: `mate = 0` does not imply no forced mate exists -- only that none was found within the search depth limit.
+
+## Limitations / Known Issues
+
+- Mate-in-N labels depend on Stockfish search depth; deeper searches may find mates that depth 16 misses
+- Upstream win probabilities near 0% or 100% may reflect Stockfish evaluation saturation rather than true forced mates, which is why not all analyzed moves yield confirmed mates
+- Legal move generation and UCI formatting must match python-chess rules for underpromotions, castling rights, and en passant
+
+## License
+
+This dataset is licensed under **CC BY 4.0**.
+
+### Attribution & Changes
+
+- **Upstream attribution**: DeepMind "searchless chess" action-value release
+- **Changes**: Reorganization from per-move records into per-position legal-move lists, plus mate-in-N augmentation via Stockfish analysis
+
+## Citation
+
+If you use this dataset, please cite the upstream DeepMind paper:
+
+```bibtex
+@article{ruoss2024grandmaster,
+  title={Grandmaster-Level Chess Without Search},
+  author={Ruoss, Anian and Del{\'e}tang, Gr{\'e}goire and Medapati, Sourabh and Grau-Moya, Jordi and Wenliang, Li Ke and Catt, Elliot and Reid, John and Genewein, Tim},
+  journal={arXiv preprint arXiv:2402.04494},
+  year={2024}
 }
-
-Mate Definition (IMPORTANT)
-
-Define:
-	•	Is mate_in measured in plies or full moves?
-	•	Is it from the side-to-move’s perspective?
-	•	How do you encode “mate for the losing side” (e.g., negative values vs. separate field)?
-
-Example convention (common in engine analysis):
-	•	mate_in > 0 means side-to-move can force mate in N plies
-	•	mate_in < 0 means side-to-move is getting mated in |N| plies
-	•	mate_in = null if no forced mate found within limits
-
-Splits
-
-List your actual splits (or explain if none):
-	•	train: …
-	•	validation: …
-	•	test: …
-
-If you did not create official splits, say so explicitly and provide a script or recommended split strategy.
-
-How Mate-in-N Was Computed
-
-Mate-depth labels were generated with Stockfish. Stockfish is GPLv3 software; you’re not distributing Stockfish itself here, but you should still document provenance and reproduce settings.  ￼
-
-Please fill in:
-	•	Stockfish version: (e.g., Stockfish 16 / 17 / dev build)
-	•	Command/config:
-	•	Threads: __
-	•	Hash: __
-	•	Limit type: (nodes / depth / time): __
-	•	Skill level (if any): __
-	•	Syzygy tablebases (if any): __
-	•	Criteria for “mate found”:
-	•	Did you require the engine to report a mate score at PV root?
-	•	How did you handle ambiguous cases (e.g., mate not found within limit)?
-
-Exact trigger condition
-
-State what “winrate 0%/100%” means in your code:
-	•	Exactly 0.0 or 1.0?
-	•	Or <= eps / >= 1-eps?
-
-This affects label stability.
-
-Recommended Citations
-
-If you use this dataset, please cite:
-	•	The upstream DeepMind paper/repo (action-value data source).  ￼
-	•	This derived dataset (Zenodo DOI or HF citation if you add it).
-
-(You can add BibTeX blocks here.)
-
-License
-
-License for this dataset repository: CC BY 4.0.
-
-Rationale:
-	•	This dataset redistributes an adapted form of the upstream data, which is licensed as: some portions CC0 (lichess), remainder CC BY 4.0, per DeepMind’s release.  ￼
-
-Attribution & changes
-	•	Upstream attribution: DeepMind “searchless chess” action-value release.
-	•	Changes: reorganization into per-FEN legal-move lists + mate-in-N augmentation via Stockfish.
-
-Limitations / Known Issues
-	•	Mate-in-N labels depend on Stockfish settings and search limits; “mate not found” does not imply “no forced mate exists.”
-	•	If winrates are quantized or clipped upstream, exact 0/1 may reflect saturation rather than certainty.
-	•	Legal move generation and UCI formatting must match engine rules; verify consistency on underpromotions, castling rights, en passant, etc.
+```

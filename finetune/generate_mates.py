@@ -89,7 +89,7 @@ def _analyze_move(args: tuple) -> tuple:
             mate_in = pov_score.mate()
             if mate_in is not None:
                 if mate_in < 0:
-                    return (key, abs(mate_in))
+                    return (key, abs(mate_in) + 1)
                 else:
                     return (key, -mate_in)
         return (key, 0)
