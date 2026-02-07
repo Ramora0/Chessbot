@@ -127,6 +127,9 @@ class TrackingTrainer(Trainer):
         # NEW: Attention policy head losses
         self._last_attention_policy_loss: Optional[float] = None
         self._last_attention_move_winrate_loss: Optional[float] = None
+        # Mate prediction
+        self._last_mate_loss: Optional[float] = None
+        self._last_mate_accuracy: Optional[float] = None
 
     def compute_loss(
         self,
