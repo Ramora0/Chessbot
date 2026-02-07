@@ -31,7 +31,6 @@ from tokenizer import process_fen
 
 EXPECTED_SEQ_LEN = 72
 NUM_VALUE_BINS = 128
-NUM_MATE_CLASSES = 7
 
 
 def create_action_value_dataset(
@@ -154,12 +153,28 @@ def _transform_example(
         # Initialize policy with -1 (marking all moves as illegal)
         policy = np.full(policy_size, -1.0, dtype=np.float32)
 
-        # Fill in p_win values for each legal move
+        # Fill in adjusted win% values for each legal move
+        # When mate data is available, encode mate information directly into win%:
+        #   - Mating moves (mate > 0): 0.98 + 0.02/n  (range: (0.98, 1.0])
+        #   - Non-mate moves: linearly scaled to [0.02, 0.98]
+        #   - Getting-mated moves (mate < 0): 0.02 - 0.02/|n|  (range: [0.0, 0.02))
+        # This gives clean separation so sigmoid and softmax losses work together
         valid_indices = []
-        for move, p_win in zip(moves, p_wins):
+        mate_depths_raw = examples["mate"][i] if has_mate_field else None
+        for j, (move, p_win) in enumerate(zip(moves, p_wins)):
             if move in move_to_idx:
                 idx = move_to_idx[move]
-                policy[idx] = p_win
+                if has_mate_field:
+                    md = int(mate_depths_raw[j])
+                    if md > 0:  # mate-in-n
+                        adjusted = 0.98 + 0.02 / md
+                    elif md < 0:  # mated-in-n
+                        adjusted = 0.02 - 0.02 / abs(md)
+                    else:  # no mate
+                        adjusted = 0.02 + p_win * 0.96
+                    policy[idx] = adjusted
+                else:
+                    policy[idx] = p_win
                 valid_indices.append(idx)
             # Skip moves not in policy_index (e.g., promotions to rook/bishop)
 
@@ -172,8 +187,8 @@ def _transform_example(
                 policy[idx] -= max_p_win
 
         # 3. Create smooth target distribution over 128 bins for win%
-        # Use the maximum p_win (best move's win probability)
-        best_win_prob = max(p_wins) if p_wins else 0.5
+        # Use the maximum win probability (adjusted if mate data available)
+        best_win_prob = max_p_win if valid_indices else (max(p_wins) if p_wins else 0.5)
 
         # Create smooth Gaussian-like distribution centered on best_win_prob
         # Bins represent win% from 0.0 to 1.0
@@ -204,10 +219,9 @@ def _transform_example(
             control_map[sq] = len(board.attackers(chess.WHITE, chess_sq))
             control_map[64 + sq] = len(board.attackers(chess.BLACK, chess_sq))
 
-        # 6. Process mate depths if mate field exists
+        # 6. Process mate depths if mate field exists (mate_depths_raw already read in step 2)
         mate_depths_arr = np.zeros(policy_size, dtype=np.int16)
         if has_mate_field:
-            mate_depths_raw = examples["mate"][i]
             for j, (move, md) in enumerate(zip(moves, mate_depths_raw)):
                 if move in move_to_idx:
                     mate_depths_arr[move_to_idx[move]] = int(md)

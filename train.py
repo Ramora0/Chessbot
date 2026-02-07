@@ -127,9 +127,6 @@ class TrackingTrainer(Trainer):
         # NEW: Attention policy head losses
         self._last_attention_policy_loss: Optional[float] = None
         self._last_attention_move_winrate_loss: Optional[float] = None
-        # Mate prediction
-        self._last_mate_loss: Optional[float] = None
-        self._last_mate_accuracy: Optional[float] = None
 
     def compute_loss(
         self,
@@ -264,21 +261,6 @@ class TrackingTrainer(Trainer):
             float(model_entropy.detach().item())
         ) if model_entropy is not None else None
 
-        mate_loss = getattr(outputs, "mate_loss", None)
-        if mate_loss is not None:
-            mate_weight = float(getattr(model, "mate_loss_weight", 0.0))
-            mate_value = float(mate_loss.detach().item())
-            self._last_mate_loss = (
-                mate_value / mate_weight if mate_weight > 0 else mate_value
-            )
-        else:
-            self._last_mate_loss = None
-
-        mate_accuracy = getattr(outputs, "mate_accuracy", None)
-        self._last_mate_accuracy = (
-            float(mate_accuracy.detach().item())
-        ) if mate_accuracy is not None else None
-
         if return_outputs:
             return loss, outputs
         return loss
@@ -328,12 +310,6 @@ class TrackingTrainer(Trainer):
             if self._last_model_entropy is not None:
                 logs.setdefault("model_entropy",
                                 self._last_model_entropy)
-            if self._last_mate_loss is not None:
-                logs.setdefault("mate_loss",
-                                self._last_mate_loss)
-            if self._last_mate_accuracy is not None:
-                logs.setdefault("mate_accuracy",
-                                self._last_mate_accuracy)
         super().log(logs, *args, **kwargs)
 
 

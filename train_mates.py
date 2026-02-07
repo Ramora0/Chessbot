@@ -50,10 +50,8 @@ class TrackingTrainer(Trainer):
         self._last_total_loss: Optional[float] = None
         self._last_move_winrate_loss: Optional[float] = None
         self._last_illegality_loss: Optional[float] = None
-        self._last_mate_loss: Optional[float] = None
         self._last_top1_agreement: Optional[float] = None
         self._last_value_mae: Optional[float] = None
-        self._last_mate_accuracy: Optional[float] = None
 
     def compute_loss(self, model, inputs, return_outputs: bool = False, num_items_in_batch: Optional[int] = None):
         inputs['training_step'] = self.state.global_step
@@ -69,7 +67,6 @@ class TrackingTrainer(Trainer):
             ("winrate_loss", "_last_winrate_loss"),
             ("move_winrate_loss", "_last_move_winrate_loss"),
             ("illegality_loss", "_last_illegality_loss"),
-            ("mate_loss", "_last_mate_loss"),
         ]:
             val = getattr(outputs, name, None)
             if val is not None:
@@ -79,7 +76,6 @@ class TrackingTrainer(Trainer):
         for name, attr in [
             ("top1_agreement", "_last_top1_agreement"),
             ("value_mae", "_last_value_mae"),
-            ("mate_accuracy", "_last_mate_accuracy"),
         ]:
             val = getattr(outputs, name, None)
             setattr(self, attr, float(val.detach().item()) if val is not None else None)
@@ -95,10 +91,8 @@ class TrackingTrainer(Trainer):
                 ("_last_winrate_loss", "winrate_loss"),
                 ("_last_move_winrate_loss", "move_winrate_loss"),
                 ("_last_illegality_loss", "illegality_loss"),
-                ("_last_mate_loss", "mate_loss"),
                 ("_last_top1_agreement", "top1_agreement"),
                 ("_last_value_mae", "value_mae"),
-                ("_last_mate_accuracy", "mate_accuracy"),
             ]:
                 val = getattr(self, attr, None)
                 if val is not None:
