@@ -31,7 +31,7 @@ MAX_SEQ_LENGTH = 256  # Board tokens: 72
 DATASET_PATH = os.getenv("DATASET_PATH", "fuck")
 SHUFFLE_DATASET = True
 ELO_EVAL_STEPS = 16000
-EVAL_BATCH_SIZE = 4096
+EVAL_BATCH_SIZE = 512
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
 BASE_BATCH_SIZE = 256
 BASE_LEARNING_RATE = 4e-5
@@ -60,35 +60,11 @@ BASE_GAME_EVAL_STEPS = GAME_EVAL_STEPS
 RESUME_FROM_CHECKPOINT = None
 
 
-# Set True to get exact backward traceback for NaN grads (~2x slower)
-DETECT_ANOMALY = False
-
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
 
 torch.set_float32_matmul_precision("high")
-
-
-def _classify_param_group(name: str) -> str:
-    """Classify a parameter name into a human-readable group for grad norm analysis."""
-    if 'rel_pos_emb' in name or 'rel_query' in name or 'rel_key' in name or 'rel_value' in name:
-        return 'rpe'
-    if 'task_head' in name:
-        return 'task_heads'
-    if 'control_head' in name:
-        return 'control_head'
-    if 'lm_head' in name:
-        return 'lm_head'
-    if 'embed_tokens' in name:
-        return 'embeddings'
-    if 'layers.' in name:
-        parts = name.split('.')
-        for i, p in enumerate(parts):
-            if p == 'layers' and i + 1 < len(parts):
-                return f'transformer_layer_{int(parts[i+1]):02d}'
-        return 'transformer_other'
-    return 'other'
 
 
 @dataclass
@@ -148,8 +124,7 @@ class TrackingTrainer(Trainer):
         self._last_value_mae: Optional[float] = None
         self._last_move_winrate_mae: Optional[float] = None
         self._last_model_entropy: Optional[float] = None
-        self._last_preclip_grad_norm: Optional[float] = None
-        # NEW: Attention policy head losses
+        # Attention policy head losses
         self._last_attention_policy_loss: Optional[float] = None
         self._last_attention_move_winrate_loss: Optional[float] = None
 
@@ -167,49 +142,6 @@ class TrackingTrainer(Trainer):
         if loss is None:
             raise ValueError(
                 "Model did not return a loss tensor during training")
-
-        # --- Blowup detection: dump all loss components if loss is bad ---
-        loss_val = loss.detach().item()
-        if not math.isfinite(loss_val) or loss_val > 1000:
-            step = self.state.global_step
-            print(f"\n{'!'*70}")
-            print(f"LOSS BLOWUP at step {step}: total_loss={loss_val}")
-            # Dump every individual loss component (unweighted)
-            raw_model = model.module if hasattr(model, 'module') else model
-            component_names = [
-                'policy_loss', 'move_winrate_loss', 'illegality_loss',
-                'winrate_loss', 'control_map_loss', 'masked_token_loss', 'mate_loss',
-            ]
-            for name in component_names:
-                val = getattr(outputs, name, None)
-                if val is not None:
-                    v = val.detach().item()
-                    weight_attr = name.replace('_loss', '_loss_weight')
-                    w = float(getattr(raw_model, weight_attr, 1.0))
-                    print(f"  {name:25s} = {v:12.4f}  (weight={w}, raw={v/w if w else v:.6f})")
-            # RPE weight norms
-            if hasattr(raw_model, 'rel_pos_embs'):
-                print("  RPE weight norms:")
-                for i, rpe in enumerate(raw_model.rel_pos_embs):
-                    q_n = rpe.rpe_q.rpe.norm().item()
-                    k_n = rpe.rpe_k.rpe.norm().item()
-                    v_n = rpe.rpe_v.rpe_value.norm().item()
-                    q_max = rpe.rpe_q.rpe.abs().max().item()
-                    k_max = rpe.rpe_k.rpe.abs().max().item()
-                    v_max = rpe.rpe_v.rpe_value.abs().max().item()
-                    print(f"    Layer {i:2d}: Q(norm={q_n:.4f}, max={q_max:.4f})  "
-                          f"K(norm={k_n:.4f}, max={k_max:.4f})  "
-                          f"V(norm={v_n:.4f}, max={v_max:.4f})")
-            # Input data stats
-            if 'policy' in inputs and inputs['policy'] is not None:
-                p = inputs['policy']
-                tv = inputs.get('true_value')
-                print(f"  Input policy: min={p.min().item():.4f} max={p.max().item():.4f} "
-                      f"has_nan={bool(torch.isnan(p).any())}")
-                if tv is not None:
-                    print(f"  Input true_value: min={tv.min().item():.4f} max={tv.max().item():.4f} "
-                          f"has_nan={bool(torch.isnan(tv).any())}")
-            print(f"{'!'*70}\n")
 
         self._last_total_loss = float(loss.detach().item())
 
@@ -272,7 +204,6 @@ class TrackingTrainer(Trainer):
         else:
             self._last_illegality_loss = None
 
-        # NEW: Attention policy head losses
         attention_policy_loss = getattr(outputs, "attention_policy_loss", None)
         if attention_policy_loss is not None:
             weight = float(getattr(model, "attention_policy_loss_weight", 0.0))
@@ -333,121 +264,6 @@ class TrackingTrainer(Trainer):
             return loss, outputs
         return loss
 
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        """Override to compute per-parameter-group gradient norms after backward."""
-        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
-
-        # Compute pre-clip gradient norms by parameter group
-        raw_model = model.module if hasattr(model, 'module') else model
-        total_norm_sq = 0.0
-        group_norms_sq: dict[str, float] = {}
-        for name, param in raw_model.named_parameters():
-            if param.grad is not None:
-                pn_sq = param.grad.norm().item() ** 2
-                total_norm_sq += pn_sq
-                group = _classify_param_group(name)
-                group_norms_sq.setdefault(group, 0.0)
-                group_norms_sq[group] += pn_sq
-        total_norm = total_norm_sq ** 0.5
-        group_norms = {k: v ** 0.5 for k, v in group_norms_sq.items()}
-
-        self._last_preclip_grad_norm = total_norm
-
-        if total_norm > 100:
-            step = self.state.global_step
-            print(f"\n{'#'*70}")
-            print(f"GRAD EXPLOSION at step {step}: total_norm={total_norm:.2e}")
-            print(f"Per-group grad norms (sorted):")
-            for group, norm in sorted(group_norms.items(), key=lambda x: -x[1]):
-                print(f"  {group:30s}: {norm:.2e}")
-            # Top individual parameters
-            param_norms = []
-            for name, param in raw_model.named_parameters():
-                if param.grad is not None:
-                    param_norms.append((name, param.grad.norm().item(), param.grad.abs().max().item()))
-            param_norms.sort(key=lambda x: -x[1])
-            print(f"Top 10 parameters by grad norm:")
-            for name, norm, mx in param_norms[:10]:
-                print(f"  {name:60s}: norm={norm:.2e} max={mx:.2e}")
-
-            # ── H1 + H3 + H4: Per-layer attention diagnostics ──
-            from model import _rpe_diagnostics
-            layers_diag = _rpe_diagnostics.get('layers', {})
-            if layers_diag:
-                print(f"\n--- H1: Per-layer attention score max (post-scale, post-cap) ---")
-                for lid in sorted(layers_diag.keys()):
-                    d = layers_diag[lid]
-                    print(f"  Layer {lid:2d}: score_max={d['score_max']:7.2f}  "
-                          f"score_min={d['score_min']:7.2f}  "
-                          f"term1(QK)={d['term1_max']:6.2f}  "
-                          f"term2(Q·RPE_K)={d['term2_max']:6.2f}  "
-                          f"term3(RPE_Q·K)={d['term3_max']:6.2f}")
-
-                print(f"\n--- H3: Per-head breakdown (layer with max score) ---")
-                worst_layer = max(layers_diag.keys(), key=lambda l: layers_diag[l]['score_abs_max'])
-                wd = layers_diag[worst_layer]
-                print(f"  Worst layer: {worst_layer} (score_abs_max={wd['score_abs_max']:.2f})")
-                for h in range(len(wd['per_head_max'])):
-                    print(f"    Head {h}: max_score={wd['per_head_max'][h]:7.2f}  "
-                          f"entropy={wd['per_head_entropy'][h]:5.2f}  "
-                          f"max_attn_weight={wd['per_head_max_weight'][h]:.4f}")
-
-                print(f"\n--- H2: Q/K/V vector norms per layer ---")
-                for lid in sorted(layers_diag.keys()):
-                    d = layers_diag[lid]
-                    print(f"  Layer {lid:2d}: "
-                          f"Q_mean={d['q_vec_norm']:6.2f}  Q_max={d['q_vec_max_norm']:6.2f}  "
-                          f"K_mean={d['k_vec_norm']:6.2f}  K_max={d['k_vec_max_norm']:6.2f}  "
-                          f"V_mean={d['v_vec_norm']:6.2f}")
-
-            # ── H2: Per-layer hidden state norms (residual accumulation) ──
-            hs_norms = _rpe_diagnostics.get('per_layer_hs_norms', [])
-            if hs_norms:
-                print(f"\n--- H2: Hidden state norms per layer (residual accumulation) ---")
-                for i, norm in enumerate(hs_norms):
-                    label = "embed" if i == 0 else f"layer {i-1:2d}"
-                    print(f"  After {label:10s}: {norm:.2f}")
-
-            # ── H5: Per-layer weight norms (W_Q, W_K, W_V, W_O) ──
-            print(f"\n--- H5: Per-layer attention weight norms ---")
-            unwrapped = raw_model._orig_mod if hasattr(raw_model, '_orig_mod') else raw_model
-            if hasattr(unwrapped, 'transformer'):
-                for i, layer in enumerate(unwrapped.transformer.layers):
-                    attn = layer.self_attn
-                    q_wn = attn.q_proj.weight.norm().item()
-                    k_wn = attn.k_proj.weight.norm().item()
-                    v_wn = attn.v_proj.weight.norm().item()
-                    o_wn = attn.o_proj.weight.norm().item()
-                    print(f"  Layer {i:2d}: W_Q={q_wn:7.2f}  W_K={k_wn:7.2f}  "
-                          f"W_V={v_wn:7.2f}  W_O={o_wn:7.2f}")
-
-            # ── H6: Batch characteristics ──
-            print(f"\n--- H6: Batch characteristics ---")
-            if 'true_value' in inputs and inputs['true_value'] is not None:
-                tv = inputs['true_value']
-                print(f"  true_value: min={tv.min().item():.4f}  max={tv.max().item():.4f}  "
-                      f"mean={tv.mean().item():.4f}  std={tv.std().item():.4f}")
-                # Extreme win rates
-                extreme_low = (tv < 0.05).sum().item()
-                extreme_high = (tv > 0.95).sum().item()
-                print(f"  extreme win rates: <0.05: {extreme_low}/{len(tv)}  >0.95: {extreme_high}/{len(tv)}")
-            if 'policy' in inputs and inputs['policy'] is not None:
-                p = inputs['policy']
-                legal_per_sample = (p > -0.99).float().sum(dim=-1)
-                print(f"  legal moves: min={legal_per_sample.min().item():.0f}  "
-                      f"max={legal_per_sample.max().item():.0f}  "
-                      f"mean={legal_per_sample.mean().item():.1f}")
-                print(f"  policy has_nan={bool(torch.isnan(p).any())}  "
-                      f"has_inf={bool(torch.isinf(p).any())}")
-            if 'input_ids' in inputs:
-                ids = inputs['input_ids']
-                print(f"  input_ids: shape={list(ids.shape)}  "
-                      f"has_nan={bool(torch.isnan(ids.float()).any())}")
-
-            print(f"{'#'*70}\n")
-
-        return loss
-
     def log(self, logs, *args, **kwargs):  # type: ignore[override]
         logs = dict(logs)
         if "loss" in logs:
@@ -494,26 +310,6 @@ class TrackingTrainer(Trainer):
                 logs.setdefault("model_entropy",
                                 self._last_model_entropy)
 
-            # Pre-clip gradient norm (catches explosions before clipping hides them)
-            if self._last_preclip_grad_norm is not None:
-                logs.setdefault("preclip_grad_norm",
-                                self._last_preclip_grad_norm)
-
-            # RPE weight norms (track growth over time in wandb)
-            raw_model = self.model.module if hasattr(self.model, 'module') else self.model
-            if hasattr(raw_model, 'rel_pos_embs'):
-                q_norms, k_norms, v_norms = [], [], []
-                for rpe in raw_model.rel_pos_embs:
-                    q_norms.append(rpe.rpe_q.rpe.norm().item())
-                    k_norms.append(rpe.rpe_k.rpe.norm().item())
-                    v_norms.append(rpe.rpe_v.rpe_value.norm().item())
-                logs["rpe_q_norm_mean"] = sum(q_norms) / len(q_norms)
-                logs["rpe_k_norm_mean"] = sum(k_norms) / len(k_norms)
-                logs["rpe_v_norm_mean"] = sum(v_norms) / len(v_norms)
-                logs["rpe_q_norm_max"] = max(q_norms)
-                logs["rpe_k_norm_max"] = max(k_norms)
-                logs["rpe_v_norm_max"] = max(v_norms)
-
         super().log(logs, *args, **kwargs)
 
 
@@ -558,6 +354,7 @@ class EloEvaluationCallback(TrainerCallback):
 
         model = self.trainer.model
         was_training = model.training
+        torch.cuda.empty_cache()
         elo, elo_se, solve_percentage, elo_greedy, elo_se_greedy, solve_percentage_greedy = evaluate_model_elo(
             model=model,
             batch_size=self.batch_size,
@@ -568,6 +365,7 @@ class EloEvaluationCallback(TrainerCallback):
         )
         if was_training:
             model.train()
+        torch.cuda.empty_cache()
 
         metrics = {
             "eval_elo": float(elo),
@@ -642,6 +440,7 @@ class GameEvaluationCallback(TrainerCallback):
 
         model = self.trainer.model
         was_training = model.training
+        torch.cuda.empty_cache()
 
         # Import here to avoid circular dependency
         from evaluation_game import evaluate_model_against_stockfish
@@ -665,6 +464,7 @@ class GameEvaluationCallback(TrainerCallback):
             # Restore training mode
             if was_training:
                 model.train()
+            torch.cuda.empty_cache()
 
             # Log metrics to wandb
             metrics = {
@@ -693,6 +493,7 @@ class GameEvaluationCallback(TrainerCallback):
             # Continue training even if evaluation fails
             if was_training:
                 model.train()
+            torch.cuda.empty_cache()
 
         return control
 
@@ -737,6 +538,7 @@ class RegretEvaluationCallback(TrainerCallback):
 
         model = self.trainer.model
         was_training = model.training
+        torch.cuda.empty_cache()
 
         try:
             print(f"\n{'='*80}")
@@ -753,6 +555,7 @@ class RegretEvaluationCallback(TrainerCallback):
 
             if was_training:
                 model.train()
+            torch.cuda.empty_cache()
 
             print_regret_results(results)
 
@@ -776,16 +579,13 @@ class RegretEvaluationCallback(TrainerCallback):
             traceback.print_exc()
             if was_training:
                 model.train()
+            torch.cuda.empty_cache()
 
         return control
 
 
 def train(run_name: Optional[str] = None) -> None:
     print("Starting chess transformer training...")
-
-    if DETECT_ANOMALY:
-        torch.autograd.set_detect_anomaly(True)
-        print("WARNING: torch.autograd.detect_anomaly enabled — training will be ~2x slower")
 
     os.environ["WANDB_PROJECT"] = "chessformer"
     # Avoid W&B from uploading checkpoints while keeping metric logging enabled.

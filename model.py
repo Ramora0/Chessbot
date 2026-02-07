@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -22,27 +21,6 @@ from loss_weights import (
     MATE_LOSS_WEIGHT,
     TEMPERATURE,
 )
-
-
-# ── Gradient explosion diagnostics ─────────────────────────────────────
-# Register backward hooks on intermediate tensors to catch gradient explosions.
-# Hooks fire during backward and print when grad norm exceeds threshold.
-_GRAD_DEBUG_THRESHOLD = 100.0  # Print when any grad norm > this
-
-
-def _make_grad_hook(name: str):
-    """Create a backward hook that checks gradient health."""
-    def hook(grad):
-        if grad is None:
-            return
-        grad_norm = grad.norm().item()
-        grad_max = grad.abs().max().item()
-        has_nan = bool(torch.isnan(grad).any())
-        has_inf = bool(torch.isinf(grad).any())
-        if has_nan or has_inf or grad_norm > _GRAD_DEBUG_THRESHOLD:
-            print(f"  GRAD [{name}]: norm={grad_norm:.2e} max={grad_max:.2e} "
-                  f"shape={list(grad.shape)} nan={has_nan} inf={has_inf}")
-    return hook
 
 
 def _make_rpe_factorizer():
@@ -225,67 +203,10 @@ def relative_position_attention_forward(
     else:
         attn_output = attn_output + rpe_v_out
 
-    # --- Numerical health check (only on first batch element, cheap) ---
-    if training and _rpe_diag_enabled:
-        with torch.no_grad():
-            b0 = slice(0, 1)
-
-            score_max = attn_scores[b0].max().item()
-            score_min = attn_scores[b0].min().item()
-            score_abs_max = max(abs(score_max), abs(score_min))
-
-            # Per-term breakdown (pre-scaling)
-            term1_only = torch.matmul(query[b0], key[b0].transpose(-2, -1))
-            term1_max = (term1_only * scaling).abs().max().item()
-            rpe_q_max = (rpe_q_bias[:1] * scaling).abs().max().item()
-            rpe_k_max = (rpe_k_bias[:1] * scaling).abs().max().item()
-
-            # Per-head stats
-            per_head_max = attn_scores[b0, :, :, :].amax(dim=(-2, -1))
-            aw_b0 = attn_weights[b0]
-            log_aw = torch.log(aw_b0 + 1e-10)
-            per_head_entropy = -(aw_b0 * log_aw).sum(dim=-1).mean(dim=-1).squeeze(0)
-            per_head_max_weight = aw_b0.amax(dim=(-2, -1)).squeeze(0)
-
-            # Q, K, V vector norms
-            q_vec_norm = query[b0].norm(dim=-1).mean().item()
-            k_vec_norm = key[b0].norm(dim=-1).mean().item()
-            v_vec_norm = value[b0].norm(dim=-1).mean().item()
-            q_vec_max_norm = query[b0].norm(dim=-1).max().item()
-            k_vec_max_norm = key[b0].norm(dim=-1).max().item()
-
-            _rpe_diagnostics.setdefault('layers', {})[layer_idx] = {
-                'score_max': score_max,
-                'score_min': score_min,
-                'score_abs_max': score_abs_max,
-                'term1_max': term1_max,
-                'rpe_q_max': rpe_q_max,
-                'rpe_k_max': rpe_k_max,
-                'per_head_max': per_head_max.tolist(),
-                'per_head_entropy': per_head_entropy.tolist(),
-                'per_head_max_weight': per_head_max_weight.tolist(),
-                'q_vec_norm': q_vec_norm,
-                'k_vec_norm': k_vec_norm,
-                'v_vec_norm': v_vec_norm,
-                'q_vec_max_norm': q_vec_max_norm,
-                'k_vec_max_norm': k_vec_max_norm,
-                'attn_output_max': attn_output[b0].abs().max().item(),
-                'rpe_v_max': rpe_v_out[:1].abs().max().item(),
-                'attn_has_nan': bool(torch.isnan(attn_output[b0]).any()),
-                'attn_has_inf': bool(torch.isinf(attn_output[b0]).any()),
-            }
-
     # Transpose for output projection: [batch, seq, heads, dim]
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
-
-
-# ── RPE diagnostics toggle ──────────────────────────────────────────────
-# Set _rpe_diag_enabled = True before a forward pass to collect per-layer
-# stats into _rpe_diagnostics.  Cheap (first sample only, no grad).
-_rpe_diag_enabled: bool = False
-_rpe_diagnostics: dict = {}
 
 
 def make_relative_attention_forward(rpe: Lc0StyleRPE, layer_idx: int = -1):
@@ -649,39 +570,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         # Relative position embeddings are handled inside attention layers
         # via lc0-style content-dependent RPE (no absolute position embedding addition)
 
-        # Enable per-layer RPE diagnostics during training
-        global _rpe_diag_enabled, _rpe_diagnostics
-        if self.training:
-            _rpe_diag_enabled = True
-            _rpe_diagnostics.clear()
-
-        # Process all tokens through transformer
-        # Enable output_hidden_states during training for per-layer norm diagnostics (H2)
-        if self.training:
-            kwargs['output_hidden_states'] = True
         transformer_outputs = self.transformer(
             inputs_embeds=input_embeds, **kwargs)
         hidden_states = transformer_outputs.last_hidden_state
-
-        # Collect per-layer hidden state norms for H2 diagnostics
-        if self.training:
-            _rpe_diag_enabled = False
-            with torch.no_grad():
-                # H2: Per-layer hidden state norms (tracks residual accumulation)
-                if transformer_outputs.hidden_states is not None:
-                    per_layer_hs_norms = []
-                    for layer_hs in transformer_outputs.hidden_states:
-                        # Mean norm across positions for first batch element
-                        per_layer_hs_norms.append(layer_hs[:1].norm(dim=-1).mean().item())
-                    _rpe_diagnostics['per_layer_hs_norms'] = per_layer_hs_norms
-
-                hs_abs_max = hidden_states.abs().max().item()
-                hs_has_nan = bool(torch.isnan(hidden_states).any())
-                hs_has_inf = bool(torch.isinf(hidden_states).any())
-                if hs_has_nan or hs_has_inf or hs_abs_max > 60000:
-                    print(f"\n{'='*70}")
-                    print(f"NUMERICAL ISSUE in hidden states: max={hs_abs_max:.1f} nan={hs_has_nan} inf={hs_has_inf}")
-                    print(f"{'='*70}\n")
 
         # Multi-task attention pooling (single forward pass)
         task_outputs = self.task_head(hidden_states)
@@ -706,36 +597,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         mate_logits = mate_logits_flat.view(batch_size, self.policy_dim, self.num_mate_classes)
 
         target_device = policy_logits.device
-
-        # Register backward hooks on key intermediate tensors (training only)
-        if self.training:
-            hidden_states.register_hook(_make_grad_hook("hidden_states"))
-            policy_logits.register_hook(_make_grad_hook("policy_logits"))
-            winrate_logits.register_hook(_make_grad_hook("winrate_logits"))
-            control_logits.register_hook(_make_grad_hook("control_logits"))
-            mate_logits_flat.register_hook(_make_grad_hook("mate_logits_flat"))
-
-        # Forward-pass health check on task head outputs
-        if self.training:
-            with torch.no_grad():
-                _fwd_issues = []
-                for _name, _t in [("policy_logits", policy_logits),
-                                   ("winrate_logits", winrate_logits),
-                                   ("control_logits", control_logits),
-                                   ("mate_logits_flat", mate_logits_flat)]:
-                    _t_max = _t.abs().max().item()
-                    if torch.isnan(_t).any():
-                        _fwd_issues.append(f"{_name} has NaN")
-                    if torch.isinf(_t).any():
-                        _fwd_issues.append(f"{_name} has Inf")
-                    if _t_max > 1000:
-                        _fwd_issues.append(f"{_name} max={_t_max:.1f}")
-                if _fwd_issues:
-                    print(f"\n{'='*70}")
-                    print(f"FORWARD HEALTH CHECK — task head outputs (step {training_step}):")
-                    for _issue in _fwd_issues:
-                        print(f"  {_issue}")
-                    print(f"{'='*70}\n")
 
         # Use passed endgame weights for loss upweighting, or default to uniform weights
         if endgame_weights is None:
@@ -811,10 +672,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 torch.clamp(annealed_logits, max=-1e9)
             )
 
-            # Register gradient hook on annealed_logits (feeds both policy CE and BCE losses)
-            if self.training:
-                annealed_logits.register_hook(_make_grad_hook("annealed_logits"))
-
             # Use log_softmax (numerically stable — never computes log(0))
             # then derive probs only where needed for metrics.
             # The old pattern `softmax() + log() + 1e-10` is unsafe in bf16:
@@ -862,44 +719,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             mae_per_move = torch.abs(pred_winrates - absolute_winrates)
             total_legal_count = policy_mask_bool.float().sum()
             move_winrate_mae = (mae_per_move * policy_mask_bool.float()).sum() / total_legal_count.clamp(min=1)
-
-            # Forward health check on targets and loss intermediates
-            if self.training:
-                with torch.no_grad():
-                    _fwd_issues = []
-                    # Check absolute_winrates range on LEGAL moves only (should be [0,1])
-                    # Illegal moves have policy=-1.0 so their absolute_winrates is expected to be negative
-                    _legal_aw = absolute_winrates[policy_mask_bool]
-                    if _legal_aw.numel() > 0:
-                        aw_min = _legal_aw.min().item()
-                        aw_max = _legal_aw.max().item()
-                        if aw_min < -0.1 or aw_max > 1.1:
-                            _fwd_issues.append(f"absolute_winrates (legal) out of range [{aw_min:.4f}, {aw_max:.4f}]")
-                    # Check target_logits on legal moves
-                    _legal_tl = target_logits[policy_mask_bool]
-                    if _legal_tl.numel() > 0:
-                        tl_max = _legal_tl.abs().max().item()
-                        if tl_max > 50:
-                            _fwd_issues.append(f"target_logits (legal) max={tl_max:.1f}")
-                    # Check annealed_logits range
-                    _legal_al = annealed_logits[policy_mask_bool]
-                    if _legal_al.numel() > 0:
-                        al_max = _legal_al.abs().max().item()
-                        if al_max > 100:
-                            _fwd_issues.append(f"annealed_logits (legal) max={al_max:.1f}")
-                    # Check individual loss values
-                    for _ln, _lv in [("policy_loss", policy_loss), ("move_winrate_loss", move_winrate_loss),
-                                     ("illegality_loss", illegality_loss)]:
-                        if _lv is not None:
-                            _lval = _lv.item()
-                            if not math.isfinite(_lval) or _lval > 100:
-                                _fwd_issues.append(f"{_ln}={_lval:.4f}")
-                    if _fwd_issues:
-                        print(f"\n{'='*70}")
-                        print(f"FORWARD HEALTH CHECK — targets/losses (step {training_step}):")
-                        for _issue in _fwd_issues:
-                            print(f"  {_issue}")
-                        print(f"{'='*70}\n")
 
         winrate_loss: Optional[torch.Tensor] = None
         value_mae: Optional[torch.Tensor] = None
@@ -1068,20 +887,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             model_best_move_idx = model_probs.argmax(dim=-1)
             stockfish_best_move_idx = policy.argmax(dim=-1)
             top1_agreement = (model_best_move_idx == stockfish_best_move_idx).float().mean()
-
-        # Register backward hooks on individual loss tensors
-        if self.training:
-            for loss_name, loss_tensor in [
-                ("policy_loss", policy_loss),
-                ("move_winrate_loss", move_winrate_loss),
-                ("illegality_loss", illegality_loss),
-                ("winrate_loss", winrate_loss),
-                ("control_map_loss", control_map_loss),
-                ("masked_token_loss", masked_token_loss),
-                ("mate_loss", mate_loss),
-            ]:
-                if loss_tensor is not None and loss_tensor.requires_grad:
-                    loss_tensor.register_hook(_make_grad_hook(loss_name))
 
         loss_components = [
             component
