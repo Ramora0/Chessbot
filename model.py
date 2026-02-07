@@ -181,6 +181,10 @@ def relative_position_attention_forward(
     # so the 1/sqrt(3) DeBERTa correction would over-dampen initial attention.
     attn_scores = attn_scores * scaling
 
+    # Soft-cap attention logits to prevent score explosion (à la Gemini 1.5).
+    # Bounds total attention score regardless of which term (QK, Q·RPE, RPE·K) produces it.
+    attn_scores = torch.tanh(attn_scores / 50.0) * 50.0
+
     # Apply attention mask
     if attention_mask is not None:
         attn_scores = attn_scores + attention_mask
@@ -449,7 +453,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.illegality_penalty_annealing_steps = getattr(config, 'illegality_penalty_annealing_steps', 0)
 
         self.post_init()
-
+        
         # Zero-init RPE embeddings AFTER post_init(), which re-inits all
         # nn.Embedding modules with normal(0, initializer_range).
         # Zero init is critical: matches lc0, lets the model start with
@@ -822,11 +826,14 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             if self.training:
                 with torch.no_grad():
                     _fwd_issues = []
-                    # Check absolute_winrates range (should be [0,1])
-                    aw_min = absolute_winrates.min().item()
-                    aw_max = absolute_winrates.max().item()
-                    if aw_min < -0.1 or aw_max > 1.1:
-                        _fwd_issues.append(f"absolute_winrates out of range [{aw_min:.4f}, {aw_max:.4f}]")
+                    # Check absolute_winrates range on LEGAL moves only (should be [0,1])
+                    # Illegal moves have policy=-1.0 so their absolute_winrates is expected to be negative
+                    _legal_aw = absolute_winrates[policy_mask_bool]
+                    if _legal_aw.numel() > 0:
+                        aw_min = _legal_aw.min().item()
+                        aw_max = _legal_aw.max().item()
+                        if aw_min < -0.1 or aw_max > 1.1:
+                            _fwd_issues.append(f"absolute_winrates (legal) out of range [{aw_min:.4f}, {aw_max:.4f}]")
                     # Check target_logits on legal moves
                     _legal_tl = target_logits[policy_mask_bool]
                     if _legal_tl.numel() > 0:
