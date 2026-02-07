@@ -12,11 +12,14 @@
 
 set -euo pipefail
 
-# CLI arguments (passed after -- in sbatch command)
-# Usage: sbatch slurms/h100.slurm [branch] [run_name]
-# Example: sbatch slurms/h100.slurm feature-branch my-experiment
+# CLI arguments
+# Usage: sbatch slurms/h100.slurm [branch] [run_name] [train.py args...]
+# Example: sbatch slurms/h100.slurm feature-branch my-experiment --ffn-dim 1024 --depth 24 --lr 1e-4
 BRANCH="${1:-master}"
-RUN_NAME="${2:-}"
+shift || true
+RUN_NAME="${1:-}"
+shift || true
+EXTRA_ARGS="$@"
 
 # Each job gets unique directory (SLURM_JOB_ID ensures no collisions)
 CODE_LOCAL="$TMPDIR/Chessbot-$SLURM_JOB_ID"
@@ -67,9 +70,9 @@ cd "$CODE_LOCAL"
 # Run training with local dataset path
 export DATASET_PATH="$DATASET_LOCAL"
 if [ -n "$RUN_NAME" ]; then
-    python train.py --run-name "$RUN_NAME"
+    python train.py --run-name "$RUN_NAME" $EXTRA_ARGS
 else
-    python train.py
+    python train.py $EXTRA_ARGS
 fi
 
 echo "================================================"

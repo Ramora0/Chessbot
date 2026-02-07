@@ -584,7 +584,24 @@ class RegretEvaluationCallback(TrainerCallback):
         return control
 
 
-def train(run_name: Optional[str] = None) -> None:
+def train(
+    run_name: Optional[str] = None,
+    ffn_dim: Optional[int] = None,
+    depth: Optional[int] = None,
+    heads: Optional[int] = None,
+    lr: Optional[float] = None,
+    beta2: Optional[float] = None,
+    dropout: Optional[float] = None,
+    weight_decay: Optional[float] = None,
+) -> None:
+    # Resolve hyperparameters (CLI overrides → defaults)
+    effective_ffn_dim = ffn_dim if ffn_dim is not None else 768
+    effective_depth = depth if depth is not None else 20
+    effective_heads = heads if heads is not None else 8
+    effective_dropout = dropout if dropout is not None else DROPOUT
+    effective_weight_decay = weight_decay if weight_decay is not None else 0.01
+    effective_beta2 = beta2 if beta2 is not None else 0.999
+
     print("Starting chess transformer training...")
 
     os.environ["WANDB_PROJECT"] = "chessformer"
@@ -613,11 +630,14 @@ def train(run_name: Optional[str] = None) -> None:
     per_device_batch_size = 1024
     schedule = build_training_schedule(per_device_batch_size)
 
+    # CLI --lr overrides the auto-scaled learning rate
+    effective_lr = lr if lr is not None else schedule.learning_rate
+
     print(f"Training will run for {schedule.max_steps} steps")
     print(
         "Training schedule:",
         f"batch_size={per_device_batch_size}",
-        f"learning_rate={schedule.learning_rate}",
+        f"learning_rate={effective_lr}",
         f"warmup_steps={schedule.warmup_steps}",
         f"save_steps={schedule.save_steps}",
         f"logging_steps={schedule.logging_steps}",
@@ -657,12 +677,12 @@ def train(run_name: Optional[str] = None) -> None:
             vocab_size=vocab_size,
             max_position_embeddings=MAX_SEQ_LENGTH,
             hidden_size=768,
-            intermediate_size=768,
-            num_hidden_layers=20,
-            num_attention_heads=8,
-            num_key_value_heads=8,
-            attention_dropout=DROPOUT,
-            hidden_dropout=DROPOUT,
+            intermediate_size=effective_ffn_dim,
+            num_hidden_layers=effective_depth,
+            num_attention_heads=effective_heads,
+            num_key_value_heads=effective_heads,
+            attention_dropout=effective_dropout,
+            hidden_dropout=effective_dropout,
             pad_token_id=pad_token_id,
         )
         config.policy_dim = len(policy_index)
@@ -695,9 +715,10 @@ def train(run_name: Optional[str] = None) -> None:
         num_train_epochs=1,
 
         per_device_train_batch_size=per_device_batch_size,
-        learning_rate=schedule.learning_rate,
+        learning_rate=effective_lr,
         warmup_steps=schedule.warmup_steps,
-        weight_decay=0.01,
+        weight_decay=effective_weight_decay,
+        adam_beta2=effective_beta2,
         max_grad_norm=1.0,
         bf16=True,
         # fp16=True,
@@ -829,5 +850,56 @@ if __name__ == "__main__":
         default=None,
         help="Name for the W&B run (default: testz)"
     )
+    parser.add_argument(
+        "--ffn-dim",
+        type=int,
+        default=None,
+        help="FFN intermediate dimension (default: 768)"
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=None,
+        help="Number of transformer layers (default: 20)"
+    )
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=None,
+        help="Number of attention heads (default: 8)"
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Learning rate, overrides batch-scaled default (default: ~1.6e-4)"
+    )
+    parser.add_argument(
+        "--beta2",
+        type=float,
+        default=None,
+        help="Adam beta2 (default: 0.999)"
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=None,
+        help="Dropout rate (default: 0.1)"
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=None,
+        help="Weight decay (default: 0.01)"
+    )
     args = parser.parse_args()
-    train(run_name=args.run_name)
+    train(
+        run_name=args.run_name,
+        ffn_dim=args.ffn_dim,
+        depth=args.depth,
+        heads=args.heads,
+        lr=args.lr,
+        beta2=args.beta2,
+        dropout=args.dropout,
+        weight_decay=args.weight_decay,
+    )
