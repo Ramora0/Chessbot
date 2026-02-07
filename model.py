@@ -201,18 +201,62 @@ def relative_position_attention_forward(
     rel_value_output = torch.einsum('bhqk,hqkd->bhqd', attn_weights, rel_value_bias_t)
     attn_output = attn_output + rel_value_output
 
-    # --- Numerical health check (only on first batch element, cheap) ---
+    # --- Comprehensive attention diagnostics (first batch element, cheap) ---
     if training and _rpe_diag_enabled:
         with torch.no_grad():
+            b0 = slice(0, 1)  # first batch element only
+
+            # H1: Pre-softmax attention score stats (post-scaling, post-cap)
+            score_max = attn_scores[b0].max().item()
+            score_min = attn_scores[b0].min().item()
+            score_abs_max = max(abs(score_max), abs(score_min))
+
+            # H4: Per-term breakdown (pre-scaling) — which term dominates?
+            # term1 = QK^T only (before term2/term3 were added)
+            term1_only = torch.matmul(query[b0], key[b0].transpose(-2, -1))
+            term1_max = (term1_only * scaling).abs().max().item()
+            term2_max = (term2[b0] * scaling).abs().max().item()
+            term3_max = (term3[b0] * scaling).abs().max().item()
+
+            # H3: Per-head max score and entropy
+            # attn_scores shape: [batch, heads, seq_q, seq_k]
+            per_head_max = attn_scores[b0, :, :, :].amax(dim=(-2, -1))  # [heads]
+            # attn_weights entropy per head: -sum(p * log(p))
+            aw_b0 = attn_weights[b0]  # [1, heads, seq_q, seq_k]
+            log_aw = torch.log(aw_b0 + 1e-10)
+            per_head_entropy = -(aw_b0 * log_aw).sum(dim=-1).mean(dim=-1).squeeze(0)  # [heads]
+            per_head_max_weight = aw_b0.amax(dim=(-2, -1)).squeeze(0)  # [heads] — peakedness
+
+            # H2: Q, K, V vector norms (indicators of hidden state growth)
+            q_vec_norm = query[b0].norm(dim=-1).mean().item()  # mean over positions/heads
+            k_vec_norm = key[b0].norm(dim=-1).mean().item()
+            v_vec_norm = value[b0].norm(dim=-1).mean().item()
+            q_vec_max_norm = query[b0].norm(dim=-1).max().item()
+            k_vec_max_norm = key[b0].norm(dim=-1).max().item()
+
             _rpe_diagnostics.setdefault('layers', {})[layer_idx] = {
-                'qk_max': attn_scores[:1].abs().max().item(),
-                'term2_max': term2[:1].abs().max().item(),
-                'term3_max': term3[:1].abs().max().item(),
-                'attn_output_max': attn_output[:1].abs().max().item(),
-                'rel_value_max': rel_value_output[:1].abs().max().item(),
-                'value_max': value[:1].abs().max().item(),
-                'attn_has_nan': bool(torch.isnan(attn_output[:1]).any()),
-                'attn_has_inf': bool(torch.isinf(attn_output[:1]).any()),
+                # H1: Overall score stats
+                'score_max': score_max,
+                'score_min': score_min,
+                'score_abs_max': score_abs_max,
+                # H4: Per-term breakdown
+                'term1_max': term1_max,
+                'term2_max': term2_max,
+                'term3_max': term3_max,
+                # H3: Per-head stats
+                'per_head_max': per_head_max.tolist(),
+                'per_head_entropy': per_head_entropy.tolist(),
+                'per_head_max_weight': per_head_max_weight.tolist(),
+                # H2: Vector norms
+                'q_vec_norm': q_vec_norm,
+                'k_vec_norm': k_vec_norm,
+                'v_vec_norm': v_vec_norm,
+                'q_vec_max_norm': q_vec_max_norm,
+                'k_vec_max_norm': k_vec_max_norm,
+                # Existing checks
+                'attn_output_max': attn_output[b0].abs().max().item(),
+                'attn_has_nan': bool(torch.isnan(attn_output[b0]).any()),
+                'attn_has_inf': bool(torch.isinf(attn_output[b0]).any()),
             }
 
     # Transpose for output projection: [batch, seq, heads, dim]
@@ -608,38 +652,31 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             _rpe_diagnostics.clear()
 
         # Process all tokens through transformer
+        # Enable output_hidden_states during training for per-layer norm diagnostics (H2)
+        if self.training:
+            kwargs['output_hidden_states'] = True
         transformer_outputs = self.transformer(
             inputs_embeds=input_embeds, **kwargs)
         hidden_states = transformer_outputs.last_hidden_state
 
-        # Check for numerical issues in hidden states coming out of the transformer
+        # Collect per-layer hidden state norms for H2 diagnostics
         if self.training:
             _rpe_diag_enabled = False
             with torch.no_grad():
+                # H2: Per-layer hidden state norms (tracks residual accumulation)
+                if transformer_outputs.hidden_states is not None:
+                    per_layer_hs_norms = []
+                    for layer_hs in transformer_outputs.hidden_states:
+                        # Mean norm across positions for first batch element
+                        per_layer_hs_norms.append(layer_hs[:1].norm(dim=-1).mean().item())
+                    _rpe_diagnostics['per_layer_hs_norms'] = per_layer_hs_norms
+
                 hs_abs_max = hidden_states.abs().max().item()
                 hs_has_nan = bool(torch.isnan(hidden_states).any())
                 hs_has_inf = bool(torch.isinf(hidden_states).any())
                 if hs_has_nan or hs_has_inf or hs_abs_max > 60000:
                     print(f"\n{'='*70}")
                     print(f"NUMERICAL ISSUE in hidden states: max={hs_abs_max:.1f} nan={hs_has_nan} inf={hs_has_inf}")
-                    print(f"Input embed max: {input_embeds.abs().max().item():.4f}")
-                    # Dump per-layer attention diagnostics
-                    for layer_id in sorted(_rpe_diagnostics.get('layers', {}).keys()):
-                        d = _rpe_diagnostics['layers'][layer_id]
-                        print(f"  Layer {layer_id:2d}: "
-                              f"qk_max={d['qk_max']:.1f}  "
-                              f"term2_max={d['term2_max']:.1f}  "
-                              f"term3_max={d['term3_max']:.1f}  "
-                              f"attn_out_max={d['attn_output_max']:.1f}  "
-                              f"rpe_v_max={d['rel_value_max']:.1f}  "
-                              f"V_max={d['value_max']:.1f}  "
-                              f"nan={d['attn_has_nan']}  inf={d['attn_has_inf']}")
-                    # RPE weight norms
-                    for i, rpe in enumerate(self.rel_pos_embs):
-                        q_norm = rpe.rel_query_board.weight.norm().item()
-                        k_norm = rpe.rel_key_board.weight.norm().item()
-                        v_norm = rpe.rel_value_board.weight.norm().item()
-                        print(f"  RPE weights layer {i:2d}: Q_norm={q_norm:.4f}  K_norm={k_norm:.4f}  V_norm={v_norm:.4f}")
                     print(f"{'='*70}\n")
 
         # Multi-task attention pooling (single forward pass)

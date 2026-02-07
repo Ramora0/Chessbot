@@ -369,6 +369,81 @@ class TrackingTrainer(Trainer):
             print(f"Top 10 parameters by grad norm:")
             for name, norm, mx in param_norms[:10]:
                 print(f"  {name:60s}: norm={norm:.2e} max={mx:.2e}")
+
+            # ── H1 + H3 + H4: Per-layer attention diagnostics ──
+            from model import _rpe_diagnostics
+            layers_diag = _rpe_diagnostics.get('layers', {})
+            if layers_diag:
+                print(f"\n--- H1: Per-layer attention score max (post-scale, post-cap) ---")
+                for lid in sorted(layers_diag.keys()):
+                    d = layers_diag[lid]
+                    print(f"  Layer {lid:2d}: score_max={d['score_max']:7.2f}  "
+                          f"score_min={d['score_min']:7.2f}  "
+                          f"term1(QK)={d['term1_max']:6.2f}  "
+                          f"term2(Q·RPE_K)={d['term2_max']:6.2f}  "
+                          f"term3(RPE_Q·K)={d['term3_max']:6.2f}")
+
+                print(f"\n--- H3: Per-head breakdown (layer with max score) ---")
+                worst_layer = max(layers_diag.keys(), key=lambda l: layers_diag[l]['score_abs_max'])
+                wd = layers_diag[worst_layer]
+                print(f"  Worst layer: {worst_layer} (score_abs_max={wd['score_abs_max']:.2f})")
+                for h in range(len(wd['per_head_max'])):
+                    print(f"    Head {h}: max_score={wd['per_head_max'][h]:7.2f}  "
+                          f"entropy={wd['per_head_entropy'][h]:5.2f}  "
+                          f"max_attn_weight={wd['per_head_max_weight'][h]:.4f}")
+
+                print(f"\n--- H2: Q/K/V vector norms per layer ---")
+                for lid in sorted(layers_diag.keys()):
+                    d = layers_diag[lid]
+                    print(f"  Layer {lid:2d}: "
+                          f"Q_mean={d['q_vec_norm']:6.2f}  Q_max={d['q_vec_max_norm']:6.2f}  "
+                          f"K_mean={d['k_vec_norm']:6.2f}  K_max={d['k_vec_max_norm']:6.2f}  "
+                          f"V_mean={d['v_vec_norm']:6.2f}")
+
+            # ── H2: Per-layer hidden state norms (residual accumulation) ──
+            hs_norms = _rpe_diagnostics.get('per_layer_hs_norms', [])
+            if hs_norms:
+                print(f"\n--- H2: Hidden state norms per layer (residual accumulation) ---")
+                for i, norm in enumerate(hs_norms):
+                    label = "embed" if i == 0 else f"layer {i-1:2d}"
+                    print(f"  After {label:10s}: {norm:.2f}")
+
+            # ── H5: Per-layer weight norms (W_Q, W_K, W_V, W_O) ──
+            print(f"\n--- H5: Per-layer attention weight norms ---")
+            unwrapped = raw_model._orig_mod if hasattr(raw_model, '_orig_mod') else raw_model
+            if hasattr(unwrapped, 'transformer'):
+                for i, layer in enumerate(unwrapped.transformer.layers):
+                    attn = layer.self_attn
+                    q_wn = attn.q_proj.weight.norm().item()
+                    k_wn = attn.k_proj.weight.norm().item()
+                    v_wn = attn.v_proj.weight.norm().item()
+                    o_wn = attn.o_proj.weight.norm().item()
+                    print(f"  Layer {i:2d}: W_Q={q_wn:7.2f}  W_K={k_wn:7.2f}  "
+                          f"W_V={v_wn:7.2f}  W_O={o_wn:7.2f}")
+
+            # ── H6: Batch characteristics ──
+            print(f"\n--- H6: Batch characteristics ---")
+            if 'true_value' in inputs and inputs['true_value'] is not None:
+                tv = inputs['true_value']
+                print(f"  true_value: min={tv.min().item():.4f}  max={tv.max().item():.4f}  "
+                      f"mean={tv.mean().item():.4f}  std={tv.std().item():.4f}")
+                # Extreme win rates
+                extreme_low = (tv < 0.05).sum().item()
+                extreme_high = (tv > 0.95).sum().item()
+                print(f"  extreme win rates: <0.05: {extreme_low}/{len(tv)}  >0.95: {extreme_high}/{len(tv)}")
+            if 'policy' in inputs and inputs['policy'] is not None:
+                p = inputs['policy']
+                legal_per_sample = (p > -0.99).float().sum(dim=-1)
+                print(f"  legal moves: min={legal_per_sample.min().item():.0f}  "
+                      f"max={legal_per_sample.max().item():.0f}  "
+                      f"mean={legal_per_sample.mean().item():.1f}")
+                print(f"  policy has_nan={bool(torch.isnan(p).any())}  "
+                      f"has_inf={bool(torch.isinf(p).any())}")
+            if 'input_ids' in inputs:
+                ids = inputs['input_ids']
+                print(f"  input_ids: shape={list(ids.shape)}  "
+                      f"has_nan={bool(torch.isnan(ids.float()).any())}")
+
             print(f"{'#'*70}\n")
 
         return loss
