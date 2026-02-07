@@ -31,7 +31,7 @@ MAX_SEQ_LENGTH = 256  # Board tokens: 72
 DATASET_PATH = os.getenv("DATASET_PATH", "fuck")
 SHUFFLE_DATASET = True
 ELO_EVAL_STEPS = 16000
-EVAL_BATCH_SIZE = 4096
+EVAL_BATCH_SIZE = 512
 TRAIN_MAX_STEPS_ENV = "TRAIN_MAX_STEPS"
 BASE_BATCH_SIZE = 256
 BASE_LEARNING_RATE = 4e-5
@@ -124,7 +124,7 @@ class TrackingTrainer(Trainer):
         self._last_value_mae: Optional[float] = None
         self._last_move_winrate_mae: Optional[float] = None
         self._last_model_entropy: Optional[float] = None
-        # NEW: Attention policy head losses
+        # Attention policy head losses
         self._last_attention_policy_loss: Optional[float] = None
         self._last_attention_move_winrate_loss: Optional[float] = None
 
@@ -204,7 +204,6 @@ class TrackingTrainer(Trainer):
         else:
             self._last_illegality_loss = None
 
-        # NEW: Attention policy head losses
         attention_policy_loss = getattr(outputs, "attention_policy_loss", None)
         if attention_policy_loss is not None:
             weight = float(getattr(model, "attention_policy_loss_weight", 0.0))
@@ -310,6 +309,7 @@ class TrackingTrainer(Trainer):
             if self._last_model_entropy is not None:
                 logs.setdefault("model_entropy",
                                 self._last_model_entropy)
+
         super().log(logs, *args, **kwargs)
 
 
@@ -354,6 +354,7 @@ class EloEvaluationCallback(TrainerCallback):
 
         model = self.trainer.model
         was_training = model.training
+        torch.cuda.empty_cache()
         elo, elo_se, solve_percentage, elo_greedy, elo_se_greedy, solve_percentage_greedy = evaluate_model_elo(
             model=model,
             batch_size=self.batch_size,
@@ -364,6 +365,7 @@ class EloEvaluationCallback(TrainerCallback):
         )
         if was_training:
             model.train()
+        torch.cuda.empty_cache()
 
         metrics = {
             "eval_elo": float(elo),
@@ -385,7 +387,17 @@ class EloEvaluationCallback(TrainerCallback):
 
 
 class GameEvaluationCallback(TrainerCallback):
-    """Callback to run game-based evaluation against Stockfish during training."""
+    """Callback to run game-based evaluation against Stockfish during training.
+
+    The opponent ELO dynamically adjusts after each evaluation: it is set to the
+    model's estimated ELO from the previous evaluation (clamped to Stockfish's
+    supported range).  This ensures the model always faces a challenging opponent
+    rather than being stuck playing against a fixed, potentially inferior level.
+    """
+
+    # Stockfish UCI_Elo supported range
+    STOCKFISH_ELO_MIN = 1320
+    STOCKFISH_ELO_MAX = 3190
 
     def __init__(
         self,
@@ -428,13 +440,14 @@ class GameEvaluationCallback(TrainerCallback):
 
         model = self.trainer.model
         was_training = model.training
+        torch.cuda.empty_cache()
 
         # Import here to avoid circular dependency
         from evaluation_game import evaluate_model_against_stockfish
 
         try:
             print(f"\n{'='*80}")
-            print(f"Running game evaluation at step {step}...")
+            print(f"Running game evaluation at step {step} (opponent ELO: {self.opponent_elo})...")
             print(f"{'='*80}")
 
             # Run game evaluation
@@ -451,6 +464,7 @@ class GameEvaluationCallback(TrainerCallback):
             # Restore training mode
             if was_training:
                 model.train()
+            torch.cuda.empty_cache()
 
             # Log metrics to wandb
             metrics = {
@@ -462,6 +476,14 @@ class GameEvaluationCallback(TrainerCallback):
             self.trainer.log(metrics)
             self._last_step_logged = step
 
+            # Dynamically adjust opponent ELO for next evaluation
+            if not math.isnan(estimated_elo):
+                old_elo = self.opponent_elo
+                new_elo = int(round(estimated_elo))
+                new_elo = max(self.STOCKFISH_ELO_MIN, min(self.STOCKFISH_ELO_MAX, new_elo))
+                self.opponent_elo = new_elo
+                print(f"Opponent ELO updated: {old_elo} -> {new_elo} (model estimated: {estimated_elo:.0f})")
+
             print(
                 f"Game evaluation complete: ELO={estimated_elo:.1f} ± {std_error:.1f}")
             print(f"{'='*80}\n")
@@ -471,6 +493,7 @@ class GameEvaluationCallback(TrainerCallback):
             # Continue training even if evaluation fails
             if was_training:
                 model.train()
+            torch.cuda.empty_cache()
 
         return control
 
@@ -515,6 +538,7 @@ class RegretEvaluationCallback(TrainerCallback):
 
         model = self.trainer.model
         was_training = model.training
+        torch.cuda.empty_cache()
 
         try:
             print(f"\n{'='*80}")
@@ -531,6 +555,7 @@ class RegretEvaluationCallback(TrainerCallback):
 
             if was_training:
                 model.train()
+            torch.cuda.empty_cache()
 
             print_regret_results(results)
 
@@ -554,12 +579,14 @@ class RegretEvaluationCallback(TrainerCallback):
             traceback.print_exc()
             if was_training:
                 model.train()
+            torch.cuda.empty_cache()
 
         return control
 
 
 def train(run_name: Optional[str] = None) -> None:
     print("Starting chess transformer training...")
+
     os.environ["WANDB_PROJECT"] = "chessformer"
     # Avoid W&B from uploading checkpoints while keeping metric logging enabled.
     os.environ["WANDB_LOG_MODEL"] = "false"
@@ -670,7 +697,7 @@ def train(run_name: Optional[str] = None) -> None:
         per_device_train_batch_size=per_device_batch_size,
         learning_rate=schedule.learning_rate,
         warmup_steps=schedule.warmup_steps,
-        weight_decay=0,
+        weight_decay=0.01,
         max_grad_norm=1.0,
         bf16=True,
         # fp16=True,
