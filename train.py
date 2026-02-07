@@ -710,9 +710,9 @@ def train(
         output_dir=OUTPUT_DIR,
         num_train_epochs=1,
 
-        gradient_accumulation_steps=2,
+        # gradient_accumulation_steps=2,
 
-        per_device_train_batch_size=per_device_batch_size // 2,
+        per_device_train_batch_size=per_device_batch_size,
         learning_rate=effective_lr,
         warmup_steps=schedule.warmup_steps,
         weight_decay=weight_decay,
