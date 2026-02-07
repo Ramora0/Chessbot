@@ -586,6 +586,7 @@ class RegretEvaluationCallback(TrainerCallback):
 
 def train(
     run_name: Optional[str] = None,
+    hidden_dim: Optional[int] = None,
     ffn_dim: Optional[int] = None,
     depth: Optional[int] = None,
     heads: Optional[int] = None,
@@ -595,6 +596,7 @@ def train(
     weight_decay: Optional[float] = None,
 ) -> None:
     # Resolve hyperparameters (CLI overrides → defaults)
+    effective_hidden_dim = hidden_dim if hidden_dim is not None else 768
     effective_ffn_dim = ffn_dim if ffn_dim is not None else 768
     effective_depth = depth if depth is not None else 20
     effective_heads = heads if heads is not None else 8
@@ -676,7 +678,7 @@ def train(
         config = LlamaConfig(
             vocab_size=vocab_size,
             max_position_embeddings=MAX_SEQ_LENGTH,
-            hidden_size=768,
+            hidden_size=effective_hidden_dim,
             intermediate_size=effective_ffn_dim,
             num_hidden_layers=effective_depth,
             num_attention_heads=effective_heads,
@@ -853,6 +855,12 @@ if __name__ == "__main__":
         help="Name for the W&B run (default: testz)"
     )
     parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=None,
+        help="Model hidden dimension (default: 768)"
+    )
+    parser.add_argument(
         "--ffn-dim",
         type=int,
         default=None,
@@ -897,6 +905,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     train(
         run_name=args.run_name,
+        hidden_dim=args.hidden_dim,
         ffn_dim=args.ffn_dim,
         depth=args.depth,
         heads=args.heads,
