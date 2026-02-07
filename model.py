@@ -199,8 +199,8 @@ def relative_position_attention_forward(
     # Scale all terms together (lc0 style: 1/sqrt(d_k))
     attn_scores = attn_scores * scaling
 
-    # Soft-cap attention logits (temporarily disabled)
-    # attn_scores = torch.tanh(attn_scores / 50.0) * 50.0
+    # Soft-cap attention logits to prevent score explosion (à la Gemini 1.5).
+    attn_scores = torch.tanh(attn_scores / 50.0) * 50.0
 
     # Apply attention mask
     if attention_mask is not None:
