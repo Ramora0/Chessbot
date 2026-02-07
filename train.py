@@ -610,7 +610,7 @@ def train(run_name: Optional[str] = None) -> None:
         seed=42,
     )
 
-    per_device_batch_size = 1024
+    per_device_batch_size = 2048
     schedule = build_training_schedule(per_device_batch_size)
 
     print(f"Training will run for {schedule.max_steps} steps")
@@ -694,9 +694,7 @@ def train(run_name: Optional[str] = None) -> None:
         output_dir=OUTPUT_DIR,
         num_train_epochs=1,
 
-        gradient_accumulation_steps=2,
-
-        per_device_train_batch_size=per_device_batch_size // 2,
+        per_device_train_batch_size=per_device_batch_size,
         learning_rate=schedule.learning_rate,
         warmup_steps=schedule.warmup_steps,
         weight_decay=0.01,
