@@ -32,6 +32,8 @@ _GRAD_DEBUG_THRESHOLD = 100.0  # Print when any grad norm > this
 def _make_grad_hook(name: str):
     """Create a backward hook that checks gradient health."""
     def hook(grad):
+        if grad is None:
+            return
         grad_norm = grad.norm().item()
         grad_max = grad.abs().max().item()
         has_nan = bool(torch.isnan(grad).any())
