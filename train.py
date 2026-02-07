@@ -191,12 +191,12 @@ class TrackingTrainer(Trainer):
             if hasattr(raw_model, 'rel_pos_embs'):
                 print("  RPE weight norms:")
                 for i, rpe in enumerate(raw_model.rel_pos_embs):
-                    q_n = rpe.rel_query_board.weight.norm().item()
-                    k_n = rpe.rel_key_board.weight.norm().item()
-                    v_n = rpe.rel_value_board.weight.norm().item()
-                    q_max = rpe.rel_query_board.weight.abs().max().item()
-                    k_max = rpe.rel_key_board.weight.abs().max().item()
-                    v_max = rpe.rel_value_board.weight.abs().max().item()
+                    q_n = rpe.rpe_q.rpe.norm().item()
+                    k_n = rpe.rpe_k.rpe.norm().item()
+                    v_n = rpe.rpe_v.rpe_value.norm().item()
+                    q_max = rpe.rpe_q.rpe.abs().max().item()
+                    k_max = rpe.rpe_k.rpe.abs().max().item()
+                    v_max = rpe.rpe_v.rpe_value.abs().max().item()
                     print(f"    Layer {i:2d}: Q(norm={q_n:.4f}, max={q_max:.4f})  "
                           f"K(norm={k_n:.4f}, max={k_max:.4f})  "
                           f"V(norm={v_n:.4f}, max={v_max:.4f})")
@@ -504,9 +504,9 @@ class TrackingTrainer(Trainer):
             if hasattr(raw_model, 'rel_pos_embs'):
                 q_norms, k_norms, v_norms = [], [], []
                 for rpe in raw_model.rel_pos_embs:
-                    q_norms.append(rpe.rel_query_board.weight.norm().item())
-                    k_norms.append(rpe.rel_key_board.weight.norm().item())
-                    v_norms.append(rpe.rel_value_board.weight.norm().item())
+                    q_norms.append(rpe.rpe_q.rpe.norm().item())
+                    k_norms.append(rpe.rpe_k.rpe.norm().item())
+                    v_norms.append(rpe.rpe_v.rpe_value.norm().item())
                 logs["rpe_q_norm_mean"] = sum(q_norms) / len(q_norms)
                 logs["rpe_k_norm_mean"] = sum(k_norms) / len(k_norms)
                 logs["rpe_v_norm_mean"] = sum(v_norms) / len(v_norms)

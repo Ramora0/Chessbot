@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,146 +45,162 @@ def _make_grad_hook(name: str):
     return hook
 
 
-class ChessRelativePositionEmbedding(nn.Module):
-    """Chess-aware relative position embeddings with full Q, K, V biases.
+def _make_rpe_factorizer():
+    """Build the fixed 225->4096 factorizer matrix (lc0 style).
 
-    Board positions (0-63) use 2D relative coordinates (rank_diff, file_diff).
-    Metadata positions (64-71) get zero bias (rely on token embeddings for identity).
+    Maps 225 relative displacement parameters (15x15 grid of rank_diff x file_diff,
+    each ranging -7..+7) to all 4096 square pairs (64x64).  This is a binary matrix:
+    factorizer[disp_idx, sq_pair_idx] = 1 iff that square pair has that displacement.
+    """
+    out = np.zeros((225, 64 * 64), dtype=np.float32)
+    for r1 in range(8):
+        for f1 in range(8):
+            for r2 in range(8):
+                for f2 in range(8):
+                    disp = 15 * (r1 - r2 + 7) + (f1 - f2 + 7)
+                    pair = 64 * (r1 * 8 + f1) + (r2 * 8 + f2)
+                    out[disp, pair] = 1.0
+    return out
+
+
+# Precomputed once at import time (same as lc0)
+_RPE_FACTORIZER_NP = _make_rpe_factorizer()
+
+
+class Lc0RPELogits(nn.Module):
+    """Content-dependent relative position encoding for Q or K (lc0 style).
+
+    Learns a weight matrix [head_dim * num_heads, 225] that is expanded to full
+    64x64 via the fixed factorizer, then interacts with Q or K content via einsum.
+    Each feature dimension learns its own spatial attention pattern.
     """
 
-    def __init__(
-        self,
-        num_heads: int,
-        head_dim: int,
-        board_size: int = 64,
-        max_seq_len: int = 72,
-    ):
+    def __init__(self, num_heads: int, head_dim: int, rpe_type: str):
+        super().__init__()
+        assert rpe_type in ('q', 'k')
+        self.rpe_type = rpe_type
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        # Learnable RPE parameters: [head_dim * num_heads, 225]
+        self.rpe = nn.Parameter(torch.zeros(head_dim * num_heads, 225))
+        # Fixed factorizer (registered as buffer so it moves with .to(device))
+        self.register_buffer(
+            'factorizer',
+            torch.from_numpy(_RPE_FACTORIZER_NP),  # [225, 4096]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Q or K tensor, shape [batch, num_heads, 64, head_dim]
+        Returns:
+            Attention logit bias [batch, num_heads, 64, 64]
+        """
+        # Expand 225 params -> full 64x64: [D*H, 225] @ [225, 4096] -> [D*H, 4096]
+        rpe = self.rpe @ self.factorizer.to(self.rpe.dtype)
+        # Reshape to [head_dim, num_heads, 64, 64]
+        rpe = rpe.view(self.head_dim, self.num_heads, 64, 64)
+
+        if self.rpe_type == 'q':
+            # Content-dependent: each feature dim of Q selects its spatial pattern
+            return torch.einsum('bhqd,dhqk->bhqk', x, rpe)
+        else:
+            return torch.einsum('bhkd,dhqk->bhqk', x, rpe)
+
+
+class Lc0RPEValue(nn.Module):
+    """Content-dependent relative position encoding for values (lc0 style).
+
+    Generates a position-dependent value contribution weighted by attention.
+    """
+
+    def __init__(self, num_heads: int, head_dim: int):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.board_size = board_size
-        self.max_seq_len = max_seq_len
+        self.rpe_value = nn.Parameter(torch.zeros(head_dim * num_heads, 225))
+        self.register_buffer(
+            'factorizer',
+            torch.from_numpy(_RPE_FACTORIZER_NP),
+        )
 
-        # Board-to-board: 15x15 = 225 unique (rank_diff, file_diff) pairs
-        # rank_diff and file_diff each range from -7 to +7
-        self.rel_query_board = nn.Embedding(225, num_heads * head_dim)
-        self.rel_key_board = nn.Embedding(225, num_heads * head_dim)
-        self.rel_value_board = nn.Embedding(225, num_heads * head_dim)
-
-        # Initialize to zeros for stability (matches lc0's approach).
-        # Zero init means the model starts with no positional signal and
-        # gradually learns it, preventing RPE from dominating content-based
-        # attention and causing gradient spikes in deep (20-layer) models.
-        nn.init.zeros_(self.rel_query_board.weight)
-        nn.init.zeros_(self.rel_key_board.weight)
-        nn.init.zeros_(self.rel_value_board.weight)
-
-        # Precompute relative position indices (fixed for chess board)
-        self._precompute_indices()
-
-    def _precompute_indices(self):
-        """Precompute relative position index matrix for board squares only."""
-        # Board indices: convert (rank_diff, file_diff) to single index
-        # rank_diff + 7 gives 0-14, file_diff + 7 gives 0-14
-        # index = (rank_diff + 7) * 15 + (file_diff + 7)
-        board_indices = torch.zeros(self.board_size, self.board_size, dtype=torch.long)
-        for i in range(self.board_size):
-            rank_i, file_i = i // 8, i % 8
-            for j in range(self.board_size):
-                rank_j, file_j = j // 8, j % 8
-                rank_diff = rank_j - rank_i + 7  # 0-14
-                file_diff = file_j - file_i + 7  # 0-14
-                board_indices[i, j] = rank_diff * 15 + file_diff
-
-        self.register_buffer('board_indices', board_indices)
-
-    def get_bias_matrices(self, seq_len: int, device: torch.device):
-        """Get relative position bias matrices for queries, keys, and values.
-
-        Board-to-board interactions use learned relative position embeddings.
-        All other interactions (involving metadata) get zero bias.
-
-        Returns:
-            rel_query_bias: [seq_len, seq_len, num_heads, head_dim]
-            rel_key_bias: [seq_len, seq_len, num_heads, head_dim]
-            rel_value_bias: [seq_len, seq_len, num_heads, head_dim]
+    def forward(self, attn_weights: torch.Tensor) -> torch.Tensor:
         """
-        seq_len = min(seq_len, self.max_seq_len)
-        board_size = min(self.board_size, seq_len)
-        emb_dim = self.num_heads * self.head_dim
+        Args:
+            attn_weights: [batch, num_heads, 64, 64] (post-softmax)
+        Returns:
+            Value bias [batch, num_heads, 64, head_dim]
+        """
+        rpe_v = self.rpe_value @ self.factorizer.to(self.rpe_value.dtype)
+        rpe_v = rpe_v.view(self.head_dim, self.num_heads, 64, 64)
+        return torch.einsum('bhqk,dhqk->bhqd', attn_weights, rpe_v)
 
-        # Initialize full bias matrices with zeros
-        rel_query_bias = torch.zeros(seq_len, seq_len, emb_dim, device=device)
-        rel_key_bias = torch.zeros(seq_len, seq_len, emb_dim, device=device)
-        rel_value_bias = torch.zeros(seq_len, seq_len, emb_dim, device=device)
 
-        # Fill in board-to-board region with learned embeddings
-        if board_size > 0:
-            board_idx = self.board_indices[:board_size, :board_size]
-            rel_query_bias[:board_size, :board_size] = self.rel_query_board(board_idx)
-            rel_key_bias[:board_size, :board_size] = self.rel_key_board(board_idx)
-            rel_value_bias[:board_size, :board_size] = self.rel_value_board(board_idx)
+class Lc0StyleRPE(nn.Module):
+    """Per-layer container for lc0-style RPE (Q, K, V components).
 
-        # Reshape to [seq, seq, num_heads, head_dim]
-        rel_query_bias = rel_query_bias.view(seq_len, seq_len, self.num_heads, self.head_dim)
-        rel_key_bias = rel_key_bias.view(seq_len, seq_len, self.num_heads, self.head_dim)
-        rel_value_bias = rel_value_bias.view(seq_len, seq_len, self.num_heads, self.head_dim)
+    All three are zero-initialized so the model starts with pure content-based
+    attention and gradually learns positional signal.
+    """
 
-        return rel_query_bias, rel_key_bias, rel_value_bias
+    def __init__(self, num_heads: int, head_dim: int):
+        super().__init__()
+        self.rpe_q = Lc0RPELogits(num_heads, head_dim, rpe_type='q')
+        self.rpe_k = Lc0RPELogits(num_heads, head_dim, rpe_type='k')
+        self.rpe_v = Lc0RPEValue(num_heads, head_dim)
 
 
 def relative_position_attention_forward(
     query: torch.Tensor,          # [batch, num_heads, seq_len, head_dim]
     key: torch.Tensor,            # [batch, num_heads, seq_len, head_dim]
     value: torch.Tensor,          # [batch, num_heads, seq_len, head_dim]
-    rel_query_bias: torch.Tensor, # [seq_len, seq_len, num_heads, head_dim]
-    rel_key_bias: torch.Tensor,   # [seq_len, seq_len, num_heads, head_dim]
-    rel_value_bias: torch.Tensor, # [seq_len, seq_len, num_heads, head_dim]
+    rpe: Lc0StyleRPE,
     attention_mask: Optional[torch.Tensor],
     scaling: float,
     dropout: float = 0.0,
     training: bool = False,
     layer_idx: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Attention with full Q, K, V relative position representations.
+    """Attention with lc0-style content-dependent relative position encodings.
 
-    e_ij = (q_i + a_ij^Q) @ (k_j + a_ij^K)^T * scale
-         = (q_i @ k_j^T + q_i @ a_ij^K + a_ij^Q @ k_j^T + a_ij^Q @ a_ij^K) * scale
-    z_i = sum_j softmax(e_ij) * (v_j + a_ij^V)
+    attn_logits = Q @ K^T + RPE_q(Q) + RPE_k(K)
+    attn_logits = attn_logits / sqrt(d_k)
+    attn_weights = softmax(attn_logits)
+    output = attn_weights @ V + RPE_v(attn_weights)
+
+    RPE only covers board squares (0-63). For sequences longer than 64,
+    Q/K are sliced to board-only for RPE computation, and the bias is
+    zero-padded back to full sequence length.
     """
     batch_size, num_heads, seq_len, head_dim = query.shape
 
-    # Permute bias tensors for efficient computation: [heads, seq_q, seq_k, dim]
-    rel_query_bias_t = rel_query_bias.permute(2, 0, 1, 3)
-    rel_key_bias_t = rel_key_bias.permute(2, 0, 1, 3)
-    rel_value_bias_t = rel_value_bias.permute(2, 0, 1, 3)
-
-    # Term 1: q_i @ k_j^T (standard attention)
-    # [batch, heads, seq_q, dim] @ [batch, heads, dim, seq_k] -> [batch, heads, seq_q, seq_k]
+    # Term 1: Q @ K^T (standard attention)
     attn_scores = torch.matmul(query, key.transpose(-2, -1))
 
-    # Term 2: q_i @ a_ij^K (content-to-position)
-    # [batch, heads, seq_q, dim] einsum [heads, seq_q, seq_k, dim] -> [batch, heads, seq_q, seq_k]
-    term2 = torch.einsum('bhqd,hqkd->bhqk', query, rel_key_bias_t)
-    attn_scores = attn_scores + term2
+    # RPE terms: content-dependent positional bias (board squares only)
+    board_len = min(seq_len, 64)
+    q_board = query[:, :, :board_len, :]  # [B, H, <=64, D]
+    k_board = key[:, :, :board_len, :]
 
-    # Term 3: a_ij^Q @ k_j^T (position-to-content)
-    # [heads, seq_q, seq_k, dim] einsum [batch, heads, seq_k, dim] -> [batch, heads, seq_q, seq_k]
-    term3 = torch.einsum('hqkd,bhkd->bhqk', rel_query_bias_t, key)
-    attn_scores = attn_scores + term3
+    # Term 2: RPE_q(Q) -- query content selects spatial pattern
+    rpe_q_bias = rpe.rpe_q(q_board)  # [B, H, 64, 64]
+    # Term 3: RPE_k(K) -- key content selects spatial pattern
+    rpe_k_bias = rpe.rpe_k(k_board)  # [B, H, 64, 64]
 
-    # Term 4 (position-to-position, a^Q @ a^K) deliberately omitted:
-    # it's input-independent and universally dropped (DeBERTa, Transformer-XL)
+    if seq_len > 64:
+        # Zero-pad RPE bias to cover metadata tokens
+        # Board-to-board region gets RPE, everything else stays zero
+        full_bias = attn_scores.new_zeros(batch_size, num_heads, seq_len, seq_len)
+        full_bias[:, :, :board_len, :board_len] = rpe_q_bias + rpe_k_bias
+        attn_scores = attn_scores + full_bias
+    else:
+        attn_scores = attn_scores + rpe_q_bias + rpe_k_bias
 
-    # Standard 1/sqrt(d) scaling, matching lc0's approach: all three terms
-    # (QK^T, Q@RPE_K, RPE_Q@K) are summed then scaled together.
-    # With zero-init RPE, only the QK^T term is active early in training,
-    # so the 1/sqrt(3) DeBERTa correction would over-dampen initial attention.
+    # Scale all terms together (lc0 style: 1/sqrt(d_k))
     attn_scores = attn_scores * scaling
 
-    # Soft-cap attention logits to prevent score explosion (à la Gemini 1.5).
-    # Bounds total attention score regardless of which term (QK, Q·RPE, RPE·K) produces it.
-    attn_scores = torch.tanh(attn_scores / 50.0) * 50.0
+    # Soft-cap attention logits (temporarily disabled)
+    # attn_scores = torch.tanh(attn_scores / 50.0) * 50.0
 
     # Apply attention mask
     if attention_mask is not None:
@@ -195,66 +212,65 @@ def relative_position_attention_forward(
         attn_weights = F.dropout(attn_weights, p=dropout, training=True)
 
     # Standard attention output: attn_weights @ V
-    attn_output = torch.matmul(attn_weights, value)  # [batch, heads, seq_q, dim]
+    attn_output = torch.matmul(attn_weights, value)
 
-    # Relative position value bias term: attn_weights @ a_ij^V
-    rel_value_output = torch.einsum('bhqk,hqkd->bhqd', attn_weights, rel_value_bias_t)
-    attn_output = attn_output + rel_value_output
+    # RPE value bias: position-dependent value contribution weighted by attention
+    board_attn = attn_weights[:, :, :board_len, :board_len]  # [B, H, 64, 64]
+    rpe_v_out = rpe.rpe_v(board_attn)  # [B, H, 64, D]
+    if seq_len > 64:
+        # Zero-pad value RPE for metadata positions
+        full_rpe_v = torch.zeros_like(attn_output)
+        full_rpe_v[:, :, :board_len, :] = rpe_v_out
+        attn_output = attn_output + full_rpe_v
+    else:
+        attn_output = attn_output + rpe_v_out
 
-    # --- Comprehensive attention diagnostics (first batch element, cheap) ---
+    # --- Numerical health check (only on first batch element, cheap) ---
     if training and _rpe_diag_enabled:
         with torch.no_grad():
-            b0 = slice(0, 1)  # first batch element only
+            b0 = slice(0, 1)
 
-            # H1: Pre-softmax attention score stats (post-scaling, post-cap)
             score_max = attn_scores[b0].max().item()
             score_min = attn_scores[b0].min().item()
             score_abs_max = max(abs(score_max), abs(score_min))
 
-            # H4: Per-term breakdown (pre-scaling) — which term dominates?
-            # term1 = QK^T only (before term2/term3 were added)
+            # Per-term breakdown (pre-scaling)
             term1_only = torch.matmul(query[b0], key[b0].transpose(-2, -1))
             term1_max = (term1_only * scaling).abs().max().item()
-            term2_max = (term2[b0] * scaling).abs().max().item()
-            term3_max = (term3[b0] * scaling).abs().max().item()
+            rpe_q_max = (rpe_q_bias[:1] * scaling).abs().max().item()
+            rpe_k_max = (rpe_k_bias[:1] * scaling).abs().max().item()
 
-            # H3: Per-head max score and entropy
-            # attn_scores shape: [batch, heads, seq_q, seq_k]
-            per_head_max = attn_scores[b0, :, :, :].amax(dim=(-2, -1))  # [heads]
-            # attn_weights entropy per head: -sum(p * log(p))
-            aw_b0 = attn_weights[b0]  # [1, heads, seq_q, seq_k]
+            # Per-head stats
+            per_head_max = attn_scores[b0, :, :, :].amax(dim=(-2, -1))
+            aw_b0 = attn_weights[b0]
             log_aw = torch.log(aw_b0 + 1e-10)
-            per_head_entropy = -(aw_b0 * log_aw).sum(dim=-1).mean(dim=-1).squeeze(0)  # [heads]
-            per_head_max_weight = aw_b0.amax(dim=(-2, -1)).squeeze(0)  # [heads] — peakedness
+            per_head_entropy = -(aw_b0 * log_aw).sum(dim=-1).mean(dim=-1).squeeze(0)
+            per_head_max_weight = aw_b0.amax(dim=(-2, -1)).squeeze(0)
 
-            # H2: Q, K, V vector norms (indicators of hidden state growth)
-            q_vec_norm = query[b0].norm(dim=-1).mean().item()  # mean over positions/heads
+            # Q, K, V vector norms
+            q_vec_norm = query[b0].norm(dim=-1).mean().item()
             k_vec_norm = key[b0].norm(dim=-1).mean().item()
             v_vec_norm = value[b0].norm(dim=-1).mean().item()
             q_vec_max_norm = query[b0].norm(dim=-1).max().item()
             k_vec_max_norm = key[b0].norm(dim=-1).max().item()
 
             _rpe_diagnostics.setdefault('layers', {})[layer_idx] = {
-                # H1: Overall score stats
                 'score_max': score_max,
                 'score_min': score_min,
                 'score_abs_max': score_abs_max,
-                # H4: Per-term breakdown
                 'term1_max': term1_max,
-                'term2_max': term2_max,
-                'term3_max': term3_max,
-                # H3: Per-head stats
+                'rpe_q_max': rpe_q_max,
+                'rpe_k_max': rpe_k_max,
                 'per_head_max': per_head_max.tolist(),
                 'per_head_entropy': per_head_entropy.tolist(),
                 'per_head_max_weight': per_head_max_weight.tolist(),
-                # H2: Vector norms
                 'q_vec_norm': q_vec_norm,
                 'k_vec_norm': k_vec_norm,
                 'v_vec_norm': v_vec_norm,
                 'q_vec_max_norm': q_vec_max_norm,
                 'k_vec_max_norm': k_vec_max_norm,
-                # Existing checks
                 'attn_output_max': attn_output[b0].abs().max().item(),
+                'rpe_v_max': rpe_v_out[:1].abs().max().item(),
                 'attn_has_nan': bool(torch.isnan(attn_output[b0]).any()),
                 'attn_has_inf': bool(torch.isinf(attn_output[b0]).any()),
             }
@@ -272,8 +288,8 @@ _rpe_diag_enabled: bool = False
 _rpe_diagnostics: dict = {}
 
 
-def make_relative_attention_forward(rel_pos_emb: ChessRelativePositionEmbedding, layer_idx: int = -1):
-    """Create a patched attention forward that uses full Q, K, V relative positions."""
+def make_relative_attention_forward(rpe: Lc0StyleRPE, layer_idx: int = -1):
+    """Create a patched attention forward that uses lc0-style content-dependent RPE."""
 
     def forward_with_relative_pos(
         self,
@@ -291,21 +307,13 @@ def make_relative_attention_forward(rel_pos_emb: ChessRelativePositionEmbedding,
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        # NOTE: RoPE is disabled, so we skip apply_rotary_pos_emb
-        # Full Q, K, V relative position bias is computed here instead
-
-        seq_len = hidden_states.size(1)
-        rel_query_bias, rel_key_bias, rel_value_bias = rel_pos_emb.get_bias_matrices(
-            seq_len, hidden_states.device
-        )
+        # NOTE: RoPE is disabled -- lc0-style RPE is applied inside attention
 
         attn_output, attn_weights = relative_position_attention_forward(
             query_states,
             key_states,
             value_states,
-            rel_query_bias,
-            rel_key_bias,
-            rel_value_bias,
+            rpe,
             attention_mask,
             scaling=self.scaling,
             dropout=0.0 if not self.training else self.attention_dropout,
@@ -441,19 +449,15 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self._disable_rope()
         hidden_size = config.hidden_size
 
-        # Per-layer relative position embeddings with full Q, K, V biases
-        # Board positions (0-63) use 2D relative coordinates (rank_diff, file_diff)
-        # Each layer gets its own embeddings to avoid 20x gradient accumulation
+        # Per-layer lc0-style content-dependent relative position embeddings.
+        # Each layer learns [head_dim * num_heads, 225] weights for Q, K, V RPE.
+        # 225 = 15x15 relative displacements on the 8x8 board.
+        # Board squares only (0-63); metadata tokens get zero RPE.
         num_heads = config.num_attention_heads
         head_dim = hidden_size // num_heads
         num_layers = config.num_hidden_layers
         self.rel_pos_embs = nn.ModuleList([
-            ChessRelativePositionEmbedding(
-                num_heads=num_heads,
-                head_dim=head_dim,
-                board_size=64,
-                max_seq_len=72,
-            )
+            Lc0StyleRPE(num_heads=num_heads, head_dim=head_dim)
             for _ in range(num_layers)
         ])
 
@@ -497,15 +501,13 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.illegality_penalty_annealing_steps = getattr(config, 'illegality_penalty_annealing_steps', 0)
 
         self.post_init()
-        
-        # Zero-init RPE embeddings AFTER post_init(), which re-inits all
-        # nn.Embedding modules with normal(0, initializer_range).
-        # Zero init is critical: matches lc0, lets the model start with
-        # pure content-based attention and gradually learn positional signal.
+
+        # Zero-init RPE weights AFTER post_init() to ensure the model starts
+        # with pure content-based attention (matches lc0's approach).
         for rpe in self.rel_pos_embs:
-            nn.init.zeros_(rpe.rel_query_board.weight)
-            nn.init.zeros_(rpe.rel_key_board.weight)
-            nn.init.zeros_(rpe.rel_value_board.weight)
+            nn.init.zeros_(rpe.rpe_q.rpe)
+            nn.init.zeros_(rpe.rpe_k.rpe)
+            nn.init.zeros_(rpe.rpe_v.rpe_value)
 
     # type: ignore[override]
     def load_state_dict(self, state_dict, strict: bool = False):
@@ -515,27 +517,29 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             print("Warning: Ignoring legacy absolute position embeddings from checkpoint")
             del state_dict[legacy_key]
 
-        # Handle legacy checkpoints with metadata relative position embeddings (now removed)
-        legacy_meta_keys = [k for k in state_dict if 'rel_pos_emb' in k and '_meta' in k]
-        for key in legacy_meta_keys:
-            print(f"Warning: Ignoring legacy metadata position embedding: {key}")
-            del state_dict[key]
-
-        # Handle legacy shared rel_pos_emb -> broadcast to per-layer rel_pos_embs
-        shared_keys = [k for k in state_dict if k.startswith('rel_pos_emb.') and 'rel_pos_embs.' not in k]
-        if shared_keys:
-            num_layers = len(self.rel_pos_embs)
-            print(f"Broadcasting legacy shared position embeddings to {num_layers} per-layer embeddings")
-            for key in list(shared_keys):
-                suffix = key[len('rel_pos_emb.'):]  # e.g. 'rel_query_board.weight'
-                for i in range(num_layers):
-                    state_dict[f'rel_pos_embs.{i}.{suffix}'] = state_dict[key].clone()
+        # Handle legacy checkpoints with old DeBERTa-style RPE (nn.Embedding based)
+        # Old keys look like: rel_pos_embs.0.rel_query_board.weight, rel_pos_embs.0.rel_key_board.weight, etc.
+        # Also handle shared rel_pos_emb.* and metadata keys
+        old_rpe_keys = [k for k in state_dict if 'rel_pos_emb' in k and (
+            'rel_query_board' in k or 'rel_key_board' in k or 'rel_value_board' in k or '_meta' in k
+        )]
+        if old_rpe_keys:
+            print(f"Warning: Ignoring {len(old_rpe_keys)} legacy DeBERTa-style RPE keys from checkpoint "
+                  "(model now uses lc0-style RPE, will start with zero-init)")
+            for key in old_rpe_keys:
                 del state_dict[key]
 
-        # Check for relative position keys
-        rel_pos_keys = [k for k in state_dict if 'rel_pos_emb' in k]
-        if not rel_pos_keys:
-            print("Note: Checkpoint has no relative position embeddings, using random initialization")
+        # Handle legacy shared rel_pos_emb -> ignored (incompatible with lc0-style)
+        shared_keys = [k for k in state_dict if k.startswith('rel_pos_emb.') and 'rel_pos_embs.' not in k]
+        if shared_keys:
+            print(f"Warning: Ignoring {len(shared_keys)} legacy shared RPE keys from checkpoint")
+            for key in list(shared_keys):
+                del state_dict[key]
+
+        # Check for lc0-style RPE keys
+        lc0_rpe_keys = [k for k in state_dict if 'rel_pos_embs' in k and ('rpe_q.' in k or 'rpe_k.' in k or 'rpe_v.' in k)]
+        if not lc0_rpe_keys:
+            print("Note: Checkpoint has no lc0-style RPE weights, using zero initialization")
 
         result = super().load_state_dict(state_dict, strict=strict)
 
@@ -642,8 +646,8 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         batch_size = input_ids.size(0)
         input_embeds = self.transformer.embed_tokens(input_ids)
 
-        # Relative position embeddings are now handled inside attention layers
-        # via ChessRelativePositionEmbedding (no absolute position embedding addition)
+        # Relative position embeddings are handled inside attention layers
+        # via lc0-style content-dependent RPE (no absolute position embedding addition)
 
         # Enable per-layer RPE diagnostics during training
         global _rpe_diag_enabled, _rpe_diagnostics
