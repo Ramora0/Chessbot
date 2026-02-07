@@ -40,7 +40,7 @@ echo "Clone complete. Branch: $(cd "$CODE_LOCAL" && git branch --show-current)"
 echo "Commit: $(cd "$CODE_LOCAL" && git rev-parse --short HEAD)"
 
 # Original dataset location on shared storage
-DATASET_SOURCE="/fs/scratch/PAS2836/lees_stuff/action_value"
+DATASET_SOURCE="/fs/scratch/PAS2836/lees_stuff/searchless_mates_hf_fixed"
 
 # Local copy in node's temporary storage
 DATASET_LOCAL="$TMPDIR/action_value"

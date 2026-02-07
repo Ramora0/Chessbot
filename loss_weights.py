@@ -22,6 +22,3 @@ TEMPERATURE: float = 0.5
 # Endgame defined as both players having <= 13 points of material
 ENDGAME_WEIGHT: float = 1.0
 ENDGAME_MATERIAL_THRESHOLD: int = 13
-
-# Mate prediction head: 5-class classification for forced mate depth
-MATE_LOSS_WEIGHT: float = 1.0

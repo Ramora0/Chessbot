@@ -18,7 +18,6 @@ from loss_weights import (
     MOVE_WINRATE_LOSS_WEIGHT,
     ILLEGALITY_LOSS_WEIGHT,
     CONTROL_MAP_LOSS_WEIGHT,
-    MATE_LOSS_WEIGHT,
     TEMPERATURE,
 )
 
@@ -324,7 +323,6 @@ DEFAULT_MASKED_TOKEN_LOSS_WEIGHT = MASKED_TOKEN_LOSS_WEIGHT
 DEFAULT_MOVE_WINRATE_LOSS_WEIGHT = MOVE_WINRATE_LOSS_WEIGHT
 DEFAULT_ILLEGALITY_LOSS_WEIGHT = ILLEGALITY_LOSS_WEIGHT
 DEFAULT_CONTROL_MAP_LOSS_WEIGHT = CONTROL_MAP_LOSS_WEIGHT
-DEFAULT_MATE_LOSS_WEIGHT = MATE_LOSS_WEIGHT
 
 
 @dataclass
@@ -333,16 +331,12 @@ class ChessPolicyValueOutput(ModelOutput):
     policy_logits: torch.Tensor = None
     winrate_logits: torch.Tensor = None
     control_logits: torch.Tensor = None
-    illegality_logits: torch.Tensor = None
-    move_winrate_logits: torch.Tensor = None
-    mate_logits: torch.Tensor = None
     policy_loss: Optional[torch.Tensor] = None
     winrate_loss: Optional[torch.Tensor] = None
     control_map_loss: Optional[torch.Tensor] = None
     illegality_loss: Optional[torch.Tensor] = None
     masked_token_loss: Optional[torch.Tensor] = None
     move_winrate_loss: Optional[torch.Tensor] = None
-    mate_loss: Optional[torch.Tensor] = None
     # Metrics (not losses)
     illegality_rate: Optional[torch.Tensor] = None
     illegality_head_accuracy: Optional[torch.Tensor] = None
@@ -352,7 +346,6 @@ class ChessPolicyValueOutput(ModelOutput):
     move_winrate_mae: Optional[torch.Tensor] = None
     control_map_mae: Optional[torch.Tensor] = None
     model_entropy: Optional[torch.Tensor] = None
-    mate_accuracy: Optional[torch.Tensor] = None
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
 
@@ -387,15 +380,12 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
         # Multi-task attention pooling (shared K/V, task-specific queries)
         # Winrate head predicts win% in 128 bins (0.0 to 1.0)
-        # Mate head predicts 5 classes per move (no_mate, mate_in_1, mate_in_2, mate_in_3, mate_in_4_plus)
         self.num_value_bins = 128
-        self.num_mate_classes = 5
         self.task_head = MultiTaskAttentionPooling(
             hidden_size=hidden_size,
             task_output_dims={
                 'policy': self.policy_dim,  # Used for both softmax policy loss and sigmoid win% loss (includes illegality)
                 'winrate': self.num_value_bins,  # 128 bins for win probability
-                'mate': self.policy_dim * self.num_mate_classes,  # 5 classes per move, reshaped in forward()
             }
         )
 
@@ -413,7 +403,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.move_winrate_loss_weight = float(DEFAULT_MOVE_WINRATE_LOSS_WEIGHT)
         self.illegality_loss_weight = float(DEFAULT_ILLEGALITY_LOSS_WEIGHT)
         self.control_map_loss_weight = float(DEFAULT_CONTROL_MAP_LOSS_WEIGHT)
-        self.mate_loss_weight = float(DEFAULT_MATE_LOSS_WEIGHT)
         self.temperature = float(TEMPERATURE)
 
         # Illegality penalty annealing: start with -5 penalty, anneal to 0 over first 10% of epoch
@@ -558,7 +547,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         original_input_ids: Optional[torch.Tensor] = None,
         legal_move_mask: Optional[torch.Tensor] = None,
         endgame_weights: Optional[torch.Tensor] = None,
-        mate_classes: Optional[torch.Tensor] = None,
+        mate_depths: Optional[torch.Tensor] = None,
         training_step: Optional[int] = None,
         return_dict: bool = True,
         **kwargs,
@@ -590,11 +579,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             control_logits_per_square[:, :, 0],  # [batch, 64] white attackers
             control_logits_per_square[:, :, 1],  # [batch, 64] black attackers
         ], dim=1)  # [batch, 128]
-
-        # Mate prediction: 5-class classification per move (from shared attention pooling)
-        # Reshape from [batch, policy_dim * 5] to [batch, policy_dim, 5]
-        mate_logits_flat = task_outputs['mate']  # [batch, policy_dim * num_mate_classes]
-        mate_logits = mate_logits_flat.view(batch_size, self.policy_dim, self.num_mate_classes)
 
         target_device = policy_logits.device
 
@@ -633,15 +617,21 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
             # Un-sigmoid (logit transform): logit(p) = log(p / (1-p))
             # Clamp to avoid log(0) and division by zero
-            eps = 1e-7
+            eps = 1e-3
             clamped_winrates = torch.clamp(absolute_winrates, eps, 1 - eps)
 
-            # Compute target logits (un-sigmoid)
-            # For illegal moves, set to very negative value
+            # Un-sigmoid to get base target logits
+            # Mate information is already encoded in the adjusted winrates from preprocessing:
+            #   mating moves: 0.98 + 0.02/n  →  high logits
+            #   getting-mated: 0.02 - 0.02/|n|  →  low logits
+            #   non-mate: linearly scaled to [0.02, 0.98]
+            base_target_logits = torch.log(clamped_winrates / (1 - clamped_winrates))
+
+            # Apply illegal move mask
             target_logits = torch.where(
                 policy_mask_bool,
-                torch.log(clamped_winrates / (1 - clamped_winrates)),
-                torch.full_like(clamped_winrates, -1e9)
+                base_target_logits,
+                torch.full_like(base_target_logits, -1e9)
             )
 
             # Apply softmax with temperature to get target probability distribution
@@ -762,39 +752,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # MAE metric for monitoring
             control_map_mae = torch.abs(control_logits - control_map).mean()
 
-        # Mate prediction loss: 5-class classification per legal move
-        # Trained on all positions, with 10x weight for actual mate classes to handle imbalance
-        mate_loss: Optional[torch.Tensor] = None
-        mate_accuracy: Optional[torch.Tensor] = None
-        if mate_classes is not None and policy is not None:
-            if mate_classes.device != target_device:
-                mate_classes = mate_classes.to(target_device)
-
-            # Legal move mask (same as policy > -0.99)
-            legal_mask = (policy > -0.99)  # [batch, policy_dim]
-
-            # Flatten for cross-entropy
-            mate_logits_flat = mate_logits.view(-1, self.num_mate_classes)  # [batch * policy_dim, 5]
-            mate_targets_flat = mate_classes.view(-1)  # [batch * policy_dim]
-            legal_mask_flat = legal_mask.view(-1)  # [batch * policy_dim]
-
-            # Only compute loss on legal moves
-            if legal_mask_flat.any():
-                legal_logits = mate_logits_flat[legal_mask_flat]  # [num_legal, 5]
-                legal_targets = mate_targets_flat[legal_mask_flat]  # [num_legal]
-
-                # Class weights: 10x for mate classes (1-4) to handle imbalance
-                # ~1/30 legal moves lead to mate, so upweight to make gradient contribution comparable
-                mate_class_weights = torch.tensor(
-                    [1.0, 10.0, 10.0, 10.0, 10.0], device=target_device
-                )
-                raw_mate_loss = F.cross_entropy(legal_logits, legal_targets, weight=mate_class_weights)
-                mate_loss = self.mate_loss_weight * raw_mate_loss
-
-                # Accuracy metric
-                mate_preds = legal_logits.argmax(dim=-1)
-                mate_accuracy = (mate_preds == legal_targets).float().mean()
-
         # Masked token prediction loss (language modeling objective)
         masked_token_loss: Optional[torch.Tensor] = None
         masked_token_accuracy: Optional[torch.Tensor] = None
@@ -812,10 +769,10 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
                 # Flatten for loss computation
                 # [batch*seq, vocab]
-                lm_logits_flat = lm_logits.view(-1, lm_logits.size(-1))
-                original_ids_flat = original_input_ids.view(-1)  # [batch*seq]
+                lm_logits_flat = lm_logits.reshape(-1, lm_logits.size(-1))
+                original_ids_flat = original_input_ids.reshape(-1)  # [batch*seq]
                 # [batch*seq]
-                masked_positions_flat = masked_positions.view(-1)
+                masked_positions_flat = masked_positions.reshape(-1)
 
                 # Only compute loss on masked positions
                 masked_lm_logits = lm_logits_flat[masked_positions_flat]
@@ -884,9 +841,36 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             illegality_rate = summed_illegal_prob.mean()
 
             # Top-1 agreement: % of time model's top move matches Stockfish's best move
-            model_best_move_idx = model_probs.argmax(dim=-1)
-            stockfish_best_move_idx = policy.argmax(dim=-1)
-            top1_agreement = (model_best_move_idx == stockfish_best_move_idx).float().mean()
+            # Handles tied best moves and mate-depth preferences
+            model_best_move_idx = model_probs.argmax(dim=-1)  # [batch]
+
+            # Find all moves tied for best (policy=0.0 is best, tolerance for float imprecision)
+            best_policy_val = policy.max(dim=-1, keepdim=True).values  # [batch, 1]
+            is_best = (policy >= best_policy_val - 1e-4)  # [batch, policy_dim]
+
+            if mate_depths is not None:
+                if mate_depths.device != target_device:
+                    mate_depths = mate_depths.to(target_device)
+                md = mate_depths.float()
+                # Among tied-best moves, check for positive mate depths (mate-in-N, winning)
+                tied_positive_mate = is_best & (md > 0)  # [batch, policy_dim]
+                any_positive_mate = tied_positive_mate.any(dim=-1, keepdim=True)  # [batch, 1]
+
+                # Find shortest mate depth among tied-best positive-mate moves
+                mate_for_min = torch.where(
+                    tied_positive_mate, md, torch.full_like(md, float('inf'))
+                )
+                shortest_mate = mate_for_min.min(dim=-1, keepdim=True).values  # [batch, 1]
+
+                # If any tied-best move has a positive mate, only shortest-mate moves are "best"
+                is_best = torch.where(
+                    any_positive_mate,
+                    tied_positive_mate & (md == shortest_mate),
+                    is_best,
+                )
+
+            # Check if model's pick is among the best moves
+            top1_agreement = is_best.gather(1, model_best_move_idx.unsqueeze(1)).squeeze(1).float().mean()
 
         loss_components = [
             component
@@ -897,7 +881,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 winrate_loss,
                 control_map_loss,
                 masked_token_loss,
-                mate_loss,
             )
             if component is not None
         ]
@@ -920,16 +903,12 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             policy_logits=policy_logits,
             winrate_logits=winrate_logits,
             control_logits=control_logits,
-            illegality_logits=policy_logits,  # Now unified with policy_logits - sigmoid predicts both win% and legality
-            move_winrate_logits=policy_logits,  # Alias - sigmoid of policy_logits used for win% and legality
-            mate_logits=mate_logits,  # [batch, policy_dim, 5] mate class predictions per move
             policy_loss=policy_loss,  # Cross-entropy with softmax target from un-sigmoid'd Stockfish win%
             winrate_loss=winrate_loss,
             control_map_loss=control_map_loss,
             illegality_loss=illegality_loss,  # Hinge loss to push illegal logits below margin
             masked_token_loss=masked_token_loss,
             move_winrate_loss=move_winrate_loss,  # Sigmoid win% prediction on legal moves only
-            mate_loss=mate_loss,  # Cross-entropy on mate class prediction (legal moves only)
             # Metrics
             illegality_rate=illegality_rate,
             illegality_head_accuracy=None,  # Removed - illegality now implicit in move_winrate_loss
@@ -939,7 +918,6 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             move_winrate_mae=move_winrate_mae,  # Still computed only on legal moves
             control_map_mae=control_map_mae,
             model_entropy=model_entropy,
-            mate_accuracy=mate_accuracy,  # Accuracy on mate class prediction
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
