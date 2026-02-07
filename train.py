@@ -586,23 +586,17 @@ class RegretEvaluationCallback(TrainerCallback):
 
 def train(
     run_name: Optional[str] = None,
-    hidden_dim: Optional[int] = None,
+    hidden_dim: int = 768,
     ffn_dim: Optional[int] = None,
-    depth: Optional[int] = None,
-    heads: Optional[int] = None,
+    depth: int = 20,
+    heads: int = 8,
     lr: Optional[float] = None,
-    beta2: Optional[float] = None,
-    dropout: Optional[float] = None,
-    weight_decay: Optional[float] = None,
+    beta2: float = 0.999,
+    dropout: float = DROPOUT,
+    weight_decay: float = 0.01,
 ) -> None:
-    # Resolve hyperparameters (CLI overrides → defaults)
-    effective_hidden_dim = hidden_dim if hidden_dim is not None else 768
-    effective_ffn_dim = ffn_dim if ffn_dim is not None else 768
-    effective_depth = depth if depth is not None else 20
-    effective_heads = heads if heads is not None else 8
-    effective_dropout = dropout if dropout is not None else DROPOUT
-    effective_weight_decay = weight_decay if weight_decay is not None else 0.01
-    effective_beta2 = beta2 if beta2 is not None else 0.999
+    # ffn_dim defaults to hidden_dim when not explicitly set
+    effective_ffn_dim = ffn_dim if ffn_dim is not None else hidden_dim
 
     print("Starting chess transformer training...")
 
@@ -678,13 +672,13 @@ def train(
         config = LlamaConfig(
             vocab_size=vocab_size,
             max_position_embeddings=MAX_SEQ_LENGTH,
-            hidden_size=effective_hidden_dim,
+            hidden_size=hidden_dim,
             intermediate_size=effective_ffn_dim,
-            num_hidden_layers=effective_depth,
-            num_attention_heads=effective_heads,
-            num_key_value_heads=effective_heads,
-            attention_dropout=effective_dropout,
-            hidden_dropout=effective_dropout,
+            num_hidden_layers=depth,
+            num_attention_heads=heads,
+            num_key_value_heads=heads,
+            attention_dropout=dropout,
+            hidden_dropout=dropout,
             pad_token_id=pad_token_id,
         )
         config.policy_dim = len(policy_index)
@@ -721,8 +715,8 @@ def train(
         per_device_train_batch_size=per_device_batch_size // 2,
         learning_rate=effective_lr,
         warmup_steps=schedule.warmup_steps,
-        weight_decay=effective_weight_decay,
-        adam_beta2=effective_beta2,
+        weight_decay=weight_decay,
+        adam_beta2=beta2,
         max_grad_norm=1.0,
         bf16=True,
         # fp16=True,
@@ -857,25 +851,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--hidden-dim",
         type=int,
-        default=None,
+        default=768,
         help="Model hidden dimension (default: 768)"
     )
     parser.add_argument(
         "--ffn-dim",
         type=int,
         default=None,
-        help="FFN intermediate dimension (default: 768)"
+        help="FFN intermediate dimension (default: hidden-dim)"
     )
     parser.add_argument(
         "--depth",
         type=int,
-        default=None,
+        default=20,
         help="Number of transformer layers (default: 20)"
     )
     parser.add_argument(
         "--heads",
         type=int,
-        default=None,
+        default=8,
         help="Number of attention heads (default: 8)"
     )
     parser.add_argument(
@@ -887,19 +881,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--beta2",
         type=float,
-        default=None,
+        default=0.98,
         help="Adam beta2 (default: 0.999)"
     )
     parser.add_argument(
         "--dropout",
         type=float,
-        default=None,
-        help="Dropout rate (default: 0.1)"
+        default=0,
+        help=f"Dropout rate (default: {DROPOUT})"
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
-        default=None,
+        default=0,
         help="Weight decay (default: 0.01)"
     )
     args = parser.parse_args()
