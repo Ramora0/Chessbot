@@ -25,7 +25,7 @@ from evaluation_regret import evaluate_regret, print_regret_results, NUM_EVAL_PO
 from loss_weights import MASKED_TOKEN_LOSS_WEIGHT
 
 
-OUTPUT_DIR = "/users/PAS2836/leedavis/personal/Chessbot/testz"
+OUTPUT_DIR = "/users/PAS2836/leedavis/personal/Chessbot/positional-final"
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 256  # Board tokens: 72
 DATASET_PATH = os.getenv("DATASET_PATH", "fuck")
