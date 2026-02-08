@@ -14,7 +14,7 @@ set -euo pipefail
 cd "$HOME/personal/Chessbot"
 
 # Copy dataset to local storage
-DATASET_SOURCE="/fs/scratch/PAS2836/lees_stuff/action_value"
+DATASET_SOURCE="/fs/scratch/PAS2836/lees_stuff/searchless_mates_hf_fixed"
 DATASET_LOCAL="$TMPDIR/action_value"
 
 echo "================================================"

@@ -30,7 +30,7 @@ cp -r "$HOME/personal/Chessbot/".??* "$CODE_LOCAL/" 2>/dev/null || true
 echo "Code copy complete."
 
 # Original dataset location on shared storage
-DATASET_SOURCE="/fs/scratch/PAS2836/lees_stuff/action_value"
+DATASET_SOURCE="/fs/scratch/PAS2836/lees_stuff/searchless_mates_hf_fixed"
 
 # Local copy in node's temporary storage
 DATASET_LOCAL="$TMPDIR/action_value"

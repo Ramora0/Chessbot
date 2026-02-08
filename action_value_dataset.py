@@ -125,8 +125,12 @@ def _transform_example(
     all_control_map = []
     all_mate_depths = []
 
-    # Check if mate field exists in dataset
-    has_mate_field = "mate" in examples
+    # Require mate field in dataset for mate-adjusted winrates
+    if "mate" not in examples:
+        raise ValueError(
+            "Dataset is missing required 'mate' field. "
+            "Mate-adjusted winrates require mate depth data for each move."
+        )
 
     # Process each example in the batch
     for i in range(batch_size):
@@ -160,21 +164,18 @@ def _transform_example(
         #   - Getting-mated moves (mate < 0): 0.02 - 0.02/|n|  (range: [0.0, 0.02))
         # This gives clean separation so sigmoid and softmax losses work together
         valid_indices = []
-        mate_depths_raw = examples["mate"][i] if has_mate_field else None
+        mate_depths_raw = examples["mate"][i]
         for j, (move, p_win) in enumerate(zip(moves, p_wins)):
             if move in move_to_idx:
                 idx = move_to_idx[move]
-                if has_mate_field:
-                    md = int(mate_depths_raw[j])
-                    if md > 0:  # mate-in-n
-                        adjusted = 0.98 + 0.02 / md
-                    elif md < 0:  # mated-in-n
-                        adjusted = 0.02 - 0.02 / abs(md)
-                    else:  # no mate
-                        adjusted = 0.02 + p_win * 0.96
-                    policy[idx] = adjusted
-                else:
-                    policy[idx] = p_win
+                md = int(mate_depths_raw[j])
+                if md > 0:  # mate-in-n
+                    adjusted = 0.98 + 0.02 / md
+                elif md < 0:  # mated-in-n
+                    adjusted = 0.02 - 0.02 / abs(md)
+                else:  # no mate
+                    adjusted = 0.02 + p_win * 0.96
+                policy[idx] = adjusted
                 valid_indices.append(idx)
             # Skip moves not in policy_index (e.g., promotions to rook/bishop)
 
@@ -219,12 +220,11 @@ def _transform_example(
             control_map[sq] = len(board.attackers(chess.WHITE, chess_sq))
             control_map[64 + sq] = len(board.attackers(chess.BLACK, chess_sq))
 
-        # 6. Process mate depths if mate field exists (mate_depths_raw already read in step 2)
+        # 6. Process mate depths (mate_depths_raw already read in step 2)
         mate_depths_arr = np.zeros(policy_size, dtype=np.int16)
-        if has_mate_field:
-            for j, (move, md) in enumerate(zip(moves, mate_depths_raw)):
-                if move in move_to_idx:
-                    mate_depths_arr[move_to_idx[move]] = int(md)
+        for j, (move, md) in enumerate(zip(moves, mate_depths_raw)):
+            if move in move_to_idx:
+                mate_depths_arr[move_to_idx[move]] = int(md)
 
         # Add to batch outputs
         all_input_ids.append(input_ids)
@@ -235,17 +235,12 @@ def _transform_example(
         all_control_map.append(control_map.tolist())
         all_mate_depths.append(mate_depths_arr.tolist())
 
-    result = {
+    return {
         "input_ids": all_input_ids,
         "policy": all_policy,
         "winrate": all_winrate,
         "true_value": all_true_value,
         "legal_move_mask": all_legal_move_mask,
         "control_map": all_control_map,
+        "mate_depths": all_mate_depths,
     }
-
-    # Only include mate depths if mate data exists in dataset
-    if has_mate_field:
-        result["mate_depths"] = all_mate_depths
-
-    return result

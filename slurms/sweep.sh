@@ -3,4 +3,4 @@ sbatch slurms/a100.slurm master more-heads --heads 16
 sbatch slurms/a100.slurm master beta2 --beta2 0.98
 sbatch slurms/a100.slurm master no-reg --weight-decay 0 --dropout 0
 
-sbatch slurms/h100.slurm master large --hidden-dim 1024 --ffn-dim 2048 --depth 14 --heads 16
+sbatch --time=12:00:00 slurms/h100.slurm master large --hidden-dim 1024 --ffn-dim 2048 --depth 14 --heads 16
