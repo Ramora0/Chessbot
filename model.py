@@ -404,6 +404,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.illegality_loss_weight = float(DEFAULT_ILLEGALITY_LOSS_WEIGHT)
         self.control_map_loss_weight = float(DEFAULT_CONTROL_MAP_LOSS_WEIGHT)
         self.temperature = float(TEMPERATURE)
+        self.target_entropy_fraction = getattr(config, 'target_entropy_fraction', None)
+        self.min_temperature = getattr(config, 'min_temperature', 0.25)
+        self.max_temperature = getattr(config, 'max_temperature', 0.5)
 
         # Illegality penalty annealing: start with -5 penalty, anneal to 0 over first 10% of epoch
         # Uses quadratic decay so learning pressure is spread evenly (compensates for exp in softmax)
@@ -634,8 +637,19 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
                 torch.full_like(base_target_logits, -1e9)
             )
 
+            # Compute temperature: dynamic per-position or fixed scalar
+            if self.target_entropy_fraction is not None:
+                temperature = compute_entropy_temperature(
+                    target_logits, policy_mask_bool,
+                    target_entropy_fraction=self.target_entropy_fraction,
+                    min_temperature=self.min_temperature,
+                    max_temperature=self.max_temperature,
+                ).unsqueeze(-1)  # [batch, 1] for broadcasting
+            else:
+                temperature = self.temperature  # scalar, backward compatible
+
             # Apply softmax with temperature to get target probability distribution
-            target_probs = F.softmax(target_logits / self.temperature, dim=-1)
+            target_probs = F.softmax(target_logits / temperature, dim=-1)
 
             # Apply annealing penalty to illegal moves (helps both policy and BCE losses)
             annealed_logits = policy_logits.clone()
@@ -666,7 +680,7 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             # then derive probs only where needed for metrics.
             # The old pattern `softmax() + log() + 1e-10` is unsafe in bf16:
             # 1e-10 rounds to 0 in bf16 (min positive ~6e-8), so log(0) = -inf.
-            log_model_probs = F.log_softmax(masked_logits / self.temperature, dim=-1)
+            log_model_probs = F.log_softmax(masked_logits / temperature, dim=-1)
             model_probs = log_model_probs.exp()  # only for metrics (entropy, top1)
 
             # Cross-entropy loss: -sum(target_probs * log_softmax(model_logits))
@@ -921,3 +935,68 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+
+def compute_entropy_temperature(
+    logits: torch.Tensor,
+    legal_mask: torch.Tensor,
+    target_entropy_fraction: float = 0.7,
+    min_temperature: float = 0.25,
+    max_temperature: float = 0.5,
+    max_iterations: int = 20,
+) -> torch.Tensor:
+    """Compute per-position temperature via binary search to hit a target entropy.
+
+    Finds T such that H(softmax(logits / T)) = target_entropy_fraction * log(num_legal).
+    This normalizes the effective complexity of the learning signal across positions
+    with different numbers of legal moves.
+
+    Args:
+        logits: Raw logits [batch, num_moves] (illegal moves should already be masked to -1e9).
+        legal_mask: Boolean mask [batch, num_moves], True for legal moves.
+        target_entropy_fraction: Target entropy as fraction of max entropy log(num_legal).
+        min_temperature: Floor temperature value.
+        max_temperature: Ceiling temperature value (prevents softening peaky distributions).
+        max_iterations: Number of binary search iterations.
+
+    Returns:
+        Per-position temperature tensor [batch].
+    """
+    batch_size = logits.shape[0]
+    device = logits.device
+    dtype = logits.dtype
+
+    num_legal = legal_mask.float().sum(dim=-1)  # [batch]
+    max_entropy = torch.log(num_legal.clamp(min=1))  # [batch]
+    target_entropy = target_entropy_fraction * max_entropy  # [batch]
+
+    # Positions with <= 1 legal move: use min_temperature (no meaningful entropy)
+    trivial = num_legal <= 1
+
+    lo = torch.full((batch_size,), min_temperature, device=device, dtype=torch.float32)
+    hi = torch.full((batch_size,), 10.0, device=device, dtype=torch.float32)
+
+    # Work in float32 for numerical stability during binary search
+    logits_f32 = logits.float()
+    legal_mask_f32 = legal_mask.float()
+
+    for _ in range(max_iterations):
+        mid = (lo + hi) * 0.5  # [batch]
+        # Compute entropy at temperature mid
+        scaled = logits_f32 / mid.unsqueeze(-1)  # [batch, num_moves]
+        log_probs = F.log_softmax(scaled, dim=-1)  # [batch, num_moves]
+        probs = log_probs.exp()
+        ent_terms = -probs * log_probs  # [batch, num_moves]
+        ent_terms = ent_terms.masked_fill(~legal_mask, 0.0)
+        entropy = ent_terms.sum(dim=-1)  # [batch]
+
+        # If entropy < target, go higher (more uniform); else go lower (more peaked)
+        go_higher = entropy < target_entropy
+        lo = torch.where(go_higher, mid, lo)
+        hi = torch.where(go_higher, hi, mid)
+
+    temperature = (lo + hi) * 0.5
+    temperature = temperature.clamp(min=min_temperature, max=max_temperature)
+    temperature = torch.where(trivial, torch.full_like(temperature, min_temperature), temperature)
+
+    return temperature.to(dtype)

@@ -594,6 +594,9 @@ def train(
     beta2: float = 0.999,
     dropout: float = DROPOUT,
     weight_decay: float = 0.01,
+    target_entropy_fraction: Optional[float] = None,
+    min_temperature: float = 0.2,
+    max_temperature: float = 0.5,
 ) -> None:
     # ffn_dim defaults to hidden_dim when not explicitly set
     effective_ffn_dim = ffn_dim if ffn_dim is not None else hidden_dim
@@ -663,6 +666,13 @@ def train(
         model.config.illegality_penalty_annealing_steps = int(
             schedule.max_steps * 0.1)
         model.illegality_penalty_annealing_steps = model.config.illegality_penalty_annealing_steps
+        # Update dynamic temperature settings for resumed training
+        model.config.target_entropy_fraction = target_entropy_fraction
+        model.config.min_temperature = min_temperature
+        model.config.max_temperature = max_temperature
+        model.target_entropy_fraction = target_entropy_fraction
+        model.min_temperature = min_temperature
+        model.max_temperature = max_temperature
         print(
             f"Model loaded from checkpoint with {sum(p.numel() for p in model.parameters()):,} parameters")
         print(
@@ -687,6 +697,9 @@ def train(
         # Quadratic decay spreads learning evenly (compensates for exp in softmax)
         config.illegality_penalty_annealing_steps = int(
             schedule.max_steps * 0.1)
+        config.target_entropy_fraction = target_entropy_fraction
+        config.min_temperature = min_temperature
+        config.max_temperature = max_temperature
 
         print(f"Model config created - policy dimension: {config.policy_dim}")
         print(
@@ -896,6 +909,24 @@ if __name__ == "__main__":
         default=0,
         help="Weight decay (default: 0.01)"
     )
+    parser.add_argument(
+        "--target-entropy-fraction",
+        type=float,
+        default=None,
+        help="Target entropy as fraction of log(num_legal_moves). None = fixed temperature. (default: None)"
+    )
+    parser.add_argument(
+        "--min-temperature",
+        type=float,
+        default=0.2,
+        help="Minimum temperature floor for dynamic scaling (default: 0.2)"
+    )
+    parser.add_argument(
+        "--max-temperature",
+        type=float,
+        default=0.5,
+        help="Maximum temperature ceiling for dynamic scaling (default: 0.5)"
+    )
     args = parser.parse_args()
     train(
         run_name=args.run_name,
@@ -907,4 +938,7 @@ if __name__ == "__main__":
         beta2=args.beta2,
         dropout=args.dropout,
         weight_decay=args.weight_decay,
+        target_entropy_fraction=args.target_entropy_fraction,
+        min_temperature=args.min_temperature,
+        max_temperature=args.max_temperature,
     )
