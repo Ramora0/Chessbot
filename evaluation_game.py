@@ -620,6 +620,7 @@ async def play_games_batched(
     stockfish_time: Optional[float] = None,
     stockfish_nodes: Optional[int] = None,
     max_engines: int = DEFAULT_NUM_ENGINES,
+    clear_hash: bool = True,
 ) -> Tuple[int, int, int, int, float, int, List[GameState]]:
     """
     Play multiple games in parallel with batched model inference.
@@ -633,6 +634,7 @@ async def play_games_batched(
         stockfish_time: If set, limit Stockfish by time per move instead of ELO
         stockfish_nodes: If set, limit Stockfish by number of nodes searched instead of ELO
         max_engines: Maximum number of Stockfish engines to run in parallel
+        clear_hash: If True, clear Stockfish hash before every move for fair comparison
 
     Returns:
         Tuple of (wins, draws, losses, total_moves, total_illegality, illegality_count, game_states)
@@ -713,6 +715,8 @@ async def play_games_batched(
     available_engines = list(range(num_engines))
     game_to_engine = {}  # Maps game_id to engine index
     pending_games = list(range(num_games))
+    # Track engines that need ucinewgame (new game assigned)
+    engines_need_newgame: set = set(range(num_engines))
 
     # Aggregate statistics
     wins = 0
@@ -798,9 +802,27 @@ async def play_games_batched(
                 ]
 
                 if games_needing_stockfish:
-                    # Clear hash before each move for fair comparison (model has no cache)
-                    for game in games_needing_stockfish:
-                        engines[game_to_engine[game.game_id]][1].send_line("ucinewgame")
+                    # Determine which engines need ucinewgame
+                    if clear_hash:
+                        # Clear hash before every move for fair comparison (model has no cache)
+                        engines_to_clear = games_needing_stockfish
+                    else:
+                        # Only clear when engine starts a new game
+                        engines_to_clear = [
+                            game for game in games_needing_stockfish
+                            if game_to_engine[game.game_id] in engines_need_newgame
+                        ]
+
+                    if engines_to_clear:
+                        for game in engines_to_clear:
+                            engine_idx = game_to_engine[game.game_id]
+                            engines[engine_idx][1].send_line("ucinewgame")
+                            engines_need_newgame.discard(engine_idx)
+                        # Synchronize: wait for all engines to finish processing ucinewgame
+                        await asyncio.gather(*[
+                            engines[game_to_engine[game.game_id]][1].ping()
+                            for game in engines_to_clear
+                        ])
 
                     # Run Stockfish for all games needing opponent moves
                     stockfish_tasks = [
@@ -844,6 +866,7 @@ async def play_games_batched(
                         if pending_games:
                             new_game_id = pending_games.pop(0)
                             game_to_engine[new_game_id] = engine_idx
+                            engines_need_newgame.add(engine_idx)
                         else:
                             # No more games, return engine to pool
                             available_engines.append(engine_idx)
@@ -1060,6 +1083,7 @@ def evaluate_model_against_stockfish(
     stockfish_time: Optional[float] = None,
     stockfish_nodes: Optional[int] = None,
     max_engines: int = DEFAULT_NUM_ENGINES,
+    clear_hash: bool = True,
 ) -> Tuple[float, float]:
     """
     Evaluate a model by playing multiple games against Stockfish with batched inference.
@@ -1080,6 +1104,7 @@ def evaluate_model_against_stockfish(
         stockfish_time: If set, limit Stockfish by time per move instead of ELO
         stockfish_nodes: If set, limit Stockfish by number of nodes searched instead of ELO
         max_engines: Maximum number of Stockfish engines to run in parallel
+        clear_hash: If True, clear Stockfish hash before every move for fair comparison
 
     Returns:
         Tuple of (estimated_elo, standard_error). When using depth/time/nodes limits,
@@ -1137,6 +1162,7 @@ def evaluate_model_against_stockfish(
         else:
             print(f"  Model plays random color each game")
         print(f"  Batch size: {batch_size} (parallel games)")
+        print(f"  Hash clearing: {'every move' if clear_hash else 'between games only'}")
         print()
 
     # Create conversion tracker for eval-to-outcome stats
@@ -1161,6 +1187,7 @@ def evaluate_model_against_stockfish(
             stockfish_time=stockfish_time,
             stockfish_nodes=stockfish_nodes,
             max_engines=max_engines,
+            clear_hash=clear_hash,
         )
     )
 
@@ -1241,6 +1268,8 @@ def main():
                         help="Avoid moves that cause stalemate (pick next best move instead)")
     parser.add_argument("--num-engines", type=int, default=DEFAULT_NUM_ENGINES,
                         help=f"Number of Stockfish engines to run in parallel (default: {DEFAULT_NUM_ENGINES})")
+    parser.add_argument("--keep-hash", action="store_true",
+                        help="Let Stockfish keep transposition tables between moves (default: cleared every move)")
     parser.add_argument("--no-openings", action="store_true",
                         help="Don't use opening positions from openings.txt (start from initial position)")
     parser.add_argument("--openings-path", default=None,
@@ -1312,6 +1341,7 @@ def main():
         stockfish_time=args.time,
         stockfish_nodes=args.nodes,
         max_engines=args.num_engines,
+        clear_hash=not args.keep_hash,
     )
 
     print()
