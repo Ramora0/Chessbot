@@ -255,3 +255,7 @@ config = LlamaConfig(
 3. Add to `ChessPolicyValueOutput` dataclass (model.py:98-118)
 
 **Dataset changes**: Modify `ChessPolicyCollator` (data.py) to handle new fields, update `action_value_dataset.py` for preprocessing.
+
+## CRITICAL: Feature Activation Rule
+
+**Every new feature MUST be active by default.** Never hide a feature behind `None`/`False` defaults that require explicit CLI flags to enable. If a feature is on a branch, it should activate when that branch runs with no extra arguments. Use sensible defaults. If a feature truly needs to be opt-in, raise an error at startup when it's not configured, rather than silently falling back to baseline behavior.

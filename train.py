@@ -594,7 +594,7 @@ def train(
     beta2: float = 0.999,
     dropout: float = DROPOUT,
     weight_decay: float = 0.01,
-    target_entropy_fraction: Optional[float] = None,
+    target_entropy_fraction: float = 0.7,
     min_temperature: float = 0.2,
     max_temperature: float = 0.5,
 ) -> None:
@@ -912,8 +912,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--target-entropy-fraction",
         type=float,
-        default=None,
-        help="Target entropy as fraction of log(num_legal_moves). None = fixed temperature. (default: None)"
+        default=0.7,
+        help="Target entropy as fraction of log(num_legal_moves). (default: 0.7)"
     )
     parser.add_argument(
         "--min-temperature",
