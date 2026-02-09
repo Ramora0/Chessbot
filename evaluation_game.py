@@ -162,6 +162,7 @@ class ConversionTracker:
 
 # Batching configuration
 DEFAULT_BATCH_SIZE = 32  # Number of games to run in parallel
+DEFAULT_NUM_ENGINES = 22  # Number of Stockfish engines to run in parallel
 
 # ELO calculation constants
 LOG10 = float(np.log(10.0))
@@ -618,6 +619,7 @@ async def play_games_batched(
     stockfish_depth: Optional[int] = None,
     stockfish_time: Optional[float] = None,
     stockfish_nodes: Optional[int] = None,
+    max_engines: int = DEFAULT_NUM_ENGINES,
 ) -> Tuple[int, int, int, int, float, int, List[GameState]]:
     """
     Play multiple games in parallel with batched model inference.
@@ -630,6 +632,7 @@ async def play_games_batched(
         stockfish_depth: If set, limit Stockfish by search depth instead of ELO
         stockfish_time: If set, limit Stockfish by time per move instead of ELO
         stockfish_nodes: If set, limit Stockfish by number of nodes searched instead of ELO
+        max_engines: Maximum number of Stockfish engines to run in parallel
 
     Returns:
         Tuple of (wins, draws, losses, total_moves, total_illegality, illegality_count, game_states)
@@ -676,15 +679,12 @@ async def play_games_batched(
         # Full strength for accurate position evaluation
         return (transport, engine)
 
-    # Limit engines based on CPU count to avoid oversubscription
-    cpu_count = os.cpu_count() or 8
-    max_engines = cpu_count * 2  # 2x CPU count is reasonable for I/O-bound work
     num_engines = min(batch_size, num_games, max_engines)
     # Use fewer eval engines since analyse() is fast
     num_eval_engines = min(8, num_engines) if conversion_tracker else 0
 
     if verbose:
-        print(f"Using {num_engines} Stockfish engines ({cpu_count} CPUs detected, max {max_engines})")
+        print(f"Using {num_engines} Stockfish engines (max {max_engines})")
         total_engines = num_engines + num_eval_engines
         with tqdm(total=total_engines, desc="Initializing engines", unit=" engines") as pbar:
             # Initialize play engines in batches
@@ -1059,6 +1059,7 @@ def evaluate_model_against_stockfish(
     stockfish_depth: Optional[int] = None,
     stockfish_time: Optional[float] = None,
     stockfish_nodes: Optional[int] = None,
+    max_engines: int = DEFAULT_NUM_ENGINES,
 ) -> Tuple[float, float]:
     """
     Evaluate a model by playing multiple games against Stockfish with batched inference.
@@ -1078,6 +1079,7 @@ def evaluate_model_against_stockfish(
         stockfish_depth: If set, limit Stockfish by search depth instead of ELO
         stockfish_time: If set, limit Stockfish by time per move instead of ELO
         stockfish_nodes: If set, limit Stockfish by number of nodes searched instead of ELO
+        max_engines: Maximum number of Stockfish engines to run in parallel
 
     Returns:
         Tuple of (estimated_elo, standard_error). When using depth/time/nodes limits,
@@ -1158,6 +1160,7 @@ def evaluate_model_against_stockfish(
             stockfish_depth=stockfish_depth,
             stockfish_time=stockfish_time,
             stockfish_nodes=stockfish_nodes,
+            max_engines=max_engines,
         )
     )
 
@@ -1236,6 +1239,8 @@ def main():
                         help="Play against full-strength Stockfish (no ELO limit, 0.05s/move)")
     parser.add_argument("--avoid-stalemate", action="store_true",
                         help="Avoid moves that cause stalemate (pick next best move instead)")
+    parser.add_argument("--num-engines", type=int, default=DEFAULT_NUM_ENGINES,
+                        help=f"Number of Stockfish engines to run in parallel (default: {DEFAULT_NUM_ENGINES})")
     parser.add_argument("--no-openings", action="store_true",
                         help="Don't use opening positions from openings.txt (start from initial position)")
     parser.add_argument("--openings-path", default=None,
@@ -1306,6 +1311,7 @@ def main():
         stockfish_depth=args.depth,
         stockfish_time=args.time,
         stockfish_nodes=args.nodes,
+        max_engines=args.num_engines,
     )
 
     print()
