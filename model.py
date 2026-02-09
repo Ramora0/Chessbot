@@ -410,6 +410,9 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
         self.illegality_penalty_start = -5.0
         self.illegality_penalty_annealing_steps = getattr(config, 'illegality_penalty_annealing_steps', 0)
 
+        # Mate logit bonus: add scale/n to softmax targets for mate-in-n moves
+        self.mate_logit_bonus = getattr(config, 'mate_logit_bonus', None)
+
         self.post_init()
 
         # Zero-init RPE weights AFTER post_init() to ensure the model starts
@@ -622,10 +625,23 @@ class ChessPolicyValueModel(LlamaPreTrainedModel):
 
             # Un-sigmoid to get base target logits
             # Mate information is already encoded in the adjusted winrates from preprocessing:
-            #   mating moves: 0.98 + 0.02/n  →  high logits
-            #   getting-mated: 0.02 - 0.02/|n|  →  low logits
-            #   non-mate: linearly scaled to [0.02, 0.98]
+            #   mating moves: (1-mb) + mb/n  →  high logits
+            #   getting-mated: mb - mb/|n|  →  low logits
+            #   non-mate: linearly scaled to [mb, 1-mb]
+            # where mb = mate_bucket (default 0.02)
             base_target_logits = torch.log(clamped_winrates / (1 - clamped_winrates))
+
+            # Mate logit bonus: add scale/n to softmax targets for mate-in-n moves
+            # mate_depths is already signed: positive = mating, negative = being mated
+            # This only affects the softmax CE targets, not the sigmoid BCE loss
+            if self.mate_logit_bonus is not None and mate_depths is not None:
+                if mate_depths.device != target_device:
+                    mate_depths = mate_depths.to(target_device)
+                md = mate_depths.float()
+                has_mate = md != 0  # [batch, policy_dim]
+                # bonus = scale / depth (signed: positive for mating, negative for being mated)
+                bonus = torch.where(has_mate, self.mate_logit_bonus / md, torch.zeros_like(md))
+                base_target_logits = base_target_logits + bonus
 
             # Apply illegal move mask
             target_logits = torch.where(

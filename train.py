@@ -594,7 +594,13 @@ def train(
     beta2: float = 0.999,
     dropout: float = DROPOUT,
     weight_decay: float = 0.01,
+    mate_bucket: float = 0.02,
+    mate_logit_bonus: Optional[float] = None,
 ) -> None:
+    # Mate logit bonus disables mate bucket encoding (uses raw winrates)
+    if mate_logit_bonus is not None:
+        mate_bucket = 0
+
     # ffn_dim defaults to hidden_dim when not explicitly set
     effective_ffn_dim = ffn_dim if ffn_dim is not None else hidden_dim
 
@@ -621,6 +627,7 @@ def train(
         tokenizer=tokenizer,
         shuffle=SHUFFLE_DATASET,
         seed=42,
+        mate_bucket=mate_bucket,
     )
 
     per_device_batch_size = 1024
@@ -663,6 +670,9 @@ def train(
         model.config.illegality_penalty_annealing_steps = int(
             schedule.max_steps * 0.1)
         model.illegality_penalty_annealing_steps = model.config.illegality_penalty_annealing_steps
+        # Update mate logit bonus for resumed training
+        model.config.mate_logit_bonus = mate_logit_bonus
+        model.mate_logit_bonus = mate_logit_bonus
         print(
             f"Model loaded from checkpoint with {sum(p.numel() for p in model.parameters()):,} parameters")
         print(
@@ -682,6 +692,7 @@ def train(
             pad_token_id=pad_token_id,
         )
         config.policy_dim = len(policy_index)
+        config.mate_logit_bonus = mate_logit_bonus
         # Anneal illegality penalty over first 10% of epoch
         # Start with -5 penalty on illegal logits, quadratically reduce to 0
         # Quadratic decay spreads learning evenly (compensates for exp in softmax)
@@ -896,6 +907,18 @@ if __name__ == "__main__":
         default=0,
         help="Weight decay (default: 0.01)"
     )
+    parser.add_argument(
+        "--mate-bucket",
+        type=float,
+        default=0.02,
+        help="Fraction of winrate spectrum allocated to mating (default: 0.02)"
+    )
+    parser.add_argument(
+        "--mate-logit-bonus",
+        type=float,
+        default=None,
+        help="Add scale/n bonus to softmax targets for mate-in-n moves (forces mate-bucket=0)"
+    )
     args = parser.parse_args()
     train(
         run_name=args.run_name,
@@ -907,4 +930,6 @@ if __name__ == "__main__":
         beta2=args.beta2,
         dropout=args.dropout,
         weight_decay=args.weight_decay,
+        mate_bucket=args.mate_bucket,
+        mate_logit_bonus=args.mate_logit_bonus,
     )

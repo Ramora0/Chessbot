@@ -38,6 +38,7 @@ def create_action_value_dataset(
     tokenizer,
     shuffle: bool = True,
     seed: int = 42,
+    mate_bucket: float = 0.02,
 ) -> Dataset:
     """
     Load and prepare the action-value dataset for training.
@@ -79,6 +80,7 @@ def create_action_value_dataset(
         tokenizer=tokenizer,
         move_to_idx=move_to_idx,
         policy_size=policy_size,
+        mate_bucket=mate_bucket,
     )
     dataset.set_transform(transform_fn)
 
@@ -92,6 +94,7 @@ def _transform_example(
     tokenizer,
     move_to_idx: dict[str, int],
     policy_size: int,
+    mate_bucket: float = 0.02,
 ) -> dict:
     """
     Transform a batch of examples to model input format.
@@ -159,22 +162,24 @@ def _transform_example(
 
         # Fill in adjusted win% values for each legal move
         # When mate data is available, encode mate information directly into win%:
-        #   - Mating moves (mate > 0): 0.98 + 0.02/n  (range: (0.98, 1.0])
-        #   - Non-mate moves: linearly scaled to [0.02, 0.98]
-        #   - Getting-mated moves (mate < 0): 0.02 - 0.02/|n|  (range: [0.0, 0.02))
+        #   - Mating moves (mate > 0): (1-mb) + mb/n  (range: (1-mb, 1.0])
+        #   - Non-mate moves: linearly scaled to [mb, 1-mb]
+        #   - Getting-mated moves (mate < 0): mb - mb/|n|  (range: [0.0, mb))
+        # where mb = mate_bucket (fraction of winrate spectrum for mating)
         # This gives clean separation so sigmoid and softmax losses work together
         valid_indices = []
+        mb = mate_bucket
         mate_depths_raw = examples["mate"][i]
         for j, (move, p_win) in enumerate(zip(moves, p_wins)):
             if move in move_to_idx:
                 idx = move_to_idx[move]
                 md = int(mate_depths_raw[j])
                 if md > 0:  # mate-in-n
-                    adjusted = 0.98 + 0.02 / md
+                    adjusted = (1 - mb) + mb / md
                 elif md < 0:  # mated-in-n
-                    adjusted = 0.02 - 0.02 / abs(md)
+                    adjusted = mb - mb / abs(md)
                 else:  # no mate
-                    adjusted = 0.02 + p_win * 0.96
+                    adjusted = mb + p_win * (1 - 2 * mb)
                 policy[idx] = adjusted
                 valid_indices.append(idx)
             # Skip moves not in policy_index (e.g., promotions to rook/bishop)
