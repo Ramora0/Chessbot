@@ -596,6 +596,7 @@ def train(
     weight_decay: float = 0.01,
     mate_bucket: float = 0.02,
     mate_logit_bonus: Optional[float] = None,
+    grad_accum: int = 1,
 ) -> None:
     # Mate logit bonus disables mate bucket encoding (uses raw winrates)
     if mate_logit_bonus is not None:
@@ -721,9 +722,9 @@ def train(
         output_dir=OUTPUT_DIR,
         num_train_epochs=1,
 
-        # gradient_accumulation_steps=2,
+        gradient_accumulation_steps=grad_accum,
 
-        per_device_train_batch_size=per_device_batch_size,
+        per_device_train_batch_size=per_device_batch_size // grad_accum,
         learning_rate=effective_lr,
         warmup_steps=schedule.warmup_steps,
         weight_decay=weight_decay,
@@ -919,6 +920,12 @@ if __name__ == "__main__":
         default=None,
         help="Add scale/n bonus to softmax targets for mate-in-n moves (forces mate-bucket=0)"
     )
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps; per-device batch size is divided by this to keep effective batch size unchanged (default: 1)"
+    )
     args = parser.parse_args()
     train(
         run_name=args.run_name,
@@ -932,4 +939,5 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
         mate_bucket=args.mate_bucket,
         mate_logit_bonus=args.mate_logit_bonus,
+        grad_accum=args.grad_accum,
     )
